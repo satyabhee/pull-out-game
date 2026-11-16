@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.hypothesis/
+*.egg-info/
+# raw S3 downloads and generated artifacts stay local
+data/raw/
+data/cache/
+*.bin
+*.lz4
+out/
+engine_cpp/build/
+*.o
+a.out
+.DS_Store
