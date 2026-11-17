@@ -9,3 +9,10 @@ Each window lives in `windows/<start>-<end>/` with `window.json` (start/end heig
 5. **Order ids.** Resolve cancels/modifies by (user, cloid) first (~85% of BTC/ETH cancels). For int-oid cancels, estimate ids from `anchors.json` plus counted placements (global counter, +1 per order / modify / batchModify item; ~1–5% unexplained drift, so match the nearest resting order of that user and asset within tolerance). Report unresolved cancels as their own metric.
 6. **Statistics.** Cluster standard errors by window (windows are the independent unit; blocks within a window are not).
 7. **Window status.** Use `complete` windows; `partial` ones only if the missing heights are reported; skip `archived_cap`.
+8. **Snapshot reconciliation (decided Nov 17).** An L2 snapshot gives size per price, not owners, order ids or queue position, so it never replaces order-level state. Keep two kinds of resting liquidity apart: orders built from real window events, and anonymous placeholders from the starting snapshot.
+   - **Timing:** apply each later `book_<COIN>` snapshot at the end of the last block whose time is ≤ the snapshot's own `time` (not `recv_ms`). Snapshots are a logged input, so the replay stays deterministic.
+   - **Range:** only the snapshot's levels (top 20 per side). Inside that price range a missing price means size 0; below it, change nothing.
+   - **Ours > snapshot at a price:** remove the gap from that level's placeholders only, newest first, until they run out. Whatever gap remains belongs to known orders (likely ALOs Hyperliquid rejected silently): don't touch them; record it as drift.
+   - **Snapshot > ours:** add nothing; record it as missing liquidity (wrongly rejected ALOs, or orders from events not in the blocks).
+   - **Policies:** identical under every ordering policy. Placeholders are pre-window liquidity no policy affects; known orders are never corrected from snapshots, so real outcomes can't leak into the counterfactual.
+   - **Report** per minute and asset: placeholder lots trimmed, drift lots (ours > snapshot, after trimming), missing lots (snapshot > ours), over the snapshot's price range.

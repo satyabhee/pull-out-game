@@ -266,6 +266,25 @@ class BookSnapshot:
     asks: tuple[tuple[int, int], ...]
 
 
+def _snapshot(asset: int, d: dict) -> BookSnapshot:
+    spec = ASSETS[asset]
+    conv = lambda lv: tuple((spec.px_to_ticks(x["px"]), spec.sz_to_lots(x["sz"])) for x in lv)
+    return BookSnapshot(asset=asset, time_ms=d["time"], bids=conv(d["levels"][0]), asks=conv(d["levels"][1]))
+
+
+def iter_books(hl_data, coin: str, t0_ms: int, t1_ms: int) -> Iterator[BookSnapshot]:
+    """L2 snapshots with t0 <= time <= t1, deduplicated by time, in time order."""
+    asset = COIN_TO_ASSET[coin]
+    seen: dict[int, dict] = {}
+    for path in _hour_files(Path(hl_data), f"book_{coin}"):
+        for rec in _lines(path):
+            d = rec["msg"]["data"]
+            if t0_ms <= d["time"] <= t1_ms:
+                seen[d["time"]] = d
+    for t in sorted(seen):
+        yield _snapshot(asset, seen[t])
+
+
 def nearest_book(hl_data, coin: str, at_ms: int) -> BookSnapshot:
     """The L2 snapshot whose time is nearest `at_ms` (ties: the earlier one)."""
     asset = COIN_TO_ASSET[coin]
@@ -279,9 +298,7 @@ def nearest_book(hl_data, coin: str, at_ms: int) -> BookSnapshot:
                 best = (key, d)
     if best is None:
         raise ValueError(f"no book_{coin} snapshots under {hl_data}")
-    d = best[1]
-    conv = lambda lv: tuple((spec.px_to_ticks(x["px"]), spec.sz_to_lots(x["sz"])) for x in lv)
-    return BookSnapshot(asset=asset, time_ms=d["time"], bids=conv(d["levels"][0]), asks=conv(d["levels"][1]))
+    return _snapshot(asset, best[1])
 
 
 # ------------------------------------------------------------------ CLI

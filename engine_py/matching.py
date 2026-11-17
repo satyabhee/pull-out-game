@@ -99,6 +99,45 @@ class Engine:
             self._assert_not_crossed(action.asset)
         return out
 
+    def reconcile(self, asset: int, bids, asks) -> dict[str, int]:
+        """ENGINE_WINDOW_RULES rule 8: trim placeholders toward an L2 snapshot.
+
+        `bids`/`asks` are (px, sz) levels from the snapshot. Inside the snapshot's
+        price range, where we hold more than the snapshot shows, placeholders at that
+        price are reduced newest first. Known orders are never touched: any gap left
+        is returned as drift, and snapshot size we lack is returned as missing.
+        """
+        book = self.books[asset]
+        out = {"trimmed": 0, "drift": 0, "missing": 0}
+        for side, levels in ((Side.BUY, bids), (Side.SELL, asks)):
+            if not levels:
+                continue
+            snap = dict(levels)
+            edge = min(snap) if side is Side.BUY else max(snap)
+            ours = book.side(side)
+            in_range = [px for px in ours.keys() if (px >= edge if side is Side.BUY else px <= edge)]
+            for px in in_range:
+                level = ours[px]
+                gap = level.total - snap.get(px, 0)
+                if gap <= 0:
+                    continue
+                for node in reversed([n for n in level if n.order.user == PLACEHOLDER]):
+                    if gap == 0:
+                        break
+                    q = min(gap, node.remaining)
+                    book.reduce(node.order.oid, q)
+                    out["trimmed"] += q
+                    gap -= q
+                out["drift"] += gap
+            for px, sz in snap.items():
+                level = ours.get(px)
+                have = level.total if level is not None else 0
+                if sz > have:
+                    out["missing"] += sz - have
+        for k, v in out.items():
+            self.stats[f"reconcile_{k}"] += v
+        return out
+
     def end_block(self, height: int, time_ms: int) -> None:
         """Fire due scheduleCancels (deterministic order), then check every book."""
         due = sorted((at, user) for user, at in self.schedules.items() if at <= time_ms)

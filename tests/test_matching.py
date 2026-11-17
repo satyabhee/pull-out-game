@@ -241,3 +241,32 @@ def test_same_actions_same_fills():
         eng.end_block(1, 10)
         return [(f.maker_order, f.px, f.sz, f.seq) for fs in out for f in fs], resting(eng, B), resting(eng, S)
     assert run() == run()
+
+
+# ---- rule 8: snapshot reconciliation -------------------------------------------------------
+
+def test_reconcile_trims_placeholders_newest_first_and_never_known_orders(eng):
+    eng.seed(0, B, 100, 5)                       # older placeholder
+    eng.apply(place("m", B, 100, 3))             # known order
+    eng.seed(0, B, 100, 4)                       # newer placeholder
+    out = eng.reconcile(0, bids=[(100, 4)], asks=[])
+    # ours 12, snapshot 4: gap 8 -> newer placeholder 4, older placeholder 4; known order kept
+    assert out == {"trimmed": 8, "drift": 0, "missing": 0}
+    assert resting(eng, B) == [(100, PLACEHOLDER, 1), (100, "m", 3)]
+    eng.books[0].check_invariants()
+
+
+def test_reconcile_reports_drift_when_placeholders_run_out(eng):
+    eng.seed(0, S, 105, 2)
+    eng.apply(place("m", S, 105, 6))
+    out = eng.reconcile(0, bids=[], asks=[(105, 3)])
+    assert out == {"trimmed": 2, "drift": 3, "missing": 0}
+    assert resting(eng, S) == [(105, "m", 6)]
+
+
+def test_reconcile_range_and_missing(eng):
+    eng.seed(0, B, 103, 5)                       # above the snapshot's best bid: snapshot says 0
+    eng.seed(0, B, 90, 5)                        # below the snapshot's range: untouched
+    out = eng.reconcile(0, bids=[(101, 7), (100, 1)], asks=[])
+    assert out == {"trimmed": 5, "drift": 0, "missing": 8}  # nothing added for missing
+    assert resting(eng, B) == [(90, PLACEHOLDER, 5)]
