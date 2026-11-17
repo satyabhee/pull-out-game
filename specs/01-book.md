@@ -118,6 +118,8 @@ The matching engine supports limit orders in this version. Its canonical Order r
 - `remaining_lots` — quantity not yet filled.
 - `tif` — time-in-force: `GTC`, `IOC`, or `ALO`.
 - `arrival_sequence` — sequence number assigned by the matching engine to determine time priority.
+- `cloid` — optional 128-bit client order id, copied exactly from the submitted action (see Exchange identities).
+- `exchange_oid` — optional Hyperliquid order id, supplied by the replay layer when known (see Exchange identities).
 
 The globally unique identity of an order is the pair `(market_id, order_id)`. Order IDs are allocated using a per-market counter and are never reused.
 
@@ -131,7 +133,34 @@ The following validity conditions apply:
 
 Order timestamps are not authoritative for queue priority. Arrival sequence determines priority because multiple orders may have identical timestamps or arrive within the same block.
 
-Client-provided IDs, if supported, are optional correlation or idempotency metadata. They do not replace `order_id` and do not determine priority.
+Client-provided IDs are correlation metadata. They do not replace `order_id` and do not determine priority.
+
+### Exchange identities (replaying Hyperliquid data)
+
+`order_id` is the engine's own identifier. It is never compared with Hyperliquid's order ids, and the rules for assigning it (Sequence Assignment below) do not try to imitate Hyperliquid's.
+
+Why the two are separate (evidence: `report/G0_REPORT.md`, section 3):
+
+- Hyperliquid's `oid` is one global counter across all markets, not per market.
+- New orders in the block data do not carry their `oid`; only cancels and modifies reference it.
+- Counting placements reproduces the counter only approximately: 1–5% of ids are consumed by events that are not visible in the blocks. The engine therefore cannot derive Hyperliquid's `oid` deterministically.
+
+Each order therefore carries two optional external identities:
+
+- `cloid` — exact, from the action's `c` field. About 85% of BTC/ETH cancels target orders by cloid.
+- `exchange_oid` — Hyperliquid's id, estimated by the replay layer from order-id anchors (`anchors.json`, from the info API's `orderStatus`) plus counted placements. It may be absent or wrong.
+
+A cancel or modify that names a target is resolved in this order:
+
+1. By `(owner_id, cloid)` among that owner's live orders in the market.
+2. Otherwise by `(owner_id, exchange_oid)`.
+3. Otherwise the target is **unresolved**: the action has no effect on the book and is counted in the replay metric `unresolved_targets`, reported by kind (cancel, modify).
+
+If more than one live order matches at a step, the target is unresolved; the engine never guesses. A modify whose target is unresolved behaves like Hyperliquid's "Cannot modify canceled or filled order": no new order is placed.
+
+Resolution happens in the replay layer, **before** the matching engine: every cancel or modify reaches the engine either with a target `order_id` or marked unresolved. The engine itself only ever handles its own `order_id`s, so it stays deterministic. Engine versions are compared on the same resolved action stream, so they must produce identical state hashes; a better `exchange_oid` estimate produces a different stream, and is reported as such, not as an engine difference.
+
+`cloid` and `exchange_oid` are **excluded from the canonical state hash**: they are correlation data from outside the engine, and their effect on the book already shows up through which orders were cancelled.
 
 `reduce_only` is not part of this version's canonical Order representation. Position and reduce-only validation belong to the risk/admission layer before an order reaches the matching engine.
 
