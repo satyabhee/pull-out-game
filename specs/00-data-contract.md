@@ -1,7 +1,7 @@
 # 00 — Data contract
 
 What the replay reads, how its pieces link, what is missing, and whether exact replay is possible.
-Measured on real data on Nov 17, 2026. Full evidence and commands: `G0_REPORT.md`; replay rules: `ENGINE_WINDOW_RULES.md`.
+Measured on real data on Nov 17, 2026. Full evidence and commands: `report/G0_REPORT.md`; replay rules: `specs/ENGINE_WINDOW_RULES.md`.
 
 **Verdict: GO with caveats.** Blocks decode completely and every non-zero-hash trade links to its taker tx (69 of 69 checked). Exact replay is limited by three known gaps: no per-order responses, about 18% of trades with no tx, and order ids that can't be predicted exactly. Each one has a stated handling below and is reported as its own category in the mismatch table, never hidden.
 

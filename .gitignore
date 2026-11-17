@@ -15,6 +15,19 @@ engine_cpp/build/
 a.out
 .DS_Store
 
+# secrets: never commit (server IP lives in server.env, SSH key in *.pem)
+*.pem
+server.env
+# captured data stays out of git (synced to ~/Downloads/server_data)
+server_data/
+hl_data/
+blocks/
+windows/
+capture.log
+capture_state.json
+g0_cache.json
+g0_anchors.json
+
 # local agent plan (not published)
 AGENT_PLAN.md
 CLAUDE.local.md
