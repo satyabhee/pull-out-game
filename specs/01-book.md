@@ -118,6 +118,8 @@ The matching engine supports limit orders in this version. Its canonical Order r
 - `remaining_lots` — quantity not yet filled.
 - `tif` — time-in-force: `GTC`, `IOC`, or `ALO`.
 - `arrival_sequence` — sequence number assigned by the matching engine to determine time priority.
+- `cloid` — optional 128-bit client order id, copied exactly from the submitted action (see Exchange identities).
+- `exchange_oid` — optional Hyperliquid order id, supplied by the replay layer when known (see Exchange identities).
 
 The globally unique identity of an order is the pair `(market_id, order_id)`. Order IDs are allocated using a per-market counter and are never reused.
 
@@ -131,7 +133,36 @@ The following validity conditions apply:
 
 Order timestamps are not authoritative for queue priority. Arrival sequence determines priority because multiple orders may have identical timestamps or arrive within the same block.
 
-Client-provided IDs, if supported, are optional correlation or idempotency metadata. They do not replace `order_id` and do not determine priority.
+Client-provided IDs are correlation metadata. They do not replace `order_id` and do not determine priority.
+
+### Exchange identities (replaying Hyperliquid data)
+
+`order_id` is the engine's own identifier. It is never compared with Hyperliquid's order ids, and the rules for assigning it (Sequence Assignment below) do not try to imitate Hyperliquid's.
+
+Why the two are separate (evidence: `report/G0_REPORT.md`, section 3):
+
+- Hyperliquid's `oid` is one global counter across all markets, not per market.
+- New orders in the block data do not carry their `oid`; only cancels and modifies reference it.
+- Counting placements reproduces the counter only approximately: 1–5% of ids are consumed by events that are not visible in the blocks. The engine therefore cannot derive Hyperliquid's `oid` deterministically.
+
+Each order therefore carries two optional external identities:
+
+- `cloid` — exact, from the action's `c` field. About 85% of BTC/ETH cancels target orders by cloid.
+- `exchange_oid` — Hyperliquid's id, estimated by the replay layer from order-id anchors (`anchors.json`, from the info API's `orderStatus`) plus counted placements. It may be absent or wrong.
+
+A cancel or modify that names a target is resolved in this order:
+
+1. By `(owner_id, cloid)` among that owner's live orders in the market.
+2. Otherwise by `(owner_id, exchange_oid)`.
+3. Otherwise the target is **unresolved**: the cancel has no effect on the book and is counted in the replay metric `unresolved_targets`, reported by kind (cancel, modify).
+
+If more than one live order matches at a step, the target is unresolved; the engine never guesses.
+
+A modify whose target is unresolved still places its new order. On chain, a modify whose target was already gone fails with "Cannot modify canceled or filled order", and errored actions never reach the engine. So an error-free modify means Hyperliquid found the target: if we can't, the target is an order we never saw (placed before the window), and the new order was still placed.
+
+Resolution is deterministic and uses only the engine's own state plus inputs logged by the replay: the engine resolves step 1 from its `(owner_id, market, cloid)` index, and step 2 through a resolver the replay layer supplies (built from `anchors.json` and counted placements). Either way the engine only ever removes its own `order_id`s. Engine versions are compared on the same resolved action stream, so they must produce identical state hashes; a better `exchange_oid` estimate produces a different stream, and is reported as such, not as an engine difference.
+
+`cloid` and `exchange_oid` are **excluded from the canonical state hash**: they are correlation data from outside the engine, and their effect on the book already shows up through which orders were cancelled.
 
 `reduce_only` is not part of this version's canonical Order representation. Position and reduce-only validation belong to the risk/admission layer before an order reaches the matching engine.
 
@@ -151,6 +182,8 @@ The matching engine produces exactly these fields:
 - `price_tick` — execution price in integer ticks.
 - `size_lots` — executed quantity in integer lots.
 - `fill_sequence` — monotonically increasing per-market execution sequence.
+- `block_height` — height of the block whose execution produced this fill.
+- `index_in_block` — position of the fill within that block's execution, starting at 0. `(block_height, index_in_block)` identifies a fill uniquely and orders fills exactly as they were executed.
 
 Owner identifiers are included so downstream settlement can attribute executions without relying on the maker order remaining in the book.
 

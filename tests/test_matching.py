@@ -270,3 +270,15 @@ def test_reconcile_range_and_missing(eng):
     out = eng.reconcile(0, bids=[(101, 7), (100, 1)], asks=[])
     assert out == {"trimmed": 5, "drift": 0, "missing": 8}  # nothing added for missing
     assert resting(eng, B) == [(90, PLACEHOLDER, 5)]
+
+
+def test_duplicate_cloid_is_unresolved_never_guessed(eng):
+    eng.apply(place("u", B, 100, 5, Tif.ALO, cloid="0xdup"))
+    eng.apply(place("u", B, 99, 5, Tif.ALO, cloid="0xdup"))
+    _, rejects = eng.apply(CancelByCloid(**meta("u"), asset=0, cloid="0xdup"))
+    assert [r.reason for r in rejects] == [RejectReason.UNKNOWN_ORDER]
+    assert eng.stats["cloid_ambiguous"] == 1 and len(eng.books[0].index) == 2
+    # once one of them is gone, the cloid is unique again and resolves
+    eng.apply(place("t", S, 100, 5, Tif.IOC))
+    assert eng.apply(CancelByCloid(**meta("u"), asset=0, cloid="0xdup")) == ([], [])
+    assert resting(eng, B) == []

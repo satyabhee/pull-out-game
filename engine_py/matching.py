@@ -8,7 +8,8 @@ Rules (specs/01-book.md, AGENT_PLAN.md sections 3-4):
 - Self-trade: `stp="cancel_taker"` (Satya's spec: stop, keep the maker, cancel the
   taker's remainder) or `stp="expire_maker"` (cancel the maker, keep matching), until the
   data shows which one Hyperliquid uses.
-- Cancels resolve by (user, asset, cloid) exactly. Int-oid cancels go through
+- Cancels resolve by (user, asset, cloid) exactly; if two resting orders share the
+  cloid, the target is unresolved (specs/01-book.md: the engine never guesses). Int-oid cancels go through
   `resolve_oid(user, asset, hl_oid) -> engine oid | None`; without one they are rejected
   as UNKNOWN_ORDER.
 - Modify = cancel the target, then place `new` as a new order (new id, back of the queue).
@@ -52,7 +53,7 @@ class Engine:
         self.next_oid = 1
         self.next_seq = 1
         self.next_fill_seq = 1
-        self.by_cloid: dict[tuple[str, int, str], int] = {}
+        self.by_cloid: dict[tuple[str, int, str], list[int]] = {}   # resting oids, oldest first
         self.by_user: dict[str, dict[int, None]] = {}        # insertion-ordered set
         self.schedules: dict[str, int] = {}
         self.block = 0
@@ -165,7 +166,7 @@ class Engine:
                 key = (order.user, order.asset, order.cloid)
                 if key in self.by_cloid:
                     self.stats["cloid_reused_while_resting"] += 1
-                self.by_cloid[key] = order.oid
+                self.by_cloid.setdefault(key, []).append(order.oid)
 
     def _forget(self, order: Order) -> None:
         if order.user == PLACEHOLDER:
@@ -177,8 +178,11 @@ class Engine:
                 del self.by_user[order.user]
         if order.cloid is not None:
             key = (order.user, order.asset, order.cloid)
-            if self.by_cloid.get(key) == order.oid:
-                del self.by_cloid[key]
+            oids = self.by_cloid.get(key)
+            if oids is not None and order.oid in oids:
+                oids.remove(order.oid)
+                if not oids:
+                    del self.by_cloid[key]
 
     def _remove(self, oid: int) -> Order:
         order = self._book_of(oid).remove(oid).order
@@ -244,9 +248,12 @@ class Engine:
         return fills, rejects
 
     def _cancel_cloid(self, source, user, asset, cloid) -> list[Reject]:
-        oid = self.by_cloid.get((user, asset, cloid))
-        if oid is None:
+        oids = self.by_cloid.get((user, asset, cloid), [])
+        if len(oids) != 1:                     # none, or ambiguous: never guess
+            if oids:
+                self.stats["cloid_ambiguous"] += 1
             return [Reject(source, RejectReason.UNKNOWN_ORDER)]
+        oid = oids[0]
         self._remove(oid)
         return []
 
