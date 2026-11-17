@@ -151,6 +151,8 @@ The matching engine produces exactly these fields:
 - `price_tick` — execution price in integer ticks.
 - `size_lots` — executed quantity in integer lots.
 - `fill_sequence` — monotonically increasing per-market execution sequence.
+- `block_height` — height of the block whose execution produced this fill.
+- `index_in_block` — position of the fill within that block's execution, starting at 0. `(block_height, index_in_block)` identifies a fill uniquely and orders fills exactly as they were executed.
 
 Owner identifiers are included so downstream settlement can attribute executions without relying on the maker order remaining in the book.
 
