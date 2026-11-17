@@ -11,16 +11,21 @@ Specs come first and live in [`specs/`](specs/). Code is written from them.
 
 ## Fetch
 
+Data comes from the free public explorer, captured live by the AWS server (`collect/`, runbook in
+`report/SERVER_SETUP_REPORT.md`). From the Mac:
+
 ```bash
 make install
-uv run python -m data.fetch      # replica_cmds + fills for a small window (requester-pays S3)
-uv run python -m data.parse
+server/status.sh                 # server health
+server/sync_down.sh --prune      # windows + recordings -> ~/Downloads/server_data/, frees server disk
 ```
 
 ## Replay
 
 ```bash
-uv run python -m engine_py.replay   # fills + one state hash per block
+uv run python -m engine_py.replay BLOCK.json.gz             # one block: accepted/rejected, fills, state hash
+uv run python -m engine_py.replay WINDOW_DIR --quiet        # a whole folder of consecutive blocks
+uv run python -m engine_py.replay WINDOW_DIR --policy first_come   # other in-block ordering
 make test
 ```
 

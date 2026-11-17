@@ -131,3 +131,26 @@ python3 g0_check.py ~/Downloads/server_data > ~/Downloads/server_data/g0_run2.tx
 
 Outputs: `server_data/g0_run1.txt` (first run), `g0_run2.txt` (final), `g0_live_run.txt`, `g0_cache.json` (orderStatus answers), `g0_anchors.json`.
 Scripts: `g0_check.py` (all four questions, stdlib only), `g0_live.py` (fresh blocks + anchors), `fetch_blocks.py` (now rejects error responses).
+
+---
+
+## 9. Engine replays real blocks (G0, second half)
+
+The Python reference engine (`engine_py/`, implementing `specs/01-book.md`) replays real explorer blocks end to end:
+`uv run python -m engine_py.replay ~/Downloads/server_data/blocks/live-1224258679-1224258978 --quiet`
+
+- **One block** (height 1224258679): 26 accepted, 104 rejected (`POST_ONLY_WOULD_TAKE`), 4 IOC remainders cancelled, 20 unresolved cancel targets, state hash `d8e14c57291998e6…`.
+- **300 consecutive blocks** (20.8 s), project ordering, empty starting book: no engine errors; 38,814 orders accepted, 29,251 rejected, 68 fills, final book uncrossed (BTC 64904.0 / 64905.0). Takes 110 s (~0.37 s/block, mostly the per-block copy that makes blocks all-or-nothing). `first_come` ordering: also 68 fills, 29,614 vs 29,419 resting BTC orders.
+- **Accepted vs rejected:** the engine says which orders it accepted and rejects the rest with a reason. The only non-post-only rejections were 13 orders Hyperliquid would also refuse (size 0, price 0, or `63597.59` with too many decimals for BTC), so the unit config (BTC tick 0.1 / lot 0.00001, ETH 0.01 / 0.0001) fits every real order.
+- **Why so many post-only rejections:** replaying from an **empty** book. Example: a market maker's sells at 64890–64893 rest on our empty book, so every real bid at 64894–64906 looks like it crosses. On-chain, the real resting bids (~64900) made those sells the ones rejected. This is the cold-start effect that warm-up + placeholder liquidity (`specs/ENGINE_WINDOW_RULES.md`) address. It's G1 work, not an engine bug.
+- **Unresolved targets** (15,622 by cloid, 3,683 by oid in 300 blocks) are mostly cancels of orders placed before the window or wrongly rejected at cold start. Oid cancels can't resolve until `exchange_oid` estimates from `anchors.json` are wired in (G1).
+
+**G0 status:**
+
+| condition | status |
+|---|---|
+| Link fills to orders | Real fills link to their taker tx by hash (69/69). The engine records each taker's tx hash. |
+| Tell rejected from accepted orders | The chain doesn't record per-order outcomes; the engine decides them from the book. |
+| Python engine replays a real block | Done. |
+
+Caveat on "one hour of data": the explorer's rate limit (~1.1 blocks/s against ~14.5 produced) makes a full contiguous hour (~52,000 blocks, ~13 h of fetching) impractical. G0 was shown on a 20.8-s window, and the capture service now collects ~7-minute windows around the clock.
