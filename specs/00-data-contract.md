@@ -125,4 +125,10 @@ The per-minute match rate shows whether the warm-up is long enough. It should ri
 2. Fills link: taker by hash (100% of checked non-zero-hash trades), maker by address, with the order chosen by time priority.
 3. Unreproducible activity (zero-hash trades, triggers, TWAP slices, unexplained oids) is applied as outside fills or reported as its own mismatch category.
 
-**To be confirmed by the replay:** G0's one-block BTC replay (fills compared on taker, price and size), and at G1 whether listing order is execution order.
+**G0 passed (Nov 17).** One real BTC block replays and matches the chain. Block 1224258712, seeded from the L2 snapshot 0.9 s before the window: the real taker sold 0.00906 BTC at 64893, and so did the engine, at the maker's price, not the taker's 64764 limit. Rerun:
+
+```bash
+uv run python -m analysis.g0_block_check ~/Downloads/server_data/blocks/live-1224258679-1224258978 --hl-data ~/Downloads/server_data/hl_data --all
+```
+
+Across all 29 linked taker txs in that 300-block window, 12 match exactly (41%). All of them fall inside the warm-up, so this is not a match rate. **Open for G1:** the book drifts (about 3,000 BTC of known orders where the snapshot shows none), and whether listing order is execution order.
