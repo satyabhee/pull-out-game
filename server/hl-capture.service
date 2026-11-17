@@ -1,0 +1,15 @@
+[Unit]
+Description=Hyperliquid replay-window capture (blocks + order-id anchors)
+After=network-online.target hl-recorder.service
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/hl
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/hl/.venv/bin/python -u capture.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
