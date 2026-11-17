@@ -14,3 +14,7 @@ engine_cpp/build/
 *.o
 a.out
 .DS_Store
+
+# local agent plan (not published)
+AGENT_PLAN.md
+CLAUDE.local.md
