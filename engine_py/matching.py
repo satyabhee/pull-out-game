@@ -1,4 +1,250 @@
-"""The match loop and order-type semantics. Built by Claude Code from your spec.
+"""The engine: applies actions to the BTC/ETH books and emits fills and rejects.
 
-TODO
+Rules (specs/01-book.md, AGENT_PLAN.md sections 3-4):
+- Price-time priority; every fill is at the resting maker's price; the best level is
+  re-read every iteration.
+- GTC: match, rest the remainder. IOC: match, cancel the remainder (no fill is not an
+  error). ALO: rejected whole if it would cross (equal price included), else rests.
+- Self-trade: `stp="cancel_taker"` (Satya's spec: stop, keep the maker, cancel the
+  taker's remainder) or `stp="expire_maker"` (cancel the maker, keep matching), until the
+  data shows which one Hyperliquid uses.
+- Cancels resolve by (user, asset, cloid) exactly. Int-oid cancels go through
+  `resolve_oid(user, asset, hl_oid) -> engine oid | None`; without one they are rejected
+  as UNKNOWN_ORDER.
+- Modify = cancel the target, then place `new` as a new order (new id, back of the queue).
+  If the target isn't found, the new order is still placed: a modify whose target was
+  gone carries an error on chain and never reaches the engine.
+- scheduleCancel: at end_block, users whose time has come lose all their orders.
+- OutsideFill: forced fill against the named maker's orders at that price (time order),
+  then placeholders at that price; any rest is rejected as NO_MAKER.
+- A crossed book after any action raises: never repaired.
 """
+
+from __future__ import annotations
+
+from collections import Counter
+from typing import Callable
+
+from engine_py.book import Book, BookError
+from engine_py.types import (
+    ASSETS, Action, Cancel, CancelByCloid, Fill, Modify, Order, OutsideFill, Place,
+    Reject, RejectReason, ScheduleCancel, Side, Tif,
+)
+
+PLACEHOLDER = "placeholder"   # owner of seeded pre-window liquidity
+
+Resolver = Callable[[str, int, int], "int | None"]
+
+
+class CrossedBookError(BookError):
+    pass
+
+
+class Engine:
+    def __init__(self, stp: str = "cancel_taker", resolve_oid: Resolver | None = None,
+                 check_every_action: bool = False):
+        if stp not in ("cancel_taker", "expire_maker"):
+            raise ValueError(f"unknown self-trade policy {stp!r}")
+        self.stp = stp
+        self.resolve_oid = resolve_oid
+        self.check_every_action = check_every_action
+        self.books = {a: Book(a) for a in sorted(ASSETS)}
+        self.next_oid = 1
+        self.next_seq = 1
+        self.next_fill_seq = 1
+        self.by_cloid: dict[tuple[str, int, str], int] = {}
+        self.by_user: dict[str, dict[int, None]] = {}        # insertion-ordered set
+        self.schedules: dict[str, int] = {}
+        self.block = 0
+        self.stats: Counter = Counter()
+
+    # ------------------------------------------------------------ public
+    def seed(self, asset: int, side: Side, px: int, sz: int) -> int:
+        """Pre-window liquidity: one anonymous order, behind anything already seeded."""
+        order = self._new_order(PLACEHOLDER, asset, side, px, sz, Tif.GTC, None)
+        self.books[asset].add(order, sz)
+        self._assert_not_crossed(asset)
+        return order.oid
+
+    def apply(self, action: Action) -> tuple[list[Fill], list[Reject]]:
+        self.block = action.block
+        if isinstance(action, Place):
+            out = self._place(action, action)
+        elif isinstance(action, Cancel):
+            out = [], self._cancel_hl_oid(action, action.user, action.asset, action.oid)
+        elif isinstance(action, CancelByCloid):
+            out = [], self._cancel_cloid(action, action.user, action.asset, action.cloid)
+        elif isinstance(action, Modify):
+            if isinstance(action.target, str):
+                rejects = self._cancel_cloid(action, action.user, action.asset, action.target)
+            else:
+                rejects = self._cancel_hl_oid(action, action.user, action.asset, action.target)
+            fills, more = self._place(action.new, action)
+            out = fills, rejects + more
+        elif isinstance(action, ScheduleCancel):
+            if action.at_ms is None:
+                self.schedules.pop(action.user, None)
+            else:
+                self.schedules[action.user] = action.at_ms
+            out = [], []
+        elif isinstance(action, OutsideFill):
+            out = self._outside_fill(action)
+        else:
+            raise TypeError(f"unknown action {type(action).__name__}")
+
+        if self.check_every_action:
+            for book in self.books.values():
+                book.check_invariants()
+        elif hasattr(action, "asset"):
+            self._assert_not_crossed(action.asset)
+        return out
+
+    def end_block(self, height: int, time_ms: int) -> None:
+        """Fire due scheduleCancels (deterministic order), then check every book."""
+        due = sorted((at, user) for user, at in self.schedules.items() if at <= time_ms)
+        for _, user in due:
+            del self.schedules[user]
+            for oid in sorted(self.by_user.get(user, {})):
+                self._remove(oid)
+                self.stats["schedule_cancelled"] += 1
+        for asset in self.books:
+            self._assert_not_crossed(asset)
+
+    # ------------------------------------------------------------ internals
+    def _new_order(self, user, asset, side, px, sz, tif, cloid) -> Order:
+        order = Order(oid=self.next_oid, user=user, asset=asset, side=side, px=px, sz=sz,
+                      tif=tif, cloid=cloid, seq=self.next_seq, block=self.block)
+        self.next_oid += 1
+        self.next_seq += 1
+        return order
+
+    def _rest(self, order: Order, remaining: int) -> None:
+        self.books[order.asset].add(order, remaining)
+        if order.user != PLACEHOLDER:
+            self.by_user.setdefault(order.user, {})[order.oid] = None
+            if order.cloid is not None:
+                key = (order.user, order.asset, order.cloid)
+                if key in self.by_cloid:
+                    self.stats["cloid_reused_while_resting"] += 1
+                self.by_cloid[key] = order.oid
+
+    def _forget(self, order: Order) -> None:
+        if order.user == PLACEHOLDER:
+            return
+        mine = self.by_user.get(order.user)
+        if mine is not None:
+            mine.pop(order.oid, None)
+            if not mine:
+                del self.by_user[order.user]
+        if order.cloid is not None:
+            key = (order.user, order.asset, order.cloid)
+            if self.by_cloid.get(key) == order.oid:
+                del self.by_cloid[key]
+
+    def _remove(self, oid: int) -> Order:
+        order = self._book_of(oid).remove(oid).order
+        self._forget(order)
+        return order
+
+    def _book_of(self, oid: int) -> Book:
+        for book in self.books.values():
+            if oid in book:
+                return book
+        raise BookError(f"oid {oid} is not resting")
+
+    @staticmethod
+    def _crosses(side: Side, px: int, best_opposite: int | None) -> bool:
+        if best_opposite is None:
+            return False
+        return px >= best_opposite if side is Side.BUY else px <= best_opposite
+
+    def _fill(self, maker, taker_order, taker_user, taker_side, q, block, taker_hash) -> Fill:
+        f = Fill(maker_order=maker.oid, taker_order=taker_order, maker_user=maker.user,
+                 taker_user=taker_user, taker_side=taker_side, px=maker.px, sz=q,
+                 block=block, seq=self.next_fill_seq, taker_hash=taker_hash)
+        self.next_fill_seq += 1
+        return f
+
+    def _place(self, p: Place, source: Action) -> tuple[list[Fill], list[Reject]]:
+        book = self.books[p.asset]
+        opposite = p.side.opposite
+        best_opp = book.best_ask() if p.side is Side.BUY else book.best_bid()
+
+        if p.tif is Tif.ALO:
+            if self._crosses(p.side, p.px, best_opp):
+                return [], [Reject(source, RejectReason.ALO_WOULD_CROSS)]
+            self._rest(self._new_order(p.user, p.asset, p.side, p.px, p.sz, p.tif, p.cloid), p.sz)
+            return [], []
+
+        taker = self._new_order(p.user, p.asset, p.side, p.px, p.sz, p.tif, p.cloid)
+        remaining = p.sz
+        fills: list[Fill] = []
+        rejects: list[Reject] = []
+        while remaining > 0:
+            level = book.best_level(opposite)              # re-read every iteration
+            if level is None or not self._crosses(p.side, p.px, level.px):
+                break
+            maker_node = level.first()
+            maker = maker_node.order
+            if maker.user == p.user:
+                if self.stp == "cancel_taker":
+                    rejects.append(Reject(source, RejectReason.SELF_TRADE))
+                    remaining = 0                          # cancel the taker's remainder
+                    break
+                self._remove(maker.oid)                    # expire_maker
+                self.stats["self_trade_expired_maker"] += 1
+                continue
+            q = min(remaining, maker_node.remaining)
+            fills.append(self._fill(maker, taker.oid, p.user, p.side, q, p.block, p.hash))
+            remaining -= q
+            if book.reduce(maker.oid, q).remaining == 0:
+                self._forget(maker)
+
+        if remaining > 0 and p.tif is Tif.GTC:
+            self._rest(taker, remaining)
+        return fills, rejects
+
+    def _cancel_cloid(self, source, user, asset, cloid) -> list[Reject]:
+        oid = self.by_cloid.get((user, asset, cloid))
+        if oid is None:
+            return [Reject(source, RejectReason.UNKNOWN_ORDER)]
+        self._remove(oid)
+        return []
+
+    def _cancel_hl_oid(self, source, user, asset, hl_oid) -> list[Reject]:
+        oid = self.resolve_oid(user, asset, hl_oid) if self.resolve_oid else None
+        if oid is None or oid not in self.books[asset]:
+            return [Reject(source, RejectReason.UNKNOWN_ORDER)]
+        order = self.books[asset].node(oid).order
+        if order.user != user:
+            raise BookError(f"resolver mapped {user}'s oid {hl_oid} to {order.user}'s order")
+        self._remove(oid)
+        return []
+
+    def _outside_fill(self, of: OutsideFill) -> tuple[list[Fill], list[Reject]]:
+        book = self.books[of.asset]
+        level = book.side(of.taker_side.opposite).get(of.px)
+        fills: list[Fill] = []
+        remaining = of.sz
+        if level is not None:
+            named = [n for n in level if n.order.user == of.maker_user]
+            anon = [n for n in level if n.order.user == PLACEHOLDER]
+            for node in named + anon:
+                if remaining == 0:
+                    break
+                maker = node.order
+                q = min(remaining, node.remaining)
+                fills.append(self._fill(maker, None, of.user, of.taker_side, q, of.block, of.hash))
+                remaining -= q
+                if book.reduce(maker.oid, q).remaining == 0:
+                    self._forget(maker)
+        if remaining > 0:
+            self.stats["outside_fill_lots_unmatched"] += remaining
+            return fills, [Reject(of, RejectReason.NO_MAKER)]
+        return fills, []
+
+    def _assert_not_crossed(self, asset: int) -> None:
+        book = self.books[asset]
+        if book.is_crossed():
+            raise CrossedBookError(
+                f"asset {asset} crossed at block {self.block}: bid {book.best_bid()} >= ask {book.best_ask()}")
