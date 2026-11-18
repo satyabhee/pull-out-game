@@ -1,0 +1,15 @@
+[Unit]
+Description=Hyperliquid live ALO orderStatus sampler (ground truth for post-only rejects)
+After=network-online.target hl-recorder.service
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/hl
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/hl/.venv/bin/python -u alo_probe.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
