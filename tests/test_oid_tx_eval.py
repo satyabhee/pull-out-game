@@ -271,8 +271,7 @@ def _stress_world(seed):
     return GWorld(orders, groups, drift_per_mille=rng.choice([10, 30, 50]), walk_seed=seed), groups
 
 
-@pytest.mark.xfail(strict=False, reason="agent4 finding: block-group rule resolves a decoy when random-walk drift makes the "
-                                        "true assignment violate the pair slack (3 wrong of ~14,300; bar is 0)")
+# seeds that produced wrong resolutions before agent3's margin guard (c038b42); now must be 0
 @pytest.mark.parametrize("seed", [392, 838, 961])
 def test_xtx_known_wrong_resolution_seeds(seed):
     w, groups = _stress_world(seed)

@@ -104,6 +104,8 @@ def locate_anchors(window) -> list[dict]:
     return [dict(user=u, oid=o, pos=v[0][0], k=v[0][1]) for (u, o), v in sorted(found.items()) if len(v) == 1]
 
 
+GUARD: Counter = Counter()           # per-order guard what-ifs over every resolved call (see _guard_flags)
+GUARD_LOG: list[dict] = []           # same, for held-out truth calls
 WRONG_DETAILS: list[dict] = []        # filled by _replay: the evidence for every wrong held-out resolution
 
 
@@ -112,14 +114,18 @@ class _Recorder:
 
     def __init__(self):
         self.created: dict[tuple, int] = {}
+        self.by_user: dict[tuple, list] = defaultdict(list)    # (user, asset) -> [(pos, engine oid | None)]
 
     def before_action(self, rp, block, a): ...
     def after_reconcile(self, rp, block, s, result, minute): ...
     def after_block(self, rp, block, minute): ...
 
     def after_action(self, rp, block, a, fills, rejects, created):
-        if created is not None and isinstance(a, (Place, Modify)):
-            self.created[(a.block, a.tx_index, a.item_index)] = created
+        if isinstance(a, (Place, Modify)):
+            pos = (a.block, a.tx_index, a.item_index)
+            self.by_user[(a.user, a.asset)].append((pos, created))
+            if created is not None:
+                self.created[pos] = created
 
 
 def _replay(window, hl_data, anchors_path, truth: dict[tuple, tuple] | None, nearest_ratio: int, replay_kw: dict | None = None, **resolver_kw):
@@ -136,9 +142,36 @@ def _replay(window, hl_data, anchors_path, truth: dict[tuple, tuple] | None, nea
     inner = rp.resolver
     calls: list[tuple] = []
 
+    def guard_flags(user, asset, hl_oid, r) -> dict:
+        """What-if guards on a per-order resolution r (engine oid), not applied to the replay:
+        phantom = the user placed another order within tolerance that is NOT resting now (never admitted,
+        filled, cancelled or evicted in our book), so the true target may have left our book;
+        ratio_pm = |estimate - hl_oid| / tolerance in per mille (how deep into the tolerance the pick sits)."""
+        est = inner.est
+        e, tol = inner.hl[r]
+        book = rp.engine.books[asset]
+        phantom = False
+        for pos, eo in rec.by_user.get((user, asset), ()):
+            if eo == r or (eo is not None and eo in book):
+                continue
+            k = est.counts.get(pos)
+            if k is None:
+                continue
+            ep = est.estimate_count(k)
+            if ep is not None and abs(ep - hl_oid) <= est.tolerance(k, inner.base, inner.per_mille):
+                phantom = True
+                break
+        return dict(phantom=phantom, ratio_pm=abs(e - hl_oid) * 1000 // max(tol, 1))
+
     def wrapped(user, asset, hl_oid):
         before = Counter(inner.stats)
         r = inner(user, asset, hl_oid)
+        gf = guard_flags(user, asset, hl_oid, r) if r is not None and r in inner.hl else None
+        if gf is not None:
+            GUARD["resolved"] += 1
+            GUARD["phantom"] += gf["phantom"]
+            for cut in (250, 500, 750):
+                GUARD[f"ratio<={cut}"] += gf["ratio_pm"] <= cut
         pos = (truth or {}).get((user, asset, hl_oid))
         info = None
         if pos is not None:
@@ -149,6 +182,8 @@ def _replay(window, hl_data, anchors_path, truth: dict[tuple, tuple] | None, nea
                         true_est_tol=inner.hl.get(t_oid), picked_est_tol=inner.hl.get(r) if r is not None else None,
                         picked_pos=(lambda a: (a.block, a.tx_index, a.item_index))(rp.placed_by[r])
                         if r in rp.placed_by else None)
+        if info is not None and gf is not None:
+            info["guard"] = gf
         calls.append((user, asset, hl_oid, r, sorted((inner.stats - before).keys()), info))
         return r
 
@@ -162,6 +197,8 @@ def _replay(window, hl_data, anchors_path, truth: dict[tuple, tuple] | None, nea
         true_oid = rec.created.get(pos)
         v = "correct" if r is not None and r == true_oid else "abstained" if r is None else "WRONG"
         verdicts[v] += 1
+        if info is not None and info.get("guard"):
+            GUARD_LOG.append(dict(verdict=v, **info["guard"]))
         if v == "WRONG":
             WRONG_DETAILS.append(info)
         verdicts[f"{v} via {'+'.join(how)}"] += 1
@@ -184,7 +221,7 @@ def heldout(window, hl_data, folds=3, nearest_ratio=3, resolver_kw=None) -> dict
             stats, v = _replay(window, hl_data, ap, truth, nearest_ratio, None, **(resolver_kw or {}))
         total += v
         stats_all.append(stats)
-    return dict(located=len(located), folds=folds, verdicts=dict(total), wrong_details=list(WRONG_DETAILS),
+    return dict(located=len(located), folds=folds, verdicts=dict(total), wrong_details=list(WRONG_DETAILS), guard=dict(GUARD), guard_truth=list(GUARD_LOG),
                 fold_stats=stats_all)
 
 
