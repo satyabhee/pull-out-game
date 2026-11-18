@@ -132,3 +132,161 @@ def test_probe_summary_counts_oids_and_multi_item():
             dict(alo_items_in_tx=3, block=9, answer={"status": "unknownOid"})]
     s = ev.probe_summary(rows)
     assert s["answered"] == 1 and s["answered_with_oid"] == 1 and s["multi_item_txs"] == 1 and s["blocks"] == (5, 9)
+
+
+# ------------------------------------------------------------------ cross-tx grouping (agent 3's joint layers)
+from engine_py.types import Cancel  # noqa: E402
+
+
+class GWorld:
+    """Users place single orders at counts ks (true oid = base + k + drift(k)); in block 2 each user cancels
+    a group of them. `cancel_group` returns {engine oid: result} with truth known by construction."""
+
+    def __init__(self, orders, groups, drift_per_mille=0, anchors=None, walk_seed=None, **kw):
+        """orders: [(user, k)]; groups: {user: [order indices cancelled in block 2, in tx order]}."""
+        self.base = 5_000_000
+        self.true = [self.base + k + k * drift_per_mille // 1000 for _, k in orders]
+        if walk_seed is not None:                      # invisible ids as a random walk (Poisson-like), not a straight line
+            rng, extra, last = random.Random(walk_seed), 0, 0
+            for i in sorted(range(len(orders)), key=lambda j: orders[j][1]):
+                dk = orders[i][1] - last
+                extra += sum(1 for _ in range(dk) if rng.random() < drift_per_mille / 1000)
+                last = orders[i][1]
+                self.true[i] = self.base + orders[i][1] + extra
+        counts = {(1, i, 0): k for i, (_, k) in enumerate(orders)}
+        kmax = max(k for _, k in orders) + 1000
+        counts[(1, len(orders), 0)] = kmax
+        anchors = anchors or [(0, self.base), (kmax, self.base + kmax + kmax * drift_per_mille // 1000)]
+        anchors = sorted(set(anchors))
+        bg = {(2, u): [(0, self.true[i]) for i in idx] for u, idx in groups.items()}
+        self.est = OidEstimator(counts, anchors, block_groups=bg)
+        self.eng = Engine()
+        self.res = OidResolver(self.eng, self.est, **kw)
+        self.eng.resolve_oid = self.res
+        self.eo = []
+        for i, (u, k) in enumerate(orders):
+            a = Place(user=u, block=1, asset=0, side=Side.BUY, px=1000 + i, sz=1, tif=Tif.ALO, cloid=None,
+                      reduce_only=False, tx_index=i, item_index=0, hash="0x1", priority=None)
+            before = self.eng.next_oid
+            self.eng.apply(a)
+            self.res.note(a, before)
+            self.eo.append(before)
+
+    def cancel(self, i, user):
+        """Cancel order i by its true hl oid in block 2; returns the engine oid that left the book or None."""
+        before = set(self.eng.books[0].index) if hasattr(self.eng.books[0], "index") else None
+        self.eng.apply(Cancel(user=user, block=2, asset=0, oid=self.true[i], tx_index=0, item_index=0,
+                              hash="0x2", priority=None))
+        return self.eo[i] not in self.eng.books[0]
+
+    def run(self, groups):
+        """-> (correct, wrong): a cancel is wrong when another order of that user (or user) left the book."""
+        correct = wrong = 0
+        for u, idx in groups.items():
+            for i in idx:
+                snap = {e for e in self.eo if e in self.eng.books[0]}
+                self.cancel(i, u)
+                gone = snap - {e for e in self.eo if e in self.eng.books[0]}
+                if gone == {self.eo[i]}:
+                    correct += 1
+                elif gone:
+                    wrong += 1
+        return correct, wrong
+
+
+def test_xtx_two_users_interleaved_same_counts_no_wrong():
+    orders = [("u", 100), ("v", 101), ("u", 130), ("v", 131), ("u", 170), ("v", 171)]
+    groups = {"u": [0, 2, 4], "v": [1, 3, 5]}
+    w = GWorld(orders, groups)
+    c, wrong = w.run(groups)
+    assert wrong == 0
+
+
+def test_xtx_two_clusters_identical_spacing_never_resolves():
+    # u rests two clusters with identical internal spacing 25 ids apart; the cancel group names one of them.
+    orders = [("u", 100), ("u", 120), ("u", 160), ("u", 125), ("u", 145), ("u", 185)]
+    groups = {"u": [0, 1, 2]}
+    w = GWorld(orders, groups)
+    c, wrong = w.run(groups)
+    assert wrong == 0 and c == 0, "ambiguous clusters must abstain, never guess"
+
+
+@pytest.mark.parametrize("per_mille", [10, 30, 50])
+def test_xtx_drift_one_to_five_percent_no_wrong(per_mille):
+    orders = [("u", 1000 + 200 * i) for i in range(6)] + [("u", 1100 + 200 * i) for i in range(6)]
+    groups = {"u": [0, 2, 4, 6]}
+    w = GWorld(orders, groups, drift_per_mille=per_mille)
+    assert w.run(groups)[1] == 0
+
+
+def test_xtx_group_with_one_member_evicted_by_reseed_no_wrong():
+    orders = [("u", 100), ("u", 120), ("u", 160), ("u", 124)]
+    groups = {"u": [0, 1, 2]}
+    w = GWorld(orders, groups)
+    w.eng.evict(w.eo[1])                                 # a re-seed dropped the middle order
+    snap_before = {e for e in w.eo if e in w.eng.books[0]}
+    for i in (0, 1, 2):
+        w.cancel(i, "u")
+    gone = snap_before - {e for e in w.eo if e in w.eng.books[0]}
+    assert gone <= {w.eo[0], w.eo[2]}                    # never the decoy at k=124 (a wrong neighbour)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_xtx_random_worlds_zero_wrong(seed):
+    rng = random.Random(1000 + seed)
+    users = ["u1", "u2", "u3"]
+    ks = sorted(rng.sample(range(50, 1900), 40))
+    orders = [(rng.choice(users), k) for k in ks]
+    groups = {}
+    for u in users:
+        mine = [i for i, (uu, _) in enumerate(orders) if uu == u]
+        groups[u] = sorted(rng.sample(mine, min(len(mine), rng.randint(2, 5))))
+    w = GWorld(orders, groups, drift_per_mille=rng.choice([0, 10, 30, 50]))
+    assert w.run(groups)[1] == 0
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_xtx_random_walk_drift_zero_wrong(seed):
+    rng = random.Random(5000 + seed)
+    users = ["u1", "u2"]
+    orders = [(rng.choice(users), k) for k in sorted(rng.sample(range(50, 1900), 50))]
+    groups = {}
+    for u in users:
+        mine = [i for i, (uu, _) in enumerate(orders) if uu == u]
+        groups[u] = sorted(rng.sample(mine, min(len(mine), rng.randint(2, 6))))
+    w = GWorld(orders, groups, drift_per_mille=rng.choice([10, 30, 50]), walk_seed=seed)
+    assert w.run(groups)[1] == 0
+
+
+def _stress_world(seed):
+    rng = random.Random(seed)
+    users = ["u1", "u2", "u3"]
+    n = rng.choice([15, 40, 80])
+    orders = [(rng.choice(users), k) for k in sorted(rng.sample(range(50, 1900), n))]
+    groups = {}
+    for u in users:
+        mine = [i for i, (uu, _) in enumerate(orders) if uu == u]
+        if len(mine) >= 2:
+            groups[u] = sorted(rng.sample(mine, min(len(mine), rng.randint(2, 6))))
+    return GWorld(orders, groups, drift_per_mille=rng.choice([10, 30, 50]), walk_seed=seed), groups
+
+
+@pytest.mark.xfail(strict=False, reason="agent4 finding: block-group rule resolves a decoy when random-walk drift makes the "
+                                        "true assignment violate the pair slack (3 wrong of ~14,300; bar is 0)")
+@pytest.mark.parametrize("seed", [392, 838, 961])
+def test_xtx_known_wrong_resolution_seeds(seed):
+    w, groups = _stress_world(seed)
+    assert w.run(groups)[1] == 0
+
+
+def test_locate_anchors_finds_the_unique_placement(tmp_path):
+    from tests.window_fixture import A, Window, order, place_tx
+    w = Window(tmp_path)
+    h = w.block([place_tx(A, "0xa", 1000, order(px="60000", sz="0.001", cloid="0x01"), order(px="60001", sz="0.001"))])
+    ans = {"status": "order", "order": {"status": "canceled", "order": {
+        "coin": "BTC", "side": "B", "limitPx": "60001.0", "origSz": "0.001", "oid": 777,
+        "timestamp": w.time_of(h)}}}
+    w.anchors = [{"user": A, "oid": 777, "answer": ans}]
+    window, _ = w.write()
+    loc = ev.locate_anchors(window)
+    assert loc == [dict(user=A, oid=777, pos=(h, 0, 1), k=1)]

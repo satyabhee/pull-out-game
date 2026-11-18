@@ -134,23 +134,26 @@ def _replay(window, hl_data, anchors_path, truth: dict[tuple, tuple] | None, nea
     calls: list[tuple] = []
 
     def wrapped(user, asset, hl_oid):
+        before = Counter(inner.stats)
         r = inner(user, asset, hl_oid)
-        calls.append((user, asset, hl_oid, r))
+        calls.append((user, asset, hl_oid, r, sorted((inner.stats - before).keys())))
         return r
 
     rp.engine.resolve_oid = wrapped
     for _ in rp:
         pass
-    for user, asset, hl_oid, r in calls:
+    for user, asset, hl_oid, r, how in calls:
         pos = (truth or {}).get((user, asset, hl_oid))
         if pos is None:
             continue
         true_oid = rec.created.get(pos)
-        verdicts["correct" if r is not None and r == true_oid else "abstained" if r is None else "WRONG"] += 1
+        v = "correct" if r is not None and r == true_oid else "abstained" if r is None else "WRONG"
+        verdicts[v] += 1
+        verdicts[f"{v} via {'+'.join(how)}"] += 1
     return dict(inner.stats), verdicts
 
 
-def heldout(window, hl_data, folds=3, nearest_ratio=3) -> dict:
+def heldout(window, hl_data, folds=3, nearest_ratio=3, resolver_kw=None) -> dict:
     window = Path(window)
     located = locate_anchors(window)
     anchors = json.loads((window / "anchors.json").read_text())
@@ -163,7 +166,7 @@ def heldout(window, hl_data, folds=3, nearest_ratio=3) -> dict:
         with tempfile.TemporaryDirectory() as td:
             ap = Path(td) / "anchors.json"
             ap.write_text(json.dumps(keep))
-            stats, v = _replay(window, hl_data, ap, truth, nearest_ratio)
+            stats, v = _replay(window, hl_data, ap, truth, nearest_ratio, None, **(resolver_kw or {}))
         total += v
         stats_all.append(stats)
     return dict(located=len(located), folds=folds, verdicts=dict(total), fold_stats=stats_all)
@@ -177,9 +180,9 @@ def ASSET_OF(anchors, loc) -> int:
     raise KeyError(loc)
 
 
-def coverage(window, hl_data, nearest_ratio=3, **replay_kw) -> dict:
+def coverage(window, hl_data, nearest_ratio=3, resolver_kw=None, **replay_kw) -> dict:
     """replay_kw: Replay options, e.g. reseed=True, keep_known=True (lead-in chunks)."""
-    stats, _ = _replay(window, hl_data, None, None, nearest_ratio, replay_kw)
+    stats, _ = _replay(window, hl_data, None, None, nearest_ratio, replay_kw, **(resolver_kw or {}))
     total = sum(stats.get(k, 0) for k in ("resolved", "no_candidate", "ambiguous", "prewindow"))
     return dict(stats=stats, lookups=total,
                 shares={k: f"{100 * stats.get(k, 0) / total:.1f}%" for k in ("resolved", "no_candidate", "ambiguous", "prewindow")}
@@ -194,6 +197,8 @@ def main(argv=None):
     ap.add_argument("--folds", type=int, default=3)
     ap.add_argument("--nearest-ratio", type=int, default=3)
     ap.add_argument("--probes")
+    ap.add_argument("--baseline", action="store_true", help="coverage/heldout: switch the joint layers off (joint_tx/joint_block)")
+    ap.add_argument("--chunks", action="store_true", help="coverage: WINDOW is a folder of lead-in chunks (reseed+keep_known)")
     a = ap.parse_args(argv)
     if a.mode == "structure":
         for t, c in sorted(tx_structure(a.window).items()):
@@ -201,9 +206,18 @@ def main(argv=None):
         if a.probes:
             print(probe_summary(probe_rows(a.probes)))
     elif a.mode == "heldout":
-        print(json.dumps(heldout(a.window, a.hl_data, a.folds, a.nearest_ratio), indent=1))
+        print(json.dumps(heldout(a.window, a.hl_data, a.folds, a.nearest_ratio,
+                                      dict(joint_tx=False, joint_block=False) if a.baseline else None), indent=1))
     else:
-        print(json.dumps(coverage(a.window, a.hl_data, a.nearest_ratio), indent=1))
+        rk = dict(joint_tx=False, joint_block=False) if a.baseline else {}
+        if a.chunks:
+            tot: Counter = Counter()
+            for w in sorted(p for p in Path(a.window).iterdir() if (p / "window.json").exists()):
+                tot.update(coverage(w, a.hl_data, a.nearest_ratio, rk, reseed=True, keep_known=True)["stats"])
+            n = sum(tot.get(k, 0) for k in ("resolved", "no_candidate", "ambiguous", "prewindow"))
+            print(json.dumps(dict(stats=dict(tot), lookups=n), indent=1))
+        else:
+            print(json.dumps(coverage(a.window, a.hl_data, a.nearest_ratio, rk), indent=1))
 
 
 if __name__ == "__main__":

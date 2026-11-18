@@ -1,0 +1,36 @@
+{
+ "located": 21,
+ "folds": 3,
+ "verdicts": {
+  "WRONG": 1,
+  "WRONG via resolved": 1,
+  "abstained": 11,
+  "abstained via no_candidate": 9,
+  "correct": 9,
+  "correct via resolved": 9,
+  "abstained via ambiguous": 2
+ },
+ "fold_stats": [
+  {
+   "prewindow": 3011,
+   "no_candidate": 24456,
+   "resolved": 11651,
+   "ambiguous": 45504,
+   "resolved_nearest": 3554
+  },
+  {
+   "prewindow": 3011,
+   "no_candidate": 24632,
+   "resolved": 11794,
+   "ambiguous": 45185,
+   "resolved_nearest": 3267
+  },
+  {
+   "prewindow": 2859,
+   "no_candidate": 24381,
+   "resolved": 11947,
+   "ambiguous": 45435,
+   "resolved_nearest": 3552
+  }
+ ]
+}
