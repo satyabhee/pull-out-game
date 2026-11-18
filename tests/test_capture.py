@@ -260,3 +260,90 @@ def test_lookups_are_paced_and_default_gap_is_two_seconds(tmp_path):
 
 def test_default_mode_is_cloid():
     assert cap.ANCHOR_MODE == "cloid"
+
+
+# ---------------------------------------------------------------- info lookups (fills, open orders, history)
+def trade(users, side="B", px="60000", sz="0.01", t=1010):
+    return {"coin": "BTC", "side": side, "px": px, "sz": sz, "time": t, "hash": "0xh", "tid": 1, "users": users}
+
+
+def test_user_pickers_are_deterministic():
+    tr = [trade(["0xa", "0xm"]), trade(["0xb", "0xm"]), trade(["0xa", "0xn"], side="A", sz="1")]
+    assert cap.busiest_users(tr, 2) == ["0xa", "0xm"]                 # 2 trades each, ties by address
+    assert cap.top_makers(tr, 2) == ["0xa", "0xm"]                    # taker sold 1 BTC to 0xa: 0xa is the biggest maker
+    assert cap.trade_rows([{"msg": {"channel": "trades", "data": tr}}], 1000, 1005) == []
+
+
+def test_int_cancel_users_counts_btc_eth_int_oid_targets_only():
+    b = {"txs": [{"user": "0xU", "error": None, "action": {"type": "cancel", "cancels": [{"a": 0, "o": 5}, {"a": 7, "o": 6}]}},
+                 {"user": "0xu", "error": None, "action": {"type": "modify", "oid": 9, "order": {"a": 1}}},
+                 {"user": "0xv", "error": None, "action": {"type": "modify", "oid": "0xcloid", "order": {"a": 1}}},
+                 {"user": "0xw", "error": "x", "action": {"type": "cancel", "cancels": [{"a": 0, "o": 5}]}}]}
+    assert cap.int_cancel_users(b) == {"0xu": 2}
+
+
+class FakeBudget:
+    def __init__(self):
+        self.took, self.added = [], []
+
+    def take(self, w):
+        self.took.append(w)
+
+    def add(self, w):
+        self.added.append(w)
+
+
+def test_chunk_capture_asks_fills_history_and_open_orders_and_saves_them(tmp_home):
+    calls = []
+
+    def call(kind):
+        def f(user, *args):
+            calls.append((kind, user, args))
+            return [{"oid": 1}] * 45 if kind == "userFillsByTime" else []
+        return f
+    budget = FakeBudget()
+    w = cap.Writer(lookup=lambda u, o: {"status": "unknownOid"}, info_gap_s=0, budget=budget,
+                   calls={k: call(k) for k in ("userFillsByTime", "historicalOrders", "frontendOpenOrders")})
+    trades = [trade(["0xa", "0xm"], t=1011), trade(["0xb", "0xm"], t=1012), trade(["0xc", "0xz"], t=5000)]
+    assert cap.ask_open_orders(w, 999, trades=trades, n=1) == ["0xm"]
+    extras = {"fill_users": 2, "hist_users": 1, "trades": lambda t0, t1: [t for t in trades if t0 <= t["time"] <= t1]}
+    meta = {"kind": "chunk", "snapshot_time": 999}
+    assert cap.capture(StubFetcher(), 10, 14, meta, writer=w, state={}, warmup=0, max_anchors=0, extras=extras) == "complete"
+    d = tmp_home / "windows" / "10-14"
+    fills = json.loads((d / "fills.json").read_text())
+    assert [(f["user"], f["args"]) for f in fills] == [("0xm", [10, 6014]), ("0xa", [10, 6014])]
+    assert len(fills[0]["answer"]) == 45 and fills[0]["t0"] == 1010
+    hist = json.loads((d / "hist_orders.json").read_text())
+    assert [(h["user"], h["int_cancels"]) for h in hist] == [("0xu", 5)]
+    opn = json.loads((d / "open_orders.json").read_text())
+    assert [(o["user"], o["snapshot_time"]) for o in opn] == [("0xm", 999)]
+    assert meta["info_userFillsByTime"] == 2 and meta["info_frontendOpenOrders"] == 1 and meta["info_historicalOrders_errors"] == 0
+    assert sorted(budget.took) == [20, 20, 20, 20] and budget.added.count(2) == 2   # 45 fills -> +2 weight each
+
+
+def test_info_errors_are_kept_and_counted(tmp_home):
+    def boom(user, *a):
+        raise OSError("429")
+    w = cap.Writer(lookup=lambda u, o: {}, info_gap_s=0, budget=FakeBudget(), calls={"historicalOrders": boom})
+    meta = {"kind": "chunk"}
+    cap.capture(StubFetcher(), 10, 11, meta, writer=w, state={}, warmup=0, max_anchors=0, extras={"hist_users": 1})
+    assert meta["info_historicalOrders_errors"] == 1
+
+
+def test_legacy_capture_asks_nothing_extra(tmp_home):
+    w = cap.Writer(lookup=lambda u, o: {}, info_gap_s=0, budget=FakeBudget(), calls={})
+    meta = {}
+    cap.capture(StubFetcher(), 10, 11, meta, writer=w, state={}, warmup=0, max_anchors=0)
+    assert not any(k.startswith("info_") for k in meta)
+    assert not (tmp_home / "windows" / "10-11" / "fills.json").exists()
+
+
+def test_budget_waits_when_a_minute_is_full():
+    import info
+    now = [0.0]
+    slept = []
+    b = info.Budget(per_min=50, clock=lambda: now[0], sleep=lambda s: (slept.append(s), now.__setitem__(0, now[0] + s)))
+    b.take(20); b.take(20)
+    b.take(20)                                            # 60 > 50: waits until the first entry is a minute old
+    assert slept and now[0] >= 60
+    assert info.weight_of("userFillsByTime", [{}] * 45) == 22 and info.weight_of("orderStatus") == 2

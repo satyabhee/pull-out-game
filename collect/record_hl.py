@@ -7,6 +7,16 @@ Records, for the coins you pass:
   bbo_<COIN>.jsonl     best bid/offer on every block where it changes   -> the real touch (replay ALO gate)
 and network-wide:
   blocks.jsonl         every block header (height, blockTime, numTxs)   -> maps clock time to block height
+optional extra streams (environment variables):
+  book_<COIN>_sf<N>.jsonl  L2_SIGFIGS=4 (default; "" = off): l2Book aggregated to N significant figures, so the
+                       20 levels per side reach much deeper than the full-precision book (own connection: the
+                       messages do not say which aggregation they are)
+  user_orders.jsonl    TRACK_USERS=6 (default; 0 = off): orderUpdates (every placement / cancel / fill / reject of
+  user_fills.jsonl     that user, with oid) and userFills for the top makers by BTC/ETH maker notional, re-picked
+  tracked_users.jsonl  every TRACK_EVERY_S=1800 s (first pick after TRACK_WARMUP_S=600 s, or TRACK_USER_LIST=a,b at
+                       start). One connection per user, because orderUpdates messages carry no user; the IP allows
+                       10 connections, so api + rpc + book_sf + 6 users = 9. tracked_users.jsonl logs each set with
+                       its start time: a user's stream is complete only while they are in the set.
 
 It does NOT record transactions: the live explorer tx feed is only a ~1-in-2000 sample.
 Fetch complete blocks later with fetch_blocks.py for the time windows you need.
@@ -17,6 +27,11 @@ Usage:  python3 record_hl.py BTC ETH      (Mac: caffeinate -i python3 record_hl.
 import asyncio, gzip, json, os, shutil, sys, time
 
 COINS = sys.argv[1:] or ["BTC"]
+L2_SIGFIGS = os.environ.get("L2_SIGFIGS", "4")
+TRACK_USERS = int(os.environ.get("TRACK_USERS", 6))
+TRACK_EVERY_S = float(os.environ.get("TRACK_EVERY_S", 1800))
+TRACK_WARMUP_S = float(os.environ.get("TRACK_WARMUP_S", 600))
+TRACK_USER_LIST = [u.strip().lower() for u in os.environ.get("TRACK_USER_LIST", "").split(",") if u.strip()]
 ROOT = "hl_data"
 API_WS = "wss://api.hyperliquid.xyz/ws"
 RPC_WS = "wss://rpc.hyperliquid.xyz/ws"
@@ -66,13 +81,56 @@ def api_subscriptions(coins):
                                        {"type": "bbo", "coin": c})]
 
 
-def route_api(m, trades, books, bbos, other):
+def sigfig_subscriptions(coins, n):
+    return [{"type": "l2Book", "coin": c, "nSigFigs": int(n)} for c in coins]
+
+
+def user_subscriptions(user):
+    return [{"type": "orderUpdates", "user": user}, {"type": "userFills", "user": user}]
+
+
+class MakerTally:
+    """Maker notional per user from the trades feed; pick(n) = top n since the last pick (ties by address)."""
+
+    def __init__(self):
+        self.c = {}
+
+    def feed(self, trades):
+        for t in trades:
+            try:
+                maker = (t["users"][1] if t["side"] == "B" else t["users"][0]).lower()
+                self.c[maker] = self.c.get(maker, 0.0) + float(t["px"]) * float(t["sz"])
+            except Exception:
+                continue
+
+    def pick(self, n):
+        top = [u for u, _ in sorted(self.c.items(), key=lambda x: (-x[1], x[0]))][:n]
+        self.c = {}
+        return top
+
+
+def route_user(m, user, orders, fills, other):
+    """One message of a user's connection -> user_orders / user_fills, tagged with the user."""
+    if not isinstance(m, dict) or m.get("channel") in ("subscriptionResponse", "pong"):
+        return
+    ch = m.get("channel")
+    if ch == "orderUpdates":
+        orders.write({"user": user, "data": m.get("data")})
+    elif ch == "userFills":
+        fills.write({"user": user, "data": m.get("data")})
+    else:
+        other.write({"user": user, "msg": m})
+
+
+def route_api(m, trades, books, bbos, other, tally=None):
     """Send one api-ws message to its sink (dicts keyed by coin); anything unexpected goes to `other`."""
     if not isinstance(m, dict) or m.get("channel") == "subscriptionResponse":
         return
     d = m.get("data")
     ch = m.get("channel")
     if ch == "trades" and d:
+        if tally is not None:
+            tally.feed(d)
         trades.get(d[0].get("coin"), other).write(m)
     elif ch == "l2Book" and isinstance(d, dict):
         books.get(d.get("coin"), other).write(m)
@@ -82,11 +140,38 @@ def route_api(m, trades, books, bbos, other):
         other.write(m)
 
 
+async def track_users(tally, orders, fills, tracked, other, n=None, every_s=None, warmup_s=None, initial=None,
+                      start=None, sleep=None):
+    """Keep one orderUpdates+userFills connection per tracked user; re-pick the set every `every_s`."""
+    n = TRACK_USERS if n is None else n
+    every_s = TRACK_EVERY_S if every_s is None else every_s
+    sleep = sleep or asyncio.sleep
+    start = start or (lambda u: asyncio.ensure_future(
+        stream(API_WS, user_subscriptions(u), lambda m: route_user(m, u, orders, fills, other))))
+    tasks = {}
+    users = list(initial if initial is not None else TRACK_USER_LIST)[:n]
+    if not users:
+        await sleep(TRACK_WARMUP_S if warmup_s is None else warmup_s)
+        users = tally.pick(n)
+    while True:
+        for u in [u for u in tasks if u not in users]:
+            tasks.pop(u).cancel()
+        for u in users:
+            if u not in tasks:
+                tasks[u] = start(u)
+        tracked.write({"time": int(time.time() * 1000), "users": sorted(tasks)})
+        await sleep(every_s)
+        users = tally.pick(n) or users
+
+
 async def main():
     trades = {c: Sink(f"trades_{c}") for c in COINS}
     books = {c: Sink(f"book_{c}") for c in COINS}
     bbos = {c: Sink(f"bbo_{c}") for c in COINS}
     blocks, other = Sink("blocks"), Sink("other")
+    sf_books = {c: Sink(f"book_{c}_sf{L2_SIGFIGS}") for c in COINS} if L2_SIGFIGS else {}
+    orders, fills, tracked = Sink("user_orders"), Sink("user_fills"), Sink("tracked_users")
+    tally = MakerTally()
 
     def route_rpc(m):
         # explorer messages arrive as bare lists; keep only block headers
@@ -95,12 +180,18 @@ async def main():
                 if isinstance(it, dict) and "numTxs" in it:
                     blocks.write(it)
 
+    jobs = [stream(API_WS, api_subscriptions(COINS), lambda m: route_api(m, trades, books, bbos, other, tally)),
+            stream(RPC_WS, [{"type": "explorerBlock"}], route_rpc)]
+    if sf_books:
+        jobs.append(stream(API_WS, sigfig_subscriptions(COINS, L2_SIGFIGS),
+                           lambda m: route_api(m, {}, sf_books, {}, other)))
+    if TRACK_USERS:
+        jobs.append(track_users(tally, orders, fills, tracked, other))
     try:
-        await asyncio.gather(stream(API_WS, api_subscriptions(COINS),
-                                    lambda m: route_api(m, trades, books, bbos, other)),
-                             stream(RPC_WS, [{"type": "explorerBlock"}], route_rpc))
+        await asyncio.gather(*jobs)
     finally:
-        for s in [*trades.values(), *books.values(), *bbos.values(), blocks, other]:
+        for s in [*trades.values(), *books.values(), *bbos.values(), *sf_books.values(), blocks, other,
+                  orders, fills, tracked]:
             s.close()
 
 

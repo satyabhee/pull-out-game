@@ -28,6 +28,11 @@ Settings (environment variables):
   ANCHOR_MODE=cloid    which lookups: cloid = placements with a cloid, spread over the fetched blocks (the answer
                        is an exact oid at a known position, so the estimator can use it); targets = the legacy
                        int-oid cancel targets (mostly placed before the chunk, so never locatable)
+  CHUNK_FILL_USERS=6   chunks: userFillsByTime for the users in the most BTC/ETH trades of the fetched blocks
+                       (fills.json; every fill carries the order's oid and the tx hash -> exact anchors)
+  CHUNK_OPEN_USERS=5   chunks: frontendOpenOrders of the top recent makers, asked at the snapshot (open_orders.json)
+  CHUNK_HIST_USERS=1   chunks: historicalOrders of the users with the most int-oid cancels (hist_orders.json)
+  INFO_WEIGHT_PER_MIN=600  weight budget for all info lookups (IP limit 1200/min; collect/info.py)
   MAX_AGE_MIN=30       never request a block estimated older than this
   FRESH_MIN=20         on restart, finish a partial window only if its oldest missing block is younger
   ONCE=1               capture one window/chunk and exit (for testing)
@@ -35,6 +40,7 @@ Needs the hl-recorder service: block headers and book snapshots come from its fi
 """
 import collections, datetime, glob, gzip, json, os, queue, shutil, sys, threading, time, urllib.request
 from fetch_blocks import DEFAULT_INTERVAL, ArchivedCap, Fetcher, NotYet, TooOld, last_line, recorder_head, save
+import info
 
 HOME = os.path.dirname(os.path.abspath(__file__))
 WIN_DIR = os.path.join(HOME, "windows")
@@ -49,6 +55,11 @@ REQUEST_LOG = os.path.join(HOME, "requests.jsonl")
 MAX_ANCHORS = int(os.environ.get("MAX_ANCHORS", 100))
 CHUNK_ANCHORS = int(os.environ.get("CHUNK_ANCHORS", 2))
 ANCHOR_MODE = os.environ.get("ANCHOR_MODE", "cloid")
+CHUNK_FILL_USERS = int(os.environ.get("CHUNK_FILL_USERS", 6))
+CHUNK_OPEN_USERS = int(os.environ.get("CHUNK_OPEN_USERS", 5))
+CHUNK_HIST_USERS = int(os.environ.get("CHUNK_HIST_USERS", 1))
+INFO_FILES = {"userFillsByTime": "fills.json", "frontendOpenOrders": "open_orders.json",
+              "historicalOrders": "hist_orders.json"}
 FRESH_MIN = float(os.environ.get("FRESH_MIN", 20))
 # Never request a block older than this. Nov 18 log: the cap hit while fetching ~84-min-old blocks after
 # ~10.5k blocks that day, so "archived" starts far earlier than the ~3 h assumed before. Chunks fetch
@@ -108,15 +119,20 @@ def order_status(user, oid):
 
 
 class Writer:
-    """Background thread for everything that isn't an explorer request: gzip+save blocks, and
-    orderStatus anchor lookups (info API, paced >= 2 s apart). drain() waits for all of it."""
+    """Background thread for everything that isn't an explorer request: gzip+save blocks, orderStatus anchor
+    lookups (paced >= 2 s apart) and the other info lookups (userFillsByTime, frontendOpenOrders,
+    historicalOrders; paced by the weight budget). Every info call books its weight in `budget`.
+    drain() waits for all of it."""
 
-    def __init__(self, lookup=None, saver=None, info_gap_s=2.0):
+    def __init__(self, lookup=None, saver=None, info_gap_s=2.0, calls=None, budget=None):
         self.q = queue.Queue()
         self.lock = threading.Lock()
         self.anchors = []
+        self.info = collections.defaultdict(list)      # kind -> [{"user", "kind", "asked_at", ..., "answer"}]
         self.errors = []
         self.lookup, self.saver, self.info_gap_s = lookup or order_status, saver or save, info_gap_s
+        self.calls = calls or info.CALLS
+        self.budget = budget or info.Budget()
         self._last_info = 0.0
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -126,11 +142,24 @@ class Writer:
             try:
                 if job[0] == "save":
                     self.saver(job[1], job[2])
+                elif job[0] == "info":
+                    _, kind, user, args, extra = job
+                    self.budget.take(info.weight_of(kind))
+                    t = time.time()
+                    try:
+                        r = self.calls[kind](user, *args)
+                    except Exception as e:
+                        r = {"error": repr(e)}
+                    self.budget.add(info.weight_of(kind, r) - info.weight_of(kind))
+                    with self.lock:
+                        self.info[kind].append({**extra, "user": user, "kind": kind, "args": list(args),
+                                                "asked_at": t, "answered_at": time.time(), "answer": r})
                 else:
                     _, user, oid, ch, extra = job
                     wait = self._last_info + self.info_gap_s - time.time()
                     if wait > 0:
                         time.sleep(wait)
+                    self.budget.take(info.weight_of("orderStatus"))
                     try:
                         r = self.lookup(user, oid)
                     except Exception as e:
@@ -153,9 +182,19 @@ class Writer:
         as its own anchor format)."""
         self.q.put(("anchor", user, oid, cancel_height, extra or {}))
 
+    def ask_info(self, kind, user, args=(), extra=None):
+        """One info lookup (collect/info.py CALLS[kind](user, *args)); the answer is kept raw in info[kind]."""
+        self.q.put(("info", kind, user, tuple(args), extra or {}))
+
     def snapshot(self):
         with self.lock:
             return list(self.anchors)
+
+    def take_info(self):
+        """Every info answer so far, by kind; clears them."""
+        with self.lock:
+            out, self.info = dict(self.info), collections.defaultdict(list)
+        return out
 
     def drain(self):
         self.q.join()
@@ -246,8 +285,97 @@ class AnchorPicker:
         return user, cloid, {"kind": "cloid", "placed_height": h, "tx": t, "item": i}
 
 
-def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max_anchors=None):
-    """Fetch start..end oldest-first into its folder; collect anchors as we go. Returns final status."""
+def trade_rows(rows, t0_ms=None, t1_ms=None):
+    """Recorder trade messages -> [{coin, side, px, sz, time, hash, tid, users}] within [t0, t1]."""
+    out = []
+    for r in rows:
+        m = r.get("msg") if isinstance(r, dict) else None
+        for t in (m or {}).get("data") or []:
+            if isinstance(t, dict) and "users" in t and (t0_ms is None or t["time"] >= t0_ms) \
+                    and (t1_ms is None or t["time"] <= t1_ms):
+                out.append(t)
+    return out
+
+
+def recorder_trades(t0_ms, t1_ms, coins=("BTC", "ETH"), nbytes=8 << 20):
+    """BTC/ETH trades the recorder wrote with time in [t0, t1] (current hour: file tail; earlier hour: whole .gz)."""
+    rows = []
+    for coin in coins:
+        hours = sorted({time.strftime("%Y-%m-%d/%H", time.gmtime(t / 1000)) for t in (t0_ms, t1_ms)})
+        for hour in hours:
+            plain = os.path.join(HOME, "hl_data", hour, f"trades_{coin}.jsonl")
+            if os.path.exists(plain):
+                rows += tail_lines(plain, nbytes)
+            elif os.path.exists(plain + ".gz"):
+                with gzip.open(plain + ".gz", "rt") as f:
+                    for line in f:
+                        try:
+                            rows.append(json.loads(line))
+                        except Exception:
+                            pass
+    return trade_rows(rows, t0_ms, t1_ms)
+
+
+def busiest_users(trades, n, exclude=()):
+    """Users in the most trades (either side), most first; ties by address (deterministic)."""
+    c = collections.Counter(u.lower() for t in trades for u in t["users"])
+    return [u for u, _ in sorted(c.items(), key=lambda x: (-x[1], x[0])) if u not in exclude][:n]
+
+
+def top_makers(trades, n):
+    """Users with the most maker notional (the resting side: seller when the taker bought)."""
+    c = collections.Counter()
+    for t in trades:
+        maker = t["users"][1] if t["side"] == "B" else t["users"][0]
+        c[maker.lower()] += float(t["px"]) * float(t["sz"])
+    return [u for u, _ in sorted(c.items(), key=lambda x: (-x[1], x[0]))][:n]
+
+
+def int_cancel_users(block):
+    """user -> number of BTC/ETH int-oid cancel/modify-target items in one block's successful txs."""
+    c = collections.Counter()
+    for tx in block["txs"]:
+        if tx.get("error") is not None:
+            continue
+        a = tx.get("action") or {}
+        kind = a.get("type")
+        its = (a.get("cancels", []) if kind == "cancel" else [{"a": (a.get("order") or {}).get("a"), "o": a.get("oid")}]
+               if kind == "modify" else [{"a": (m.get("order") or {}).get("a"), "o": m.get("oid")}
+                                         for m in a.get("modifies", [])] if kind == "batchModify" else [])
+        n = sum(1 for it in its if it.get("a") in (0, 1) and isinstance(it.get("o"), int) and not isinstance(it.get("o"), bool))
+        if n:
+            c[tx["user"].lower()] += n
+    return c
+
+
+def ask_extras(writer, extras, meta, cancels):
+    """After a chunk's blocks are fetched: userFillsByTime for the users in the most trades of the fetched time
+    range, historicalOrders for the users with the most int-oid cancels."""
+    t0, t1 = meta.get("first_block_time"), meta.get("last_block_time")
+    if t0 is None or t1 is None:
+        return
+    nf = extras.get("fill_users", 0)
+    if nf:
+        trades = extras["trades"](t0, t1 + 1000) if extras.get("trades") else []
+        for u in busiest_users(trades, nf):
+            writer.ask_info("userFillsByTime", u, (t0 - 1000, t1 + 5000), {"t0": t0, "t1": t1})
+    for u, _ in sorted(cancels.items(), key=lambda x: (-x[1], x[0]))[:extras.get("hist_users", 0)]:
+        writer.ask_info("historicalOrders", u, (), {"int_cancels": cancels[u]})
+
+
+def save_info(d, got, meta):
+    """Append this capture's info answers to the window's per-kind files; count them on the meta."""
+    for kind, recs in got.items():
+        path = os.path.join(d, INFO_FILES.get(kind, kind + ".json"))
+        old = json.load(open(path)) if os.path.exists(path) else []
+        save_json(path, old + recs)
+        meta[f"info_{kind}"] = len(old) + len(recs)
+        meta[f"info_{kind}_errors"] = sum(1 for r in old + recs if isinstance(r["answer"], dict) and "error" in r["answer"])
+
+
+def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max_anchors=None, extras=None):
+    """Fetch start..end oldest-first into its folder; collect anchors as we go. Returns final status.
+    extras (chunks): {"fill_users", "hist_users", "trades": fn(t0_ms, t1_ms) -> recorder trades}; see ask_extras."""
     writer = writer or Writer()
     state = state if state is not None else {}
     warmup = WARMUP if warmup is None else warmup
@@ -263,6 +391,7 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
     meta.update(start_height=start, end_height=end, warmup_end_height=start + warmup, status="fetching")
     meta.setdefault("failed_heights", [])
     fetched_now, t0, status = 0, time.time(), None
+    cancels = collections.Counter()
     for i, h in enumerate(range(start, end + 1)):
         p = os.path.join(d, f"{h}.json.gz")
         b = None
@@ -308,6 +437,7 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
                 meta["first_block_time" if h == start else "last_block_time"] = bt
         if b is not None:
             picker.feed(h, b)
+            cancels.update(int_cancel_users(b))
         # one orderStatus lookup at the end of every `every`-block segment; the writer paces them >= 2 s apart
         if n_asked < max_anchors and (i + 1) % every == 0:
             pick = picker.take()
@@ -318,10 +448,13 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
         if i % 300 == 0 and i:
             meta["blocks_on_disk"] = len(glob.glob(os.path.join(d, "*.json.gz")))
             save_json(wpath, meta); save_json(apath, old + writer.snapshot())
+    if extras and status is None:
+        ask_extras(writer, extras, meta, cancels)
     writer.drain()                                         # every block on disk, every lookup answered
     anchors = old + writer.snapshot()
     with writer.lock:
         writer.anchors = []
+    save_info(d, writer.take_info(), meta)
     secs = time.time() - t0
     meta["fetch_finished"] = time.time()
     meta["blocks_per_s"] = round(fetched_now / secs, 3) if secs > 0 else None
@@ -430,6 +563,23 @@ def recent_headers():
             if isinstance(r.get("msg"), dict) and "height" in r["msg"]]
 
 
+def chunk_extras():
+    return {"fill_users": CHUNK_FILL_USERS, "hist_users": CHUNK_HIST_USERS, "trades": recorder_trades}
+
+
+def ask_open_orders(writer, snap_ms, trades=None, n=None):
+    """frontendOpenOrders of the top makers of the last 10 min, asked as soon as a chunk is planned (the resting
+    orders at the snapshot, with oid, timestamp and reduce-only flag). Stored with the chunk (open_orders.json)."""
+    n = CHUNK_OPEN_USERS if n is None else n
+    if not n:
+        return []
+    trades = recorder_trades(snap_ms - 600_000, snap_ms) if trades is None else trades
+    users = top_makers(trades, n)
+    for u in users:
+        writer.ask_info("frontendOpenOrders", u, (), {"snapshot_time": snap_ms})
+    return users
+
+
 def run_chunks(fetcher, state, writer):
     last_snap, last_start = 0, 0.0
     while True:
@@ -449,7 +599,9 @@ def run_chunks(fetcher, state, writer):
         last_snap, last_start = snap, time.time()
         start, end, warmup = with_lead_in(span, LEAD_IN_BLOCKS)
         meta = {"kind": "chunk", "snapshot_time": snap, "lead_in_blocks": warmup}
-        status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=warmup, max_anchors=CHUNK_ANCHORS)
+        ask_open_orders(writer, snap)
+        status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=warmup, max_anchors=CHUNK_ANCHORS,
+                         extras=chunk_extras())
         save_json(STATE, state)
         if status == "archived_cap":
             if ONCE:

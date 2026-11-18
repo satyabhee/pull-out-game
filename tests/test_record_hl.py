@@ -32,3 +32,67 @@ def test_routes_each_channel_to_its_sink():
         record_hl.route_api(m, trades, books, bbos, other)
     assert [len(x["BTC"].got) for x in (trades, books, bbos)] == [1, 1, 1]
     assert other.got == [msgs[3]]
+
+
+def test_maker_tally_picks_top_maker_notional_and_resets():
+    t = record_hl.MakerTally()
+    t.feed([{"side": "B", "px": "100", "sz": "2", "users": ["0xT", "0xM"]},      # taker bought: seller made
+            {"side": "A", "px": "100", "sz": "1", "users": ["0xN", "0xT"]},
+            {"side": "A", "px": "100", "sz": "1", "users": ["0xA", "0xT"]}, {"bad": 1}])
+    assert t.pick(2) == ["0xm", "0xa"] and t.pick(2) == []
+
+
+def test_user_and_sigfig_subscriptions():
+    assert record_hl.user_subscriptions("0xu") == [{"type": "orderUpdates", "user": "0xu"},
+                                                   {"type": "userFills", "user": "0xu"}]
+    assert record_hl.sigfig_subscriptions(["BTC"], "4") == [{"type": "l2Book", "coin": "BTC", "nSigFigs": 4}]
+
+
+def test_route_user_tags_the_user_and_trades_feed_the_tally():
+    orders, fills, other = FakeSink(), FakeSink(), FakeSink()
+    record_hl.route_user({"channel": "orderUpdates", "data": [{"order": {"oid": 1}, "status": "open"}]}, "0xu",
+                         orders, fills, other)
+    record_hl.route_user({"channel": "userFills", "data": {"user": "0xu", "fills": []}}, "0xu", orders, fills, other)
+    record_hl.route_user({"channel": "subscriptionResponse"}, "0xu", orders, fills, other)
+    assert orders.got == [{"user": "0xu", "data": [{"order": {"oid": 1}, "status": "open"}]}]
+    assert fills.got[0]["user"] == "0xu" and other.got == []
+    tally = record_hl.MakerTally()
+    record_hl.route_api({"channel": "trades", "data": [{"coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                                                        "users": ["0xa", "0xb"]}]},
+                        {"BTC": FakeSink()}, {}, {}, FakeSink(), tally)
+    assert tally.pick(1) == ["0xb"]
+
+
+def test_track_users_swaps_connections_and_logs_each_set():
+    import asyncio
+
+    class Task:
+        def __init__(self, u):
+            self.u, self.cancelled = u, False
+
+        def cancel(self):
+            self.cancelled = True
+
+    started, tracked = [], FakeSink()
+    tally = record_hl.MakerTally()
+    picks = [["0xb", "0xc"]]
+    tally.pick = lambda n: picks.pop(0) if picks else []
+    rounds = []
+
+    async def sleep(s):
+        rounds.append(s)
+        if len(rounds) >= 3:
+            raise asyncio.CancelledError
+
+    def start(u):
+        t = Task(u)
+        started.append(t)
+        return t
+    try:
+        asyncio.run(record_hl.track_users(tally, FakeSink(), FakeSink(), tracked, FakeSink(), n=2, every_s=5,
+                                          initial=["0xa", "0xb"], start=start, sleep=sleep))
+    except asyncio.CancelledError:
+        pass
+    assert [t.u for t in started] == ["0xa", "0xb", "0xc"]
+    assert started[0].cancelled and not started[1].cancelled
+    assert [m["users"] for m in tracked.got] == [["0xa", "0xb"], ["0xb", "0xc"], ["0xb", "0xc"]]

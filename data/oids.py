@@ -39,7 +39,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from data.parse import _block_files, read_block
-from engine_py.types import ASSETS, Modify, Place
+from engine_py.types import ASSETS, Modify, Place, Side
 
 _ESTIMATOR_CACHE_MAX = 8
 _estimator_cache: OrderedDict = OrderedDict()
@@ -76,12 +76,49 @@ def _cancel_items(action: dict) -> list[tuple[int, int]]:
     return [(a, o) for a, o in out if a in ASSETS and isinstance(o, int) and not isinstance(o, bool)]
 
 
+def _put_px(oid_px: dict, oid: int, user: str, asset: int, buy: bool, px: str, ts) -> None:
+    try:
+        ticks = ASSETS[asset].px_to_ticks(px)
+    except Exception:
+        return
+    old = oid_px.get(oid)
+    val = (user, asset, buy, ticks, ts if ts is not None else (old[4] if old else None))
+    if old is not None and old[:4] != val[:4]:
+        oid_px[oid] = None                                 # sources disagree: unusable
+    elif old is not None or oid not in oid_px:
+        oid_px[oid] = val
+
+
+def _locate_takers(fills: list, tx: dict, height: int, t: int, located: dict) -> None:
+    """Taker fills of one tx -> the one order item of that tx (same user, asset, side, limit allowing the price)."""
+    if tx.get("error") is not None:
+        return
+    items = _order_items(tx["action"])
+    for f in fills:
+        if f["user"] != tx["user"].lower():
+            continue
+        px = Decimal(f["px"])
+        hit = [i for i, it in enumerate(items)
+               if it.get("a") == f["asset"] and bool(it.get("b")) == f["buy"]
+               and _limit_allows(it, f["buy"], px)]
+        if len(hit) == 1:
+            located.setdefault(f["oid"], []).append((height, t, hit[0]))
+
+
+def _limit_allows(item: dict, buy: bool, px: Decimal) -> bool:
+    try:
+        lim = Decimal(item["p"])
+    except Exception:
+        return False
+    return lim >= px if buy else lim <= px
+
+
 class OidEstimator:
     """Map a placement position to an estimated Hyperliquid oid."""
 
     def __init__(self, counts: dict[Pos, int], anchors: list[tuple[int, int]],
                  groups: dict | None = None, block_groups: dict | None = None,
-                 placers: dict | None = None):
+                 placers: dict | None = None, exact: dict | None = None, oid_px: dict | None = None):
         """counts: position -> number of id-consuming items before it in the window.
         anchors: (count, real oid) pairs, any order.
         groups: (height, user) -> list of per-tx cancel groups (>= 2 items each) of (asset, oid).
@@ -90,20 +127,52 @@ class OidEstimator:
         self.groups = groups or {}
         self.block_groups = block_groups or {}
         self.placers = placers or {}      # (user, asset) -> counted positions of EVERY in-window placement, ascending
+        self.exact = exact or {}          # real oid -> placement position, from located facts/anchors
+        self.oid_px = oid_px or {}        # real oid -> (user, asset, buy, px ticks, timestamp | None), from facts
+        self.dropped_anchors = 0
+        self.first_time: int | None = None   # blockTime of the window's first block (set by from_window)
         self.anchors = sorted(set(anchors))
         for (k0, o0), (k1, o1) in zip(self.anchors, self.anchors[1:]):
             if k1 == k0 or o1 <= o0:
                 raise ValueError(f"inconsistent anchors: count {k0}->{k1}, oid {o0}->{o1}")
 
     # -------------------------------------------------------------- building
+    @staticmethod
+    def consistent(pts: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Largest subset of (count, oid) anchors with oids strictly increasing in count (counts distinct).
+        Facts from several sources can disagree (an order located at the wrong placement); keep the most."""
+        pts = sorted(set(pts))
+        by_k: dict[int, set] = {}
+        for k, o in pts:
+            by_k.setdefault(k, set()).add(o)
+        pts = [(k, o) for k, o in pts if len(by_k[k]) == 1]
+        # longest strictly increasing subsequence of oids (counts already increasing), O(n log n)
+        tails, idx, prev = [], [], [-1] * len(pts)
+        for i, (_, o) in enumerate(pts):
+            j = bisect_left(tails, o)
+            if j == len(tails):
+                tails.append(o); idx.append(i)
+            else:
+                tails[j], idx[j] = o, i
+            prev[i] = idx[j - 1] if j else -1
+        out, i = [], idx[-1] if idx else -1
+        while i >= 0:
+            out.append(pts[i]); i = prev[i]
+        return out[::-1]
+
     @classmethod
-    def from_window(cls, window_dir, anchors, count_errored: bool = False) -> "OidEstimator":
+    def from_window(cls, window_dir, anchors, count_errored: bool = False, facts=None) -> "OidEstimator":
         """anchors: a list in either format:
         - {"oid", "height", "tx", "item"}                      (checks/g0_check.py, g0_anchors.json)
         - {"user", "oid", "answer": orderStatus response}      (collect/capture.py, anchors.json)
         The second kind is located in the blocks by (user, asset, side, px, sz, time[, cloid]);
         an answer that matches zero or several placements is dropped.
-        count_errored: also count the items of txs whose action errored (experiment; default off)."""
+        count_errored: also count the items of txs whose action errored (experiment; default off).
+        facts: data/oid_facts.OidFacts. Each fact order is located like an orderStatus answer; each taker fill
+        (crossed) is located by its tx hash at the one item of that tx on its asset and side whose limit allows the
+        fill price. Located facts become anchors and `exact` entries (real oid -> position); every fact also goes
+        into `oid_px` (real oid -> user, asset, side, price). Anchors that disagree are dropped (consistent())
+        instead of failing."""
         counts: dict[Pos, int] = {}
         groups: dict = {}
         block_groups: dict = {}
@@ -122,13 +191,33 @@ class OidEstimator:
             key = (a["user"].lower(), asset, o["side"] == "B", Decimal(o["limitPx"]), Decimal(o["origSz"]),
                    int(o["timestamp"]), o.get("cloid"))
             want[key] = int(o["oid"])
+        oid_px: dict[int, tuple] = {}
+        for o in (facts.orders if facts else []):
+            key = (o["user"], o["asset"], o["buy"], Decimal(o["px"]), Decimal(o["sz"]), o["timestamp"], o["cloid"])
+            if want.get(key, o["oid"]) != o["oid"]:
+                want[key] = None                           # two different oids for one placement key: unusable
+            else:
+                want[key] = o["oid"]
+            _put_px(oid_px, o["oid"], o["user"], o["asset"], o["buy"], o["px"], o["timestamp"])
+        for f in (facts.fills if facts else []):
+            if not f["crossed"]:                           # a maker fill is at the order's own limit price
+                _put_px(oid_px, f["oid"], f["user"], f["asset"], f["buy"], f["px"], None)
+        takers: dict[str, list] = {}
+        for f in (facts.fills if facts else []):
+            if f["crossed"] and f["hash"]:
+                takers.setdefault(f["hash"], []).append(f)
         located: dict[int, list[Pos]] = {}
         k = 0
+        first_time = None
         for height, path in _block_files(Path(window_dir)):
             b = read_block(path)
+            if first_time is None:
+                first_time = b.get("blockTime")
             for t, tx in enumerate(b["txs"]):
                 if tx["error"] is not None and not count_errored:
                     continue
+                if takers and tx.get("hash") in takers:
+                    _locate_takers(takers[tx["hash"]], tx, height, t, located)
                 g = _cancel_items(tx["action"])
                 if g:
                     ukey = (height, tx["user"].lower())
@@ -145,26 +234,49 @@ class OidEstimator:
                                        Decimal(item["s"]), int(tx["time"]), item.get("c"))
                             except Exception:
                                 key = None
-                            if key in want:
+                            if want.get(key) is not None:
                                 located.setdefault(want[key], []).append((height, t, i))
                     k += 1
         pts = [(counts[(a["height"], a["tx"], a["item"])], int(a["oid"]))
                for a in anchors if "height" in a and (a["height"], a["tx"], a["item"]) in counts]
-        pts += [(counts[p[0]], oid) for oid, p in located.items() if len(p) == 1]
-        return cls(counts, pts, groups, block_groups, placers)
+        uniq = {oid: sorted(set(p)) for oid, p in located.items()}
+        uniq = {oid: p[0] for oid, p in uniq.items() if len(p) == 1 and p[0] in counts}
+        per_pos: dict[Pos, int] = {}
+        for oid, p in uniq.items():
+            per_pos[p] = per_pos.get(p, 0) + 1
+        exact = {oid: p for oid, p in uniq.items() if per_pos[p] == 1}
+        pts += [(counts[p], oid) for oid, p in exact.items()]
+        exact.update({int(a["oid"]): (a["height"], a["tx"], a["item"]) for a in anchors
+                      if "height" in a and (a["height"], a["tx"], a["item"]) in counts})
+        good = cls.consistent(pts)
+        est = cls(counts, good, groups, block_groups, placers, exact if facts is not None else None, oid_px)
+        est.dropped_anchors = len(set(pts)) - len(good)
+        est.first_time = first_time
+        if facts is not None:                              # an exact entry whose anchor was dropped is not trusted
+            keep = {o for _, o in good}
+            est.exact = {o: p for o, p in exact.items() if o in keep}
+        return est
 
     @classmethod
-    def from_files(cls, window_dir, anchor_file) -> "OidEstimator":
-        """from_window on the anchor file, built once per process per (window, anchors) and rebuilt when
-        a block file or the anchor file changes. The estimator is read-only, so it is shared."""
-        window_dir, anchor_file = Path(window_dir), Path(anchor_file)
-        st = anchor_file.stat()
+    def from_files(cls, window_dir, anchor_file, facts: bool = False, hl_data=None) -> "OidEstimator":
+        """from_window on the anchor file (None = no anchors), built once per process per (window, anchors, facts)
+        and rebuilt when a block file, the anchor file or the facts change. The estimator is read-only, so it is
+        shared. facts=True: also data/oid_facts.load(window_dir, hl_data)."""
+        window_dir = Path(window_dir)
+        anchor_file = None if anchor_file is None else Path(anchor_file)
+        st = anchor_file.stat() if anchor_file is not None else None
+        fx = None
+        if facts:
+            from data import oid_facts
+            fx = oid_facts.load(window_dir, hl_data)
         sig = (tuple(sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns) for _, p in _block_files(window_dir))),
-               st.st_size, st.st_mtime_ns)
-        key = (window_dir.resolve(), anchor_file.resolve())
+               st and st.st_size, st and st.st_mtime_ns, None if fx is None else fx.files_sig())
+        key = (window_dir.resolve(), anchor_file and anchor_file.resolve(), bool(facts),
+               None if hl_data is None else str(Path(hl_data).resolve()))
         hit = _estimator_cache.get(key)
         if hit is None or hit[0] != sig:
-            hit = (sig, cls.from_window(window_dir, json.loads(anchor_file.read_text())))
+            anchors = json.loads(anchor_file.read_text()) if anchor_file is not None else []
+            hit = (sig, cls.from_window(window_dir, anchors, facts=fx))
             _estimator_cache[key] = hit
             while len(_estimator_cache) > _ESTIMATOR_CACHE_MAX:
                 _estimator_cache.popitem(last=False)
@@ -242,9 +354,11 @@ class OidResolver:
         self.engine, self.est = engine, est
         self.base, self.per_mille, self.nearest_ratio = base, per_mille, nearest_ratio
         self.hl: dict[int, tuple[int, int]] = {}       # engine oid -> (estimated hl oid, tolerance)
+        self.by_pos: dict[Pos, int] = {}               # placement position -> engine oid (for est.exact)
         self.first_hl: int | None = None               # estimated oid of the window's first placement
         if est.counts and est.anchors:
             self.first_hl = est.estimate_count(min(est.counts.values()))
+        self.first_ts = est.first_time
         self.stats: Counter = Counter()
         self.last: int | None = None                   # engine oid picked by the last call (diagnostics)
 
@@ -253,6 +367,8 @@ class OidResolver:
         if engine_oid is None or not isinstance(action, (Place, Modify)):
             return
         pos = (action.block, action.tx_index, action.item_index)
+        if self.est.exact:
+            self.by_pos[pos] = engine_oid
         k = self.est.counts.get(pos)
         if k is None:
             return
@@ -267,6 +383,24 @@ class OidResolver:
 
     def __call__(self, user: str, asset: int, hl_oid: int) -> int | None:
         self.last, self._last_reason = None, None
+        if hl_oid in self.est.exact:                    # the real oid of an in-window placement is known
+            x = self.by_pos.get(self.est.exact[hl_oid])
+            if x is not None and x in self.engine.books[asset] and x in self.engine.by_user.get(user, {}):
+                self.stats["resolved_exact"] += 1
+                self.stats["resolved"] += 1
+                self.last = x
+                return x
+            reason = "exact_unplaced" if x is None else "exact_gone"
+            self.stats[reason] += 1                     # never fall back to a guess: the target is not resting
+            self._last_reason = reason
+            return None
+        known = self.est.oid_px.get(hl_oid)             # (user, asset, buy, px ticks, timestamp | None)
+        if known is not None and (known[0] != user.lower() or known[1] != asset):
+            known = None
+        if known is not None and known[4] is not None and self.first_ts is not None and known[4] < self.first_ts:
+            self.stats["known_prewindow"] += 1          # placed before the window (timestamp from a fact)
+            self._last_reason = "prewindow"
+            return None
         if self.first_hl is not None and hl_oid < self.first_hl - self.est.tolerance(0, self.base, self.per_mille):
             self.stats["prewindow"] += 1
             self._last_reason = "prewindow"                # placed before the window: a placeholder at best
@@ -282,9 +416,15 @@ class OidResolver:
         for oid in self.engine.by_user.get(user, {}):
             if oid not in book or oid not in self.hl:
                 continue
+            if known is not None:                       # the real order's side and price are known
+                o = book.node(oid).order
+                if (o.side is Side.BUY) != known[2] or o.px != known[3]:
+                    continue
             e, tol = self.hl[oid]
             if abs(e - hl_oid) <= tol:
                 hits.append((abs(e - hl_oid), oid))
+        if known is not None and hits:
+            self.stats["px_filtered"] += 1
         if not hits:
             self.stats["no_candidate"] += 1
             self._last_reason = "no_candidate"

@@ -159,7 +159,8 @@ class Replay:
                  other_position: str = "end",
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
                  placeholder_cap: str | None = None, reseed_keep_known: bool = False,
-                 trade_learn: str | None = None, oid_guard: str | None = None, refill_position: str = "front"):
+                 trade_learn: str | None = None, oid_guard: str | None = None, refill_position: str = "front",
+                 oid_facts: bool = False):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -219,6 +220,9 @@ class Replay:
           Aliases: "both" = "sweep,name", "both-clip" = "sweep,name-clip". Counters in `learn_stats`.
         refill_position (keep_known): "front" (default) = Engine.refill's placement, missing snapshot size
         ahead of every known order at the level; "back" = moved behind them (known orders queue first).
+        oid_facts: the int-oid resolver also uses real order-id facts (data/oid_facts.py: fills.json,
+        hist_orders.json, open_orders.json in the window, user_orders/user_fills recorder streams): located facts
+        become anchors and exact oid -> placement matches; other facts give the target's side and price.
         oid_guard (int-oid resolver preset; None/"ghost" = data/oids defaults): "ratio25" / "ratio50"
         (ratio guard, ghost off), "cap3000" (max_tol 3000, ghost off), "none" (old rule: ghost and
         joint layers off).
@@ -274,6 +278,7 @@ class Replay:
         if oid_guard not in OID_GUARDS:
             raise ValueError(f"unknown oid_guard {oid_guard!r}")
         self.oid_guard = oid_guard
+        self.oid_facts = oid_facts
         if refill_position not in ("front", "back"):
             raise ValueError(f"unknown refill_position {refill_position!r}")
         self.refill_position = refill_position
@@ -288,7 +293,11 @@ class Replay:
         self.resolver: OidResolver | None = None
         if anchors is None and (self.window_dir / "anchors.json").exists():
             anchors = self.window_dir / "anchors.json"
-        if use_resolver and anchors is not None:
+        if use_resolver and oid_facts:
+            est = OidEstimator.from_files(self.window_dir, anchors, facts=True, hl_data=self.hl_data)
+            self.resolver = OidResolver(self.engine, est, nearest_ratio=nearest_ratio, **OID_GUARDS[oid_guard])
+            self.engine.resolve_oid = self.resolver
+        elif use_resolver and anchors is not None:
             est = OidEstimator.from_files(self.window_dir, anchors)
             self.resolver = OidResolver(self.engine, est, nearest_ratio=nearest_ratio, **OID_GUARDS[oid_guard])
             self.engine.resolve_oid = self.resolver
