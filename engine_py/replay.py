@@ -51,6 +51,11 @@ class PolicyError(ValueError):
     pass
 
 
+OID_GUARDS = {None: {}, "ghost": {},
+              "ratio25": dict(ghost_guard=False, ratio_per_mille=250),
+              "ratio50": dict(ghost_guard=False, ratio_per_mille=500),
+              "cap3000": dict(ghost_guard=False, max_tol=3000),
+              "none": dict(ghost_guard=False, joint_tx=False, joint_block=False)}
 TOUCH_LOOKBACK_MS = 60_000          # touch events this long before the first block start the estimate
 
 
@@ -154,7 +159,7 @@ class Replay:
                  other_position: str = "end",
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
                  placeholder_cap: str | None = None, reseed_keep_known: bool = False,
-                 trade_learn: str | None = None):
+                 trade_learn: str | None = None, oid_guard: str | None = None):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -206,7 +211,15 @@ class Replay:
           "name":  at w, the last real maker M (highest tid at w) may still rest there; if the engine's
                    front order at w is a placeholder and M has no order at w, that placeholder becomes
                    M's order (same size, still at the front). Guess: M's order may have been used up.
-          "both":  sweep, then name. Counters in `learn_stats`.
+          "queue": at each price p where the chain filled maker M and the engine holds an order of M at p,
+                   everything the engine holds AHEAD of M's first order at p is stale (the chain reached M,
+                   so all of it was consumed first) and is removed.
+          "name-clip": as name, but only the size M just filled is named; the rest stays anonymous.
+          Rules combine with commas, applied sweep, queue, name: e.g. "sweep,queue,name-clip".
+          Aliases: "both" = "sweep,name", "both-clip" = "sweep,name-clip". Counters in `learn_stats`.
+        oid_guard (int-oid resolver preset; None/"ghost" = data/oids defaults): "ratio25" / "ratio50"
+        (ratio guard, ghost off), "cap3000" (max_tol 3000, ghost off), "none" (old rule: ghost and
+        joint layers off).
         Zero-hash trades (outside fills) are not used: they are applied as fills already."""
         keep_known = keep_known or reseed_keep_known
         if other_position not in ("end", "start", "index"):
@@ -253,13 +266,15 @@ class Replay:
         self.placeholder_ttl_ms, self.placeholder_queue = placeholder_ttl_ms, placeholder_queue
         self.placeholder_cap, self.reseed_keep_known = placeholder_cap, reseed_keep_known   # alias, see keep_known
         self.ph_stats: Counter = Counter()          # placeholder flag effects (lots / counts)
-        if trade_learn not in (None, "sweep", "name", "both", "name-clip", "both-clip"):
-            raise ValueError(f"unknown trade_learn {trade_learn!r}")
-        self._name_clip = trade_learn is not None and trade_learn.endswith("-clip")
-        self.trade_learn = trade_learn.removesuffix("-clip") if trade_learn else None
+        self.trade_learn = trade_learn
+        self._rules = self.parse_trade_learn(trade_learn)
+        self._name_clip = "name-clip" in self._rules
+        if oid_guard not in OID_GUARDS:
+            raise ValueError(f"unknown oid_guard {oid_guard!r}")
+        self.oid_guard = oid_guard
         self.learn_stats: Counter = Counter()
         self._real_trades: dict[str, list] = {}
-        if trade_learn is not None:
+        if self._rules:
             for tr in iter_trades(self.hl_data, COINS, self.t0, self.t1):
                 if tr.hash != ZERO_HASH:
                     self._real_trades.setdefault(tr.hash, []).append(tr)
@@ -270,7 +285,7 @@ class Replay:
             anchors = self.window_dir / "anchors.json"
         if use_resolver and anchors is not None:
             est = OidEstimator.from_files(self.window_dir, anchors)
-            self.resolver = OidResolver(self.engine, est, nearest_ratio=nearest_ratio)
+            self.resolver = OidResolver(self.engine, est, nearest_ratio=nearest_ratio, **OID_GUARDS[oid_guard])
             self.engine.resolve_oid = self.resolver
 
         self.snapshots = sorted((s for coin in COINS for s in iter_books(self.hl_data, coin, self.t0, self.t1)),
@@ -397,6 +412,42 @@ class Replay:
             if self.placeholder_ttl_ms is not None:
                 heapq.heappush(self._ph_heap, (s.time_ms, oid))
 
+    @staticmethod
+    def parse_trade_learn(spec: str | None) -> frozenset:
+        if spec is None:
+            return frozenset()
+        spec = {"both": "sweep,name", "both-clip": "sweep,name-clip"}.get(spec, spec)
+        rules = frozenset(x.strip() for x in spec.split(","))
+        if not rules or not rules <= {"sweep", "queue", "name", "name-clip"} or {"name", "name-clip"} <= rules:
+            raise ValueError(f"unknown trade_learn {spec!r}")
+        return rules
+
+    def _learn_queue(self, asset: int, side: Side, trs: list, coin: str) -> None:
+        """queue rule: at each price with real fills, drop what rests ahead of the first order (in our
+        queue) of any maker the chain filled there."""
+        eng = self.engine
+        levels = eng.books[asset].side(side)
+        for px in sorted({t.px for t in trs}):
+            level = levels.get(px)
+            if level is None:
+                continue
+            makers = {t.maker for t in trs if t.px == px}
+            nodes = list(level)
+            first_of: dict[str, int] = {}
+            for i, nd in enumerate(nodes):
+                first_of.setdefault(nd.order.user, i)
+            held = [first_of[m] for m in makers if m in first_of]
+            if not held:
+                continue                           # no filled maker has an order we hold here
+            cut = max(held)
+            for nd in nodes[:cut]:
+                if nd.order.user in makers:
+                    continue                       # a filled maker's own older order: leave it
+                kind = "placeholder" if nd.order.user == PLACEHOLDER else "known"
+                self.learn_stats[f"queue_{kind}_orders:{coin}"] += 1
+                self.learn_stats[f"queue_{kind}_lots:{coin}"] += nd.remaining
+                eng._remove(nd.order.oid)
+
     def _learn(self, tx_hash: str) -> None:
         """trade_learn: correct the book from this tx's real trades (see __init__)."""
         trades = self._real_trades.get(tx_hash)
@@ -410,7 +461,7 @@ class Replay:
             coin = ASSETS[asset].name
             levels = eng.books[asset].side(side)
             w = min(t.px for t in trs) if side is Side.BUY else max(t.px for t in trs)
-            if self.trade_learn in ("sweep", "both"):
+            if "sweep" in self._rules:
                 better = [px for px in levels.keys() if (px > w if side is Side.BUY else px < w)]
                 for px in better:
                     for nd in list(levels[px]):
@@ -418,7 +469,9 @@ class Replay:
                         self.learn_stats[f"swept_{kind}_orders:{coin}"] += 1
                         self.learn_stats[f"swept_{kind}_lots:{coin}"] += nd.remaining
                         eng._remove(nd.order.oid)
-            if self.trade_learn in ("name", "both"):
+            if "queue" in self._rules:
+                self._learn_queue(asset, side, trs, coin)
+            if "name" in self._rules or "name-clip" in self._rules:
                 level = levels.get(w)
                 if level is None:
                     continue
@@ -598,7 +651,7 @@ class Replay:
                 f, r = self._apply(b, a)
                 fills += f
                 rejects += r
-                if (self.trade_learn is not None and not isinstance(a, OutsideFill)
+                if (self._rules and not isinstance(a, OutsideFill)
                         and (i + 1 == len(seq) or seq[i + 1].hash != a.hash)):
                     self._learn(a.hash)
             eng.end_block(b.height, b.time_ms)

@@ -94,6 +94,44 @@ def test_name_clip_names_only_the_just_filled_size_and_keeps_the_rest_anonymous_
     window, hl = w.write()
     r = Replay(window, hl, listing, trade_learn="both-clip")
     list(r)
-    assert r.trade_learn == "both"
+    assert r._rules == {"sweep", "name-clip"}
     assert level(r, Side.SELL, "60010") == [(M, lots("0.001")), (PLACEHOLDER, lots("0.003"))]
     r.engine.books[0].check_invariants()
+
+
+def test_queue_removes_what_rests_ahead_of_a_filled_makers_order(tmp_path):
+    # Engine queue at 60010: placeholder 0.002, B 0.001, M 0.002. The chain fills A's 0.001 buy from M,
+    # so on chain everything ahead of M was gone: the placeholder and B are stale.
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 50, [], [("60010", "0.002")])
+    w.block([place_tx(B, "0xb1", 0, order(buy=False, px="60010", sz="0.001", tif="Gtc")),
+             place_tx(M, "0xm1", 1, order(buy=False, px="60010", sz="0.002", tif="Gtc"))], dt_ms=0)
+    h = w.block([place_tx(A, "0xa1", 0, order(px="60010", sz="0.001", tif="Ioc"))], dt_ms=1000)
+    w.trade("BTC", "B", "60010", "0.001", w.time_of(h), "0xa1", 1, A, M)
+    window, hl = w.write()
+    r = Replay(window, hl, listing, trade_learn="queue")
+    out = list(r)
+    assert [f.maker_user for f in out[1][1]] == [PLACEHOLDER]      # the tx itself: engine queue as it was
+    assert level(r, Side.SELL, "60010") == [(M, lots("0.002"))]
+    assert r.learn_stats["queue_placeholder_lots:BTC"] == lots("0.001")
+    assert r.learn_stats["queue_known_lots:BTC"] == lots("0.001")
+
+
+def test_trade_learn_rules_parse_and_reject_bad_combinations():
+    assert Replay.parse_trade_learn("both") == {"sweep", "name"}
+    assert Replay.parse_trade_learn("sweep,queue,name-clip") == {"sweep", "queue", "name-clip"}
+    for bad in ("name,name-clip", "sweep,all", ""):
+        with pytest.raises(ValueError):
+            Replay.parse_trade_learn(bad)
+
+
+def test_oid_guard_presets_reach_the_resolver_and_bad_ones_fail(tmp_path):
+    from engine_py.replay import OID_GUARDS
+    assert OID_GUARDS["cap3000"] == dict(ghost_guard=False, max_tol=3000)
+    window, hl = sweep_window(tmp_path)
+    with pytest.raises(ValueError):
+        Replay(window, hl, listing, oid_guard="loose")
+    res, _ = vr.run(window, hl, quiet=True, oid_guard="ratio50")
+    assert res["oid_guard"] == "ratio50"
+    res, _ = vr.run(window, hl, quiet=True)
+    assert "oid_guard" not in res
