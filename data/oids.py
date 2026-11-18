@@ -265,10 +265,6 @@ class OidResolver:
             self.stats["prewindow"] += 1
             self._last_reason = "prewindow"                # placed before the window: a placeholder at best
             return None
-        if self.ghost_guard and self._ghosts(user, asset, hl_oid) > 1:
-            self.stats["ghost"] += 1                    # another placement of the user could be the target
-            self._last_reason = "ghost"
-            return None
         if self.joint_tx or self.joint_block:
             oid = self._joint(user, asset, hl_oid)
             if oid is not None:
@@ -294,10 +290,20 @@ class OidResolver:
                 self.stats["ambiguous"] += 1            # never guess between two of the user's orders
                 self._last_reason = "ambiguous"
                 return None
+        if self._is_ghosted(user, asset, hl_oid):
+            return None
+        if len(hits) > 1:
             self.stats["resolved_nearest"] += 1
         self.stats["resolved"] += 1
         self.last = hits[0][1]
         return self.last
+
+    def _is_ghosted(self, user: str, asset: int, hl_oid: int) -> bool:
+        if self.ghost_guard and self._ghosts(user, asset, hl_oid) > 1:
+            self.stats["ghost"] += 1                    # abstain: another placement of the user could be the target
+            self._last_reason = "ghost"
+            return True
+        return False
 
     def _ghosts(self, user: str, asset: int, hl_oid: int) -> int:
         """How many in-window placements of this user on this asset, resting or not, lie within their own
@@ -344,6 +350,8 @@ class OidResolver:
                                        else self._analyse_block(user, grp))
             oid = res.get(item)
             if oid is not None and oid in self.engine.books[asset]:
+                if self._is_ghosted(user, asset, hl_oid):
+                    return None
                 self.stats["resolved_group" if layer == "tx" else "resolved_block"] += 1
                 return oid
         return None
