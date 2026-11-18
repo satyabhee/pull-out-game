@@ -80,7 +80,8 @@ class OidEstimator:
     """Map a placement position to an estimated Hyperliquid oid."""
 
     def __init__(self, counts: dict[Pos, int], anchors: list[tuple[int, int]],
-                 groups: dict | None = None, block_groups: dict | None = None):
+                 groups: dict | None = None, block_groups: dict | None = None,
+                 placers: dict | None = None):
         """counts: position -> number of id-consuming items before it in the window.
         anchors: (count, real oid) pairs, any order.
         groups: (height, user) -> list of per-tx cancel groups (>= 2 items each) of (asset, oid).
@@ -88,6 +89,7 @@ class OidEstimator:
         self.counts = counts
         self.groups = groups or {}
         self.block_groups = block_groups or {}
+        self.placers = placers or {}      # (user, asset) -> counted positions of EVERY in-window placement, ascending
         self.anchors = sorted(set(anchors))
         for (k0, o0), (k1, o1) in zip(self.anchors, self.anchors[1:]):
             if k1 == k0 or o1 <= o0:
@@ -95,15 +97,17 @@ class OidEstimator:
 
     # -------------------------------------------------------------- building
     @classmethod
-    def from_window(cls, window_dir, anchors) -> "OidEstimator":
+    def from_window(cls, window_dir, anchors, count_errored: bool = False) -> "OidEstimator":
         """anchors: a list in either format:
         - {"oid", "height", "tx", "item"}                      (checks/g0_check.py, g0_anchors.json)
         - {"user", "oid", "answer": orderStatus response}      (collect/capture.py, anchors.json)
         The second kind is located in the blocks by (user, asset, side, px, sz, time[, cloid]);
-        an answer that matches zero or several placements is dropped."""
+        an answer that matches zero or several placements is dropped.
+        count_errored: also count the items of txs whose action errored (experiment; default off)."""
         counts: dict[Pos, int] = {}
         groups: dict = {}
         block_groups: dict = {}
+        placers: dict = {}
         want: dict[tuple, int] = {}
         for a in anchors:
             if "height" in a:
@@ -123,7 +127,7 @@ class OidEstimator:
         for height, path in _block_files(Path(window_dir)):
             b = read_block(path)
             for t, tx in enumerate(b["txs"]):
-                if tx["error"] is not None:
+                if tx["error"] is not None and not count_errored:
                     continue
                 g = _cancel_items(tx["action"])
                 if g:
@@ -134,6 +138,7 @@ class OidEstimator:
                 for i, item in enumerate(_order_items(tx["action"])):
                     if item.get("a") in ASSETS:
                         counts[(height, t, i)] = k
+                        placers.setdefault((tx["user"].lower(), item["a"]), []).append(k)
                         if want:
                             try:
                                 key = (tx["user"].lower(), item["a"], bool(item["b"]), Decimal(item["p"]),
@@ -146,7 +151,7 @@ class OidEstimator:
         pts = [(counts[(a["height"], a["tx"], a["item"])], int(a["oid"]))
                for a in anchors if "height" in a and (a["height"], a["tx"], a["item"]) in counts]
         pts += [(counts[p[0]], oid) for oid, p in located.items() if len(p) == 1]
-        return cls(counts, pts, groups, block_groups)
+        return cls(counts, pts, groups, block_groups, placers)
 
     @classmethod
     def from_files(cls, window_dir, anchor_file) -> "OidEstimator":
@@ -216,7 +221,7 @@ class OidResolver:
     def __init__(self, engine, est: OidEstimator, base: int = 50, per_mille: int = 50, nearest_ratio: int = 0,
                  joint_tx: bool = True, joint_block: bool = True, group_gap: int = 0,
                  pair_slack: int = 3, pair_lo: int = 2, pair_per_mille: int = 80, node_budget: int = 20000,
-                 guard_mult: int = 2):
+                 guard_mult: int = 2, ghost_guard: bool = True):
         """nearest_ratio > 0: when several orders are within tolerance, accept the nearest one only if
         every other is at least nearest_ratio times farther (and >= base ids farther); 0 = never.
         joint_tx / joint_block: the two joint layers (module doc). group_gap: ids that may be missing
@@ -224,6 +229,11 @@ class OidResolver:
         self.joint_tx, self.joint_block, self.group_gap = joint_tx, joint_block, group_gap
         self.pair_slack, self.pair_lo, self.pair_per_mille = pair_slack, pair_lo, pair_per_mille
         self.node_budget, self.guard_mult = node_budget, guard_mult
+        self.ghost_guard = ghost_guard
+        a = est.anchors
+        spans = [est.distance_to_anchor(min(est.counts.values())), est.distance_to_anchor(max(est.counts.values()))] if est.counts and a else [0]
+        spans += [k1 - k0 for (k0, _), (k1, _) in zip(a, a[1:])]
+        self._maxtol = base + max(spans) * per_mille // 1000 + 1      # largest tolerance any count can have
         self.meta: dict[int, tuple[int, tuple[int, int]]] = {}   # engine oid -> (count k, (block, tx_index))
         self._jc_block: int | None = None
         self._jc: dict = {}
@@ -280,10 +290,37 @@ class OidResolver:
                 self.stats["ambiguous"] += 1            # never guess between two of the user's orders
                 self._last_reason = "ambiguous"
                 return None
+        if self._is_ghosted(user, asset, hl_oid):
+            return None
+        if len(hits) > 1:
             self.stats["resolved_nearest"] += 1
         self.stats["resolved"] += 1
         self.last = hits[0][1]
         return self.last
+
+    def _is_ghosted(self, user: str, asset: int, hl_oid: int) -> bool:
+        if self.ghost_guard and self._ghosts(user, asset, hl_oid) > 1:
+            self.stats["ghost"] += 1                    # abstain: another placement of the user could be the target
+            self._last_reason = "ghost"
+            return True
+        return False
+
+    def _ghosts(self, user: str, asset: int, hl_oid: int) -> int:
+        """How many in-window placements of this user on this asset, resting or not, lie within their own
+        tolerance of hl_oid. Always 0 without placer data. The real target is one of them (unless it was
+        placed before the window), so if two or more qualify, a unique resting candidate may be a decoy
+        while the true target already left our book."""
+        ks = self.est.placers.get((user, asset))
+        if not ks or not self.est.anchors:
+            return 0
+        est, maxtol = self.est, self._maxtol
+        lo = bisect_left(ks, hl_oid - maxtol, key=est.estimate_count)
+        hi = bisect_right(ks, hl_oid + maxtol, key=est.estimate_count)
+        n = 0
+        for k in ks[lo:hi]:
+            if abs(est.estimate_count(k) - hl_oid) <= est.tolerance(k, self.base, self.per_mille):
+                n += 1
+        return n
 
     # ------------------------------------------------------------------ joint
     def _joint(self, user: str, asset: int, hl_oid: int) -> int | None:
@@ -313,6 +350,8 @@ class OidResolver:
                                        else self._analyse_block(user, grp))
             oid = res.get(item)
             if oid is not None and oid in self.engine.books[asset]:
+                if self._is_ghosted(user, asset, hl_oid):
+                    return None
                 self.stats["resolved_group" if layer == "tx" else "resolved_block"] += 1
                 return oid
         return None
