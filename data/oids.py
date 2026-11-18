@@ -304,16 +304,18 @@ class OidResolver:
         self.last = hits[0][1]
         return self.last
 
-    def _refused(self, user: str, asset: int, hl_oid: int, x: int) -> bool:
+    def _refused(self, user: str, asset: int, hl_oid: int, x: int, count: bool = True) -> bool:
         """Final per-order guards on a resolution to engine order x: ratio, then ghost."""
         if self.ratio_per_mille is not None:
             e, tol = self.hl[x]
             if abs(e - hl_oid) * 1000 > self.ratio_per_mille * tol:
-                self.stats["ratio"] += 1
+                if count:
+                    self.stats["ratio"] += 1
                 self._last_reason = "ratio"
                 return True
         if self.ghost_guard and self._ghosts(user, asset, hl_oid) > 1:
-            self.stats["ghost"] += 1                    # abstain: another placement of the user could be the target
+            if count:                                   # the joint layer only peeks: the per-order rule counts the lookup once
+                self.stats["ghost"] += 1                # abstain: another placement of the user could be the target
             self._last_reason = "ghost"
             return True
         return False
@@ -363,7 +365,7 @@ class OidResolver:
                                        else self._analyse_block(user, grp))
             oid = res.get(item)
             if oid is not None and oid in self.engine.books[asset]:
-                if self._refused(user, asset, hl_oid, oid):
+                if self._refused(user, asset, hl_oid, oid, count=False):
                     return None
                 self.stats["resolved_group" if layer == "tx" else "resolved_block"] += 1
                 return oid

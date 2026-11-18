@@ -339,3 +339,21 @@ def test_ratio_guard_refuses_a_candidate_far_inside_the_tolerance():
 def test_defaults_are_the_safe_ones():
     r = OidResolver(Engine(), OidEstimator({}, []))
     assert (r.joint_tx, r.joint_block, r.ghost_guard, r.max_tol, r.ratio_per_mille) == (True, True, True, None, None)
+
+
+def test_every_lookup_counts_exactly_one_outcome_even_when_joint_and_ghost_both_refuse():
+    # cancels at 5000 and 5060 resolve jointly to X1/X3, but a departed placement at 5030 is a ghost for 5000 and 5060
+    counts = {(1, 0, 0): 0, (1, 1, 0): 20, (1, 2, 0): 60, (1, 3, 0): 30, (1, 9, 0): 1000}
+    e = OidEstimator(counts, [(0, 5000), (1000, 6000)], block_groups={(2, "u"): [(0, 5000), (0, 5060)]},
+                     placers={("u", 0): [0, 20, 30, 60]})
+    eng = Engine()
+    res = OidResolver(eng, e)
+    eng.resolve_oid = res
+    for p, px in (((1, 0, 0), 100), ((1, 1, 0), 101), ((1, 2, 0), 102)):
+        place(eng, res, "u", p, px)
+    lookups = 0
+    for o in (5000, 5060, 4000, 9999):
+        eng.apply(Cancel(user="u", **{**META, "block": 2}, asset=0, oid=o))
+        lookups += 1
+    outcomes = ("resolved", "no_candidate", "ambiguous", "prewindow", "ghost", "ratio")
+    assert sum(res.stats[k] for k in outcomes) == lookups
