@@ -236,9 +236,9 @@ def ASSET_OF(anchors, loc) -> int:
 def coverage(window, hl_data, nearest_ratio=3, resolver_kw=None, **replay_kw) -> dict:
     """replay_kw: Replay options, e.g. reseed=True, keep_known=True (lead-in chunks)."""
     stats, _ = _replay(window, hl_data, None, None, nearest_ratio, replay_kw, **(resolver_kw or {}))
-    total = sum(stats.get(k, 0) for k in ("resolved", "no_candidate", "ambiguous", "prewindow"))
+    total = sum(stats.get(k, 0) for k in ("resolved", "no_candidate", "ambiguous", "prewindow", "ghost"))
     return dict(stats=stats, lookups=total,
-                shares={k: f"{100 * stats.get(k, 0) / total:.1f}%" for k in ("resolved", "no_candidate", "ambiguous", "prewindow")}
+                shares={k: f"{100 * stats.get(k, 0) / total:.1f}%" for k in ("resolved", "no_candidate", "ambiguous", "prewindow", "ghost")}
                 if total else {})
 
 
@@ -471,7 +471,7 @@ def main(argv=None):
             tot: Counter = Counter()
             for w in sorted(p for p in Path(a.window).iterdir() if (p / "window.json").exists()):
                 tot.update(coverage(w, a.hl_data, a.nearest_ratio, rk, reseed=True, keep_known=True)["stats"])
-            n = sum(tot.get(k, 0) for k in ("resolved", "no_candidate", "ambiguous", "prewindow"))
+            n = sum(tot.get(k, 0) for k in ("resolved", "no_candidate", "ambiguous", "prewindow", "ghost"))
             print(json.dumps(dict(stats=dict(tot), lookups=n), indent=1))
         else:
             print(json.dumps(coverage(a.window, a.hl_data, a.nearest_ratio, rk), indent=1))
