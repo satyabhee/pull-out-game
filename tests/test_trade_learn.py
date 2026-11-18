@@ -135,3 +135,11 @@ def test_oid_guard_presets_reach_the_resolver_and_bad_ones_fail(tmp_path):
     assert res["oid_guard"] == "ratio50"
     res, _ = vr.run(window, hl, quiet=True)
     assert "oid_guard" not in res
+
+
+def test_cli_default_is_sweep_queue_name_clip_and_off_disables_it(tmp_path):
+    window, hl = sweep_window(tmp_path)
+    vr.main([str(window), "--hl-data", str(hl), "--out", str(tmp_path / "d")])
+    assert f"trade_learn,\"{vr.DEFAULT_TRADE_LEARN}\"" in (tmp_path / "d" / "summary.csv").read_text()
+    vr.main([str(window), "--hl-data", str(hl), "--trade-learn", "off", "--out", str(tmp_path / "o")])
+    assert "trade_learn" not in (tmp_path / "o" / "summary.csv").read_text()

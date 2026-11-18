@@ -99,6 +99,10 @@ def priority_policy(actions):
 
 POLICIES = {"listing": listing, "class": class_policy, "priority": priority_policy}
 
+# CLI default (validate_replay / validate_chunks): correct the book from each applied tx's real trades
+# (engine_py/replay.Replay trade_learn; measured in handoff/integrate_result.md). run() and Replay stay off.
+DEFAULT_TRADE_LEARN = "sweep,queue,name-clip"
+
 CATEGORIES = ("outside-fill timing", "wrong ALO decision", "unknown pre-window order", "unresolved cancel",
               "ordering", "margin rejection (unobservable)", "real bug (unexplained)")
 INFO_ALO_REJECTED = "info: engine rejected a real maker's ALO at that price"   # a flag, not a category
@@ -728,12 +732,13 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="H11: alias of --keep-known")
     ap.add_argument("--oid-guard", choices=["ghost", "ratio25", "ratio50", "cap3000", "none"],
                     help="int-oid resolver preset (default ghost = data/oids defaults; none = old rule)")
-    ap.add_argument("--trade-learn", metavar="RULES",
+    ap.add_argument("--trade-learn", metavar="RULES", default=DEFAULT_TRADE_LEARN,
                     help="correct the book from each tx's real trades after it is applied (later txs only): "
                          "sweep = remove what the real taker must have consumed; name = front placeholder at the "
                          "last real price becomes the last real maker's order (-clip: only the size that maker just filled); "
                          "queue = remove what rests ahead of a filled maker's order. Comma-separated, e.g. "
-                         "sweep,queue,name-clip; both = sweep,name; both-clip = sweep,name-clip")
+                         "sweep,queue,name-clip; both = sweep,name; both-clip = sweep,name-clip. "
+                         f"Default {DEFAULT_TRADE_LEARN}; 'off' = none")
     ap.add_argument("--wildcard-pre-reseed-known", action="store_true",
                     help="H11 scoring (NOT approved, default off): with --keep-known, known engine orders placed "
                          "before the last re-seed score as WILDCARD")
@@ -749,7 +754,8 @@ def replay_kwargs(a) -> dict:
                 outside_other_txs=a.outside_other_txs, other_position=a.other_position,
                 placeholder_ttl_ms=a.placeholder_ttl_ms, placeholder_queue=a.placeholder_queue,
                 placeholder_cap=a.placeholder_cap, reseed_keep_known=a.reseed_keep_known,
-                wildcard_pre_reseed_known=a.wildcard_pre_reseed_known, trade_learn=a.trade_learn,
+                wildcard_pre_reseed_known=a.wildcard_pre_reseed_known,
+                trade_learn=None if a.trade_learn == "off" else a.trade_learn,
                 oid_guard=a.oid_guard)
 
 
@@ -768,7 +774,8 @@ def options_tag(a) -> str:
                     "-phbehind" if a.placeholder_queue == "behind" else "",
                     "-phcapnext" if a.placeholder_cap else "", "-keepknown" if a.reseed_keep_known else "",
                     "-wcknown" if a.wildcard_pre_reseed_known else "",
-                    f"-tl{a.trade_learn.replace(',', '+')}" if a.trade_learn else "",
+                    "-tloff" if a.trade_learn == "off" else
+                    f"-tl{a.trade_learn.replace(',', '+')}" if a.trade_learn != DEFAULT_TRADE_LEARN else "",
                     f"-og{a.oid_guard}" if a.oid_guard not in (None, "ghost") else ""])
 
 
