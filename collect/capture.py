@@ -1,19 +1,35 @@
 """
-capture.py: capture replay windows forever (run by the hl-capture systemd service).
+capture.py: capture replay data forever (run by the hl-capture systemd service).
 
-Each window = the newest WINDOW_BLOCKS blocks at the moment it starts, fetched oldest-first into
-  ~/hl/windows/<start>-<end>/<height>.json.gz   + window.json + anchors.json
-then the next window starts right away from the then-newest height (fixed rule -> unbiased sample).
+CAPTURE_MODE=chunks (default, G1 #3): snapshot-aligned chunks. The replay re-seeds its book from
+every L2 snapshot, so each snapshot interval stands alone and the first seconds after a snapshot
+are the most accurate. For a new recorder snapshot (BTC and ETH arrive together, ~every 12 s) at
+time t, the chunk is the CHUNK_BLOCKS blocks after the last block with blockTime <= t, fetched while
+they are seconds old (so they are never "archived"). At most one chunk per CHUNK_EVERY_S, spread
+over the day. Each chunk is a window folder (window.json kind="chunk", warmup_end_height = start).
+
+CAPTURE_MODE=windows (legacy): the newest WINDOW_BLOCKS blocks, oldest-first.
+
+Both write  ~/hl/windows/<start>-<end>/<height>.json.gz  + window.json + anchors.json.
+Explorer requests run one at a time in the main thread (one client per IP); saving to disk and
+orderStatus anchor lookups run in a background thread, so the next request is never held up.
+Every block's estimated age at request time is logged per window (max_age_s) and counted per UTC
+day (capture_state.json), so the real archived-block rule can be read off the first cap hit.
+After an archived-block cap: wait until 00:00 UTC (the observed reset), no probing, no shrinking.
 
 Settings (environment variables):
-  WINDOW_BLOCKS=6100   ~2 min warm-up + 5 min scored at ~14.5 blocks/s (halved on archived cap, min 1800)
-  WARMUP_BLOCKS=1740   warmup_end_height = start + WARMUP_BLOCKS
-  MAX_ANCHORS=100      orderStatus lookups per window (int-oid cancels on BTC/ETH), max 1 per 2 s
-  FRESH_MIN=90         on restart, finish a partial window only if its oldest missing block is younger
-  ONCE=1               capture one window and exit (for testing)
-Needs the hl-recorder service: the newest block height comes from its blocks.jsonl.
+  CAPTURE_MODE=chunks  chunks | windows
+  CHUNK_BLOCKS=30      ~2 s of chain per chunk
+  CHUNK_EVERY_S=60     at most one chunk per this many seconds
+  WINDOW_BLOCKS=6100   windows mode only (~7 min of chain)
+  WARMUP_BLOCKS=1740   windows mode: warmup_end_height = start + WARMUP_BLOCKS
+  MAX_ANCHORS=100      orderStatus lookups per window (chunks: CHUNK_ANCHORS=2), max 1 per 2 s
+  MAX_AGE_MIN=30       never request a block estimated older than this
+  FRESH_MIN=20         on restart, finish a partial window only if its oldest missing block is younger
+  ONCE=1               capture one window/chunk and exit (for testing)
+Needs the hl-recorder service: block headers and book snapshots come from its files.
 """
-import collections, glob, gzip, json, os, shutil, sys, time, urllib.request
+import collections, datetime, glob, gzip, json, os, queue, shutil, sys, threading, time, urllib.request
 from fetch_blocks import DEFAULT_INTERVAL, ArchivedCap, Fetcher, NotYet, TooOld, last_line, recorder_head, save
 
 HOME = os.path.dirname(os.path.abspath(__file__))
@@ -21,11 +37,16 @@ WIN_DIR = os.path.join(HOME, "windows")
 LOG = os.path.join(HOME, "capture.log")
 STATE = os.path.join(HOME, "capture_state.json")
 WARMUP = int(os.environ.get("WARMUP_BLOCKS", 1740))
+MODE = os.environ.get("CAPTURE_MODE", "chunks")
+CHUNK_BLOCKS = int(os.environ.get("CHUNK_BLOCKS", 30))
+CHUNK_EVERY_S = float(os.environ.get("CHUNK_EVERY_S", 60))
 MAX_ANCHORS = int(os.environ.get("MAX_ANCHORS", 100))
-FRESH_MIN = float(os.environ.get("FRESH_MIN", 90))
-# Never request a block older than this. Blocks older than ~3 h count as "archived" (100/day/IP, and going
-# over locks the IP out of ALL blocks for a day). 120 min keeps ~1 h of margin; a normal window peaks ~95 min.
-MAX_AGE_MIN = float(os.environ.get("MAX_AGE_MIN", 120))
+CHUNK_ANCHORS = int(os.environ.get("CHUNK_ANCHORS", 2))
+FRESH_MIN = float(os.environ.get("FRESH_MIN", 20))
+# Never request a block older than this. Nov 18 log: the cap hit while fetching ~84-min-old blocks after
+# ~10.5k blocks that day, so "archived" starts far earlier than the ~3 h assumed before. Chunks fetch
+# blocks seconds old; 30 min only matters for the legacy windows mode and restarts.
+MAX_AGE_MIN = float(os.environ.get("MAX_AGE_MIN", 30))
 ONCE = os.environ.get("ONCE") == "1"
 BPS = 14.5                                     # Hyperliquid blocks per second (approx.)
 MIN_WINDOW = 1800
@@ -79,17 +100,97 @@ def order_status(user, oid):
         return json.loads(r.read())
 
 
-def capture(fetcher, start, end, meta):
+class Writer:
+    """Background thread for everything that isn't an explorer request: gzip+save blocks, and
+    orderStatus anchor lookups (info API, paced >= 2 s apart). drain() waits for all of it."""
+
+    def __init__(self, lookup=None, saver=None, info_gap_s=2.0):
+        self.q = queue.Queue()
+        self.lock = threading.Lock()
+        self.anchors = []
+        self.errors = []
+        self.lookup, self.saver, self.info_gap_s = lookup or order_status, saver or save, info_gap_s
+        self._last_info = 0.0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            job = self.q.get()
+            try:
+                if job[0] == "save":
+                    self.saver(job[1], job[2])
+                else:
+                    _, user, oid, ch = job
+                    wait = self._last_info + self.info_gap_s - time.time()
+                    if wait > 0:
+                        time.sleep(wait)
+                    try:
+                        r = self.lookup(user, oid)
+                    except Exception as e:
+                        r = {"error": repr(e)}
+                    self._last_info = time.time()
+                    with self.lock:
+                        self.anchors.append({"user": user, "oid": oid, "cancel_height": ch,
+                                             "asked_at": self._last_info, "answer": r})
+            except Exception as e:                       # a failed save must not vanish silently
+                with self.lock:
+                    self.errors.append(f"{job[0]} {job[1]}: {e!r}")
+            finally:
+                self.q.task_done()
+
+    def save(self, path, data):
+        self.q.put(("save", path, data))
+
+    def ask(self, user, oid, cancel_height):
+        self.q.put(("anchor", user, oid, cancel_height))
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.anchors)
+
+    def drain(self):
+        self.q.join()
+        with self.lock:
+            errs, self.errors = self.errors, []
+        if errs:
+            raise RuntimeError("background writer failed: " + "; ".join(errs[:3]))
+
+
+def utc_day(ts=None):
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() if ts is None else ts))
+
+
+def seconds_until_utc_midnight(ts=None, margin_s=120):
+    now = datetime.datetime.fromtimestamp(time.time() if ts is None else ts, datetime.timezone.utc)
+    nxt = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (nxt - now).total_seconds() + margin_s
+
+
+def count_fetch(state, age_min):
+    """Per UTC day: blocks fetched and their max age (what the explorer's daily budget sees)."""
+    day = utc_day()
+    if state.get("day") != day:
+        state.update(day=day, fetched_today=0, max_age_today_s=0)
+    state["fetched_today"] += 1
+    if age_min is not None:
+        state["max_age_today_s"] = max(state["max_age_today_s"], round(age_min * 60, 1))
+
+
+def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max_anchors=None):
     """Fetch start..end oldest-first into its folder; collect anchors as we go. Returns final status."""
+    writer = writer or Writer()
+    state = state if state is not None else {}
+    warmup = WARMUP if warmup is None else warmup
+    max_anchors = MAX_ANCHORS if max_anchors is None else max_anchors
     d = os.path.join(WIN_DIR, f"{start}-{end}")
     os.makedirs(d, exist_ok=True)
     wpath, apath = os.path.join(d, "window.json"), os.path.join(d, "anchors.json")
-    anchors = json.load(open(apath)) if os.path.exists(apath) else []
-    asked = {(a["user"], a["oid"]) for a in anchors}
-    every = max(1, (end - start + 1) // MAX_ANCHORS)       # spread lookups across the window
-    pending, last_info = [], 0.0
+    old = json.load(open(apath)) if os.path.exists(apath) else []
+    asked = {(a["user"], a["oid"]) for a in old}
+    every = max(1, (end - start + 1) // max(1, max_anchors))   # spread lookups across the window
+    pending, n_asked = [], len(old)
     meta.setdefault("fetch_started", time.time())
-    meta.update(start_height=start, end_height=end, warmup_end_height=start + WARMUP, status="fetching")
+    meta.update(start_height=start, end_height=end, warmup_end_height=start + warmup, status="fetching")
     meta.setdefault("failed_heights", [])
     fetched_now, t0, status = 0, time.time(), None
     for i, h in enumerate(range(start, end + 1)):
@@ -99,8 +200,12 @@ def capture(fetcher, start, end, meta):
             while True:
                 try:
                     b, data = fetcher.get(h)
-                    save(p, data)
+                    writer.save(p, data)                   # off the request path
                     fetched_now += 1
+                    age = getattr(fetcher, "last_age_min", None)
+                    count_fetch(state, age)
+                    if age is not None:
+                        meta["max_age_s"] = max(meta.get("max_age_s", 0), round(age * 60, 1))
                     break
                 except NotYet:
                     time.sleep(1)
@@ -111,7 +216,13 @@ def capture(fetcher, start, end, meta):
                     break
                 except ArchivedCap as e:
                     status = "archived_cap"
-                    log(f"archived cap at height {h}: {e}", loud=True)
+                    age = fetcher.age_min(h) if hasattr(fetcher, "age_min") else None
+                    meta["cap_at"] = {"height": h, "age_s": None if age is None else round(age * 60, 1),
+                                      "fetched_today": state.get("fetched_today"),
+                                      "max_age_today_s": state.get("max_age_today_s")}
+                    log(f"archived cap at height {h} (~{meta['cap_at']['age_s']} s old; fetched today "
+                        f"{state.get('fetched_today')}, max age today {state.get('max_age_today_s')} s): {e}",
+                        loud=True)
                     break
                 except RuntimeError as e:
                     meta["failed_heights"].append(h)
@@ -119,9 +230,12 @@ def capture(fetcher, start, end, meta):
                     break
             if status:
                 break
-        if h in (start, end) and os.path.exists(p):
-            bt = b["blockTime"] if b is not None else (lambda x: x.get("blockDetails", x))(json.load(gzip.open(p, "rt")))["blockTime"]
-            meta["first_block_time" if h == start else "last_block_time"] = bt
+        if h in (start, end):
+            if b is not None:
+                meta["first_block_time" if h == start else "last_block_time"] = b["blockTime"]
+            elif os.path.exists(p):
+                bt = (lambda x: x.get("blockDetails", x))(json.load(gzip.open(p, "rt")))["blockTime"]
+                meta["first_block_time" if h == start else "last_block_time"] = bt
         if b is not None:                                     # remember BTC/ETH int-oid cancels for anchors
             for tx in b["txs"]:
                 a = tx["action"]
@@ -129,23 +243,23 @@ def capture(fetcher, start, end, meta):
                     for c in a.get("cancels", []):
                         if c.get("a") in (0, 1) and isinstance(c.get("o"), int):
                             pending.append((h, tx["user"], c["o"]))
-        # one orderStatus lookup per `every` blocks, at most one per 2 s, quieter users first
-        if pending and len(anchors) < MAX_ANCHORS and i % every == 0 and time.time() - last_info >= 2:
+        # one orderStatus lookup per `every` blocks, quieter users first; the writer paces them >= 2 s apart
+        if pending and n_asked < max_anchors and i % every == 0:
             per_user = collections.Counter(u for _, u, _ in pending)
             pending.sort(key=lambda c: per_user[c[1]])
             ch, user, oid = next(((ch, u, o) for ch, u, o in pending if (u, o) not in asked), (None, None, None))
             if user:
-                try:
-                    r = order_status(user, oid)
-                except Exception as e:
-                    r = {"error": repr(e)}
-                last_info = time.time()
                 asked.add((user, oid))
-                anchors.append({"user": user, "oid": oid, "cancel_height": ch, "asked_at": last_info, "answer": r})
+                n_asked += 1
+                writer.ask(user, oid, ch)
             pending = []
-        if i % 300 == 0:
+        if i % 300 == 0 and i:
             meta["blocks_on_disk"] = len(glob.glob(os.path.join(d, "*.json.gz")))
-            save_json(wpath, meta); save_json(apath, anchors)
+            save_json(wpath, meta); save_json(apath, old + writer.snapshot())
+    writer.drain()                                         # every block on disk, every lookup answered
+    anchors = old + writer.snapshot()
+    with writer.lock:
+        writer.anchors = []
     secs = time.time() - t0
     meta["fetch_finished"] = time.time()
     meta["blocks_per_s"] = round(fetched_now / secs, 3) if secs > 0 else None
@@ -187,24 +301,89 @@ def unfinished_window():
     return None
 
 
-def wait_for_cap_reset(fetcher):
-    """While the IP is over the daily cap, EVERY block is refused (even the newest). Probe once per 30 min."""
-    while True:
-        time.sleep(1800)
-        newest, _ = newest_block()
-        if newest is None:
-            log("cap probe skipped: recorder header unreadable; next probe in 30 min")
-            continue
+def wait_for_cap_reset(fetcher=None):
+    """Over the daily cap the newest block is still served, so probing says nothing (Nov 18: three
+    false "reset" probes). Sleep until 00:00 UTC + 2 min, the observed reset."""
+    secs = seconds_until_utc_midnight()
+    log(f"waiting {secs / 3600:.1f} h for the 00:00 UTC cap reset", loud=True)
+    time.sleep(secs)
+
+
+def tail_lines(path, nbytes=65536):
+    """Complete lines from the end of a growing (plain) jsonl file."""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - nbytes))
+        data = f.read()
+    lines = data.splitlines()
+    if size > nbytes:
+        lines = lines[1:]                                  # first line is likely cut
+    out = []
+    for l in lines:
         try:
-            fetcher.get(newest - 50, tries=2)
-            log("explorer accepts requests again (daily cap reset)", loud=True)
+            out.append(json.loads(l))
+        except Exception:
+            continue                                       # the last line may be half-written
+    return out
+
+
+def latest_snapshot_ms():
+    """Time of the newest BTC L2 snapshot the recorder wrote (BTC and ETH arrive together)."""
+    p = os.path.join(HOME, "hl_data", time.strftime("%Y-%m-%d/%H", time.gmtime()), "book_BTC.jsonl")
+    if not os.path.exists(p):
+        return None
+    rows = tail_lines(p, 16384)
+    times = [r["msg"]["data"]["time"] for r in rows if isinstance(r.get("msg"), dict) and "data" in r["msg"]]
+    return max(times) if times else None
+
+
+def plan_chunk(snap_ms, headers, n):
+    """(start, end) of the chunk after a snapshot: the n blocks after the last block whose blockTime
+    <= snap_ms (rule 8 applies a snapshot at the end of that block). None until a header newer than
+    the snapshot is known (so 'last block <= snap_ms' is settled). headers: [(height, blockTime)]."""
+    before = [h for h, t in headers if t <= snap_ms]
+    if not before or not any(t > snap_ms for _, t in headers):
+        return None
+    last = max(before)
+    return last + 1, last + n
+
+
+def recent_headers():
+    p = os.path.join(HOME, "hl_data", time.strftime("%Y-%m-%d/%H", time.gmtime()), "blocks.jsonl")
+    if not os.path.exists(p):
+        return []
+    return [(r["msg"]["height"], r["msg"]["blockTime"]) for r in tail_lines(p)
+            if isinstance(r.get("msg"), dict) and "height" in r["msg"]]
+
+
+def run_chunks(fetcher, state, writer):
+    last_snap, last_start = 0, 0.0
+    while True:
+        pct = disk_pct()
+        if pct > 85:
+            log(f"disk {pct:.0f}% full: capture paused (recorder keeps running). Sleeping 30 min.", loud=True)
+            time.sleep(1800); continue
+        snap = latest_snapshot_ms()
+        if snap is None or snap <= last_snap or time.time() - last_start < CHUNK_EVERY_S:
+            time.sleep(0.5); continue
+        span = plan_chunk(snap, recent_headers(), CHUNK_BLOCKS)
+        if span is None:
+            if time.time() * 1000 - snap > 30_000:
+                log(f"no block headers around snapshot {snap}; skipping it (recorder lagging?)")
+                last_snap = snap
+            time.sleep(0.5); continue
+        last_snap, last_start = snap, time.time()
+        start, end = span
+        meta = {"kind": "chunk", "snapshot_time": snap}
+        status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=0, max_anchors=CHUNK_ANCHORS)
+        save_json(STATE, state)
+        if status == "archived_cap":
+            if ONCE:
+                return
+            wait_for_cap_reset()
+        if ONCE:
             return
-        except ArchivedCap:
-            log("still over the daily archived-block cap; next probe in 30 min")
-        except TooOld as e:
-            log(f"cap probe refused by the age guard ({e}); next probe in 30 min")
-        except Exception as e:
-            log(f"cap probe failed ({e}); next probe in 30 min")
 
 
 def main():
@@ -215,8 +394,20 @@ def main():
     keep = os.environ.get("KEEPALIVE") == "1"           # default: fresh connection per request (measured faster)
     fetcher = Fetcher(legacy=not keep, interval=float(os.environ.get("FETCH_INTERVAL", DEFAULT_INTERVAL)) if keep else 0,
                       head=lambda: recorder_head(os.path.join(HOME, "hl_data")), max_age_min=MAX_AGE_MIN)
-    log(f"capture started (window_blocks={window_blocks}, once={ONCE})")
+    writer = Writer()
+    log(f"capture started (mode={MODE}, chunk_blocks={CHUNK_BLOCKS}, chunk_every_s={CHUNK_EVERY_S}, "
+        f"window_blocks={window_blocks}, max_age_min={MAX_AGE_MIN}, once={ONCE})")
     resume = unfinished_window()
+    if resume:
+        start, end, meta = resume
+        capture(fetcher, start, end, meta, writer=writer, state=state,
+                warmup=0 if meta.get("kind") == "chunk" else None,
+                max_anchors=CHUNK_ANCHORS if meta.get("kind") == "chunk" else None)
+        save_json(STATE, state)
+        resume = None
+    if MODE == "chunks":
+        run_chunks(fetcher, state, writer)
+        return
     while True:
         pct = disk_pct()
         if pct > 85:
@@ -232,7 +423,8 @@ def main():
                 time.sleep(60); continue
             start, end, meta = newest - window_blocks + 1, newest, {}
             log(f"window {start}-{end} starting ({window_blocks} blocks)")
-        status = capture(fetcher, start, end, meta)
+        status = capture(fetcher, start, end, meta, writer=writer, state=state)
+        save_json(STATE, state)
         if status == "partial" and not glob.glob(os.path.join(WIN_DIR, f"{start}-{end}", "*.json.gz")):
             time.sleep(60)                                 # guard refused the first block: don't spin
         if status == "archived_cap":
@@ -242,10 +434,9 @@ def main():
                 state.update(window_blocks=window_blocks, halved=True)
                 save_json(STATE, state)
                 log(f"next windows use WINDOW_BLOCKS={window_blocks}", loud=True)
-            log("waiting for the daily cap to reset (probe every 30 min)", loud=True)
             if ONCE:
                 break
-            wait_for_cap_reset(fetcher)
+            wait_for_cap_reset()
         if ONCE:
             break
 

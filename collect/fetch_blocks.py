@@ -14,12 +14,14 @@ One request at a time (the explorer rate-limits per IP; parallel requests are sl
 Only one explorer client per machine: Fetcher takes an exclusive lock (explorer.lock next to this file,
 or $HL_EXPLORER_LOCK), so a hand-run fetch can't share the IP's budget with the capture service.
 
-Archived-block guard (fail closed). Blocks older than ~3 h are "archived": 100/day per IP, and going
-over refuses EVERY block for the rest of the day. Archived blocks are served normally until the 100th,
-so the cap error comes too late to protect anything. Before EVERY request, Fetcher estimates the
-block's age from the nearest known (height, blockTime) reference (the recorder's newest header, or the
-last block it fetched) and raises TooOld, with no request sent, if the age is over max_age_min (120)
-or can't be estimated.
+Archived-block guard (fail closed). The explorer caps "archived" blocks per IP per day, and going over
+refuses every block except the newest until 00:00 UTC. The rule is NOT what we assumed (">~3 h old,
+100/day"): on Nov 18 the cap hit while fetching ~84-min-old blocks, after ~10.5k blocks that day aged
+7-110 min, so "archived" likely starts within minutes and the budget is in the thousands; capture.py
+now logs every block's age and the day's count to pin it down. The cap error comes too late to
+protect anything, so before EVERY request Fetcher estimates the block's age from the nearest known
+(height, blockTime) reference (the recorder's newest header, or the last block it fetched) and raises
+TooOld, with no request sent, if the age is over max_age_min (30) or can't be estimated.
 Every block is checked
 (len(txs) == numTxs, error responses refused), written via temp file + rename, and
 skipped on rerun. Backs off on HTTP 429. Stops on the daily archived-block cap.
@@ -30,7 +32,7 @@ import argparse, fcntl, glob, gzip, http.client, json, os, random, sys, time, ur
 HOST, PATH = "rpc.hyperliquid.xyz", "/explorer"
 DEFAULT_INTERVAL = 0.8                  # pacing for --keepalive only
 BPS = 14.5                              # Hyperliquid blocks per second (approx.)
-MAX_AGE_MIN = 120.0                     # never request a block older than this (archived ~180 min)
+MAX_AGE_MIN = 30.0                      # never request a block older than this (see the guard note above)
 MAX_REF_GAP_MIN = 240.0                 # a reference further than this (in blocks / BPS) is too imprecise
 LOCK = os.environ.get("HL_EXPLORER_LOCK", os.path.join(os.path.dirname(os.path.abspath(__file__)), "explorer.lock"))
 
@@ -97,6 +99,7 @@ class Fetcher:
         self._last = 0.0
         self.head, self.max_age_min = head, max_age_min
         self.ref = None                        # (height, blockTime_ms) of the last block fetched
+        self.last_age_min = None               # estimated age of the last block requested
         self._lock = acquire_lock(lock) if lock else None
 
     def age_min(self, h):
@@ -173,7 +176,7 @@ class Fetcher:
         or RuntimeError after `tries`."""
         delay, last = 1.0, None
         for _ in range(tries):
-            self.check_age(h)                  # before EVERY request, retries included
+            self.last_age_min = self.check_age(h)   # before EVERY request, retries included
             try:
                 status, data = self._raw(h)
                 if status == 429:
@@ -219,7 +222,7 @@ def main():
     ap.add_argument("--hl-data", default="hl_data",
                     help="recorder data dir; its newest block header dates the blocks (default: ./hl_data)")
     ap.add_argument("--max-age-min", type=float, default=MAX_AGE_MIN,
-                    help="never request blocks older than this (archived blocks: 100/day/IP cap)")
+                    help="never request blocks older than this (daily archived-block cap per IP)")
     ap.add_argument("--keepalive", action="store_true", help="one kept-open connection (measured slower)")
     ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL, help="min seconds between requests (keepalive)")
     args = ap.parse_args()

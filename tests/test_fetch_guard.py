@@ -81,7 +81,7 @@ def test_far_reference_is_not_trusted():
 
 def test_fetched_block_becomes_reference():
     # the last fetched block (nearest height) dates the next one, even with no recorder head
-    f, sent = fb.Fetcher(head=None, lock=None), []
+    f, sent = fb.Fetcher(head=None, lock=None, max_age_min=120), []
     f.ref = (500, NOW_MS - 119 * 60_000)
     stub(f, sent)
     f.get(501)
@@ -118,3 +118,12 @@ def test_recorder_head_reads_newest_header(tmp_path):
     (d / "blocks.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     assert fb.recorder_head(str(tmp_path)) == (9, 90)
     assert fb.recorder_head(str(tmp_path / "missing")) is None
+
+
+def test_default_limit_is_30_min_and_the_request_age_is_recorded():
+    f, sent = fb.Fetcher(head=head_at(1_000_000, 0), lock=None), []
+    stub(f, sent)
+    with pytest.raises(fb.TooOld):
+        f.get(1_000_000 - int(31 * 60 * fb.BPS))
+    f.get(1_000_000 - int(5 * 60 * fb.BPS))
+    assert fb.MAX_AGE_MIN == 30 and 4.9 < f.last_age_min < 5.1
