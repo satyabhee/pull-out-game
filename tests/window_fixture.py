@@ -40,11 +40,11 @@ class Window:
     """window = Window(tmp_path); window.block([...txs]); window.book(...); window.trade(...); window.write()"""
 
     def __init__(self, root: Path, warmup_blocks: int = 0, name: str = "w", h0: int = H0, t0: int = T0,
-                 kind: str | None = None, status: str = "complete"):
+                 kind: str | None = None, status: str = "complete", meta: dict | None = None):
         """Several windows (e.g. chunks) can share one root: give each its own name, h0 and t0;
         their recorder lines are appended to the shared hl_data hour files."""
         self.dir = root / "windows" / name
-        self.h0, self.t0, self.kind, self.status = h0, t0, kind, status
+        self.h0, self.t0, self.kind, self.status, self.extra_meta = h0, t0, kind, status, meta or {}
         self.hl = root / "hl_data"
         self.blocks: list[tuple[int, int, list]] = []
         self.books: list[tuple[str, int, list, list]] = []
@@ -89,6 +89,7 @@ class Window:
                 "warmup_end_height": self.h0 + self.warmup_blocks}
         if self.kind is not None:
             meta["kind"] = self.kind
+        meta.update(self.extra_meta)
         (self.dir / "window.json").write_text(json.dumps(meta))
         if self.anchors is not None:
             (self.dir / "anchors.json").write_text(json.dumps(self.anchors))

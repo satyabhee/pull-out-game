@@ -127,3 +127,39 @@ def test_default_limit_is_30_min_and_the_request_age_is_recorded():
         f.get(1_000_000 - int(31 * 60 * fb.BPS))
     f.get(1_000_000 - int(5 * 60 * fb.BPS))
     assert fb.MAX_AGE_MIN == 30 and 4.9 < f.last_age_min < 5.1
+
+
+# ---- per-request log: response time, block age, outcome (no extra requests) ----------------------
+
+def read_log(p):
+    return [json.loads(x) for x in open(p)]
+
+
+def test_every_request_is_logged_with_age_latency_and_outcome(tmp_path):
+    log = tmp_path / "requests.jsonl"
+    f, sent = fb.Fetcher(lock=None, head=head_at(1000, 0), request_log=str(log)), []
+    stub(f, sent)
+    f.get(1000 - 145)                                       # ~10 s old
+    (r,) = read_log(log)
+    assert r["height"] == 855 and r["status"] == 200 and r["outcome"] == "ok"
+    assert r["age_s"] == pytest.approx(10.0, abs=0.1) and r["ms"] >= 0 and r["t"] == NOW_MS and r["bytes"] > 0
+
+
+def test_refused_before_sending_is_not_logged_as_a_request(tmp_path):
+    log = tmp_path / "requests.jsonl"
+    f, sent = fb.Fetcher(lock=None, head=head_at(1000, 0), max_age_min=1, request_log=str(log)), []
+    stub(f, sent)
+    with pytest.raises(fb.TooOld):
+        f.get(1000 - 14_500)                                # ~17 min old
+    assert sent == [] and not log.exists()
+
+
+def test_cap_and_429_responses_are_logged(tmp_path):
+    log = tmp_path / "requests.jsonl"
+    f = fb.Fetcher(lock=None, head=head_at(1000, 0), request_log=str(log))
+    replies = iter([(429, b"rate"), (200, json.dumps({"type": "error", "message":
+                   "More than 100 archived blocks queried in one day"}).encode())])
+    f._raw = lambda h: next(replies)
+    with pytest.raises(fb.ArchivedCap):
+        f.get(990)
+    assert [(r["status"], r["outcome"]) for r in read_log(log)] == [(429, "http_429"), (200, "archived_cap")]

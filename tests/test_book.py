@@ -109,3 +109,19 @@ def test_crossed_book_is_detected(book):
     book.add(order(Side.SELL, 100), 10)   # the book itself allows it; the check must not
     with pytest.raises(BookError, match="crossed"):
         book.check_invariants()
+
+
+def test_add_at_front_queues_ahead_and_keeps_invariants():
+    from engine_py.book import Book
+    from engine_py.types import Order, Side, Tif
+    b = Book(0)
+    mk = lambda oid: Order(oid=oid, user="u", asset=0, side=Side.BUY, px=100, sz=5, tif=Tif.GTC, cloid=None,
+                           seq=oid, block=1)
+    b.add(mk(1), 5)
+    b.add(mk(2), 5, front=True)
+    b.add(mk(3), 5)
+    assert [n.order.oid for n in b.best_level(Side.BUY)] == [2, 1, 3]
+    b.check_invariants()
+    b.remove(2)
+    assert b.best_level(Side.BUY).first().order.oid == 1
+    b.check_invariants()

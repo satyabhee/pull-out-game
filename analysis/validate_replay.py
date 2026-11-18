@@ -257,6 +257,8 @@ class ValidateObserver(Observer):
         if result.get("reseed"):
             self.reseed_seq[s.asset] = self.seq
             self.reseed_time[s.asset] = s.time_ms
+        elif result.get("refill"):                     # keep-known re-seed: known orders stay known
+            self.reseed_time[s.asset] = s.time_ms
 
     # ---------------------------------------------------------- scoring
     def flags_for(self, rec: TxRecord, rp) -> set:
@@ -340,11 +342,12 @@ def book_text(book, side, depth=BOOK_DEPTH) -> str:
 
 def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
         alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False,
-        touch_reconcile=False, touch_n_cap=False):
+        touch_reconcile=False, touch_n_cap=False, keep_known=False, skip_lead_in=False):
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
                 gate_max_age_ms=gate_max_age_ms, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
-                reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap)
+                reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap,
+                keep_known=keep_known, skip_lead_in=skip_lead_in)
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -387,7 +390,9 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                          engine_only=int(bool(rec.engine) and not rec.real),
                          flags="|".join(sorted(flags)),
                          real=fmt_fills(rec.asset, rec.real), engine=fmt_fills(rec.asset, [f[:3] for f in rec.engine]),
-                         book_before=rec.book_before))
+                         book_before=rec.book_before,
+                         match_full=int(is_match(rec.real, rec.engine)),
+                         matched_notional_full=matched_notional(rec.real, rec.engine, lambda f: (f[0], f[2]))))
 
     result = summarize(rp, obs, rows, unlinked, policy_name)
     if out_dir is not None:
@@ -434,6 +439,9 @@ def scope_metrics(scored: list) -> dict:
             res["g1_target_rule"] = f"all:fill_recall >= {G1_TARGET_PCT / 100:.2f} (report with fill_precision)"
         res[f"{scope}:fill_recall"] = rate(sum(r["matched_notional"] for r in rs), rn)
         res[f"{scope}:fill_precision"] = rate(sum(r["matched_notional"] for r in rs), en)
+        res[f"{scope}:match_rate_full"] = rate(sum(r["match_full"] for r in rs), n)
+        res[f"{scope}:fill_recall_full"] = rate(sum(r["matched_notional_full"] for r in rs), rn)
+        res[f"{scope}:fill_precision_full"] = rate(sum(r["matched_notional_full"] for r in rs), en)
         res[f"{scope}:fill_recall_px_sz"] = rate(sum(r["matched_notional_px"] for r in rs), rn)
         res[f"{scope}:fill_precision_px_sz"] = rate(sum(r["matched_notional_px"] for r in rs), en)
     return res
@@ -472,7 +480,8 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
            "alo_gate": rp.alo_gate or "off", "gate_max_age_ms": rp.gate_max_age_ms if rp.gate_max_age_ms is not None else "",
            "evict_known": rp.reconcile_known or "off",
            "nearest_ratio": rp.resolver.nearest_ratio if rp.resolver is not None else "",
-           "reseed": "every snapshot" if rp.reseed else "off",
+           "reseed": ("every snapshot, keep known" if rp.keep_known else "every snapshot") if rp.reseed else "off",
+           "lead_in": "skipped" if rp.skip_lead_in and rp.lead_in else f"{rp.lead_in} blocks" if rp.lead_in else "none",
            "touch_reconcile": ("bbo every block" + (" + n cap" if rp.touch_n_cap else "")) if rp.touch_reconcile else "off",
            "real_linked_txs_not_in_window": unlinked}
     res.update(scope_metrics(scored))
@@ -608,9 +617,9 @@ def print_report(res: dict) -> None:
               f"resting {r['resting_known_orders']}")
 
 
-def add_replay_args(ap: argparse.ArgumentParser) -> None:
+def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) -> None:
     """The replay options shared by validate_replay and validate_chunks."""
-    ap.add_argument("--hl-data", required=True)
+    ap.add_argument("--hl-data", required=hl_data_required)
     ap.add_argument("--policy", default="listing", choices=sorted(POLICIES))
     ap.add_argument("--no-resolver", action="store_true")
     ap.add_argument("--alo-gate", choices=["touch"], help="G1 fix #1: admit ALOs against the real touch")
@@ -621,13 +630,17 @@ def add_replay_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--reseed", action="store_true", help="G1 #3: rebuild each book from every snapshot")
     ap.add_argument("--touch-reconcile", action="store_true", help="rule 8 against the recorded bbo before every block")
     ap.add_argument("--touch-n-cap", action="store_true", help="with --touch-reconcile: cap touch order count at bbo n")
+    ap.add_argument("--keep-known", action="store_true",
+                    help="with --reseed: keep known orders at each snapshot, refill missing size at the front")
+    ap.add_argument("--skip-lead-in", action="store_true", help="lead-in chunks: replay only the scored part")
 
 
 def replay_kwargs(a) -> dict:
     """Keyword arguments for run() from add_replay_args options (all but hl_data, policy, anchors)."""
     return dict(use_resolver=not a.no_resolver, alo_gate=a.alo_gate, gate_max_age_ms=a.gate_max_age_ms,
                 evict_known=a.evict_known, nearest_ratio=a.nearest_ratio, reseed=a.reseed,
-                touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap)
+                touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap,
+                keep_known=a.keep_known, skip_lead_in=a.skip_lead_in)
 
 
 def options_tag(a) -> str:
@@ -635,7 +648,8 @@ def options_tag(a) -> str:
     return "".join([f"-gate{a.gate_max_age_ms if a.gate_max_age_ms is not None else ''}" if a.alo_gate else "",
                     f"-evict{a.evict_known}" if a.evict_known else "",
                     f"-nr{a.nearest_ratio}" if a.nearest_ratio else "", "-reseed" if a.reseed else "",
-                    "-touch" if a.touch_reconcile else "", "-ncap" if a.touch_n_cap else ""])
+                    "-touch" if a.touch_reconcile else "", "-ncap" if a.touch_n_cap else "",
+                    "-keep" if a.keep_known else "", "-nolead" if a.skip_lead_in else ""])
 
 
 def main(argv=None):

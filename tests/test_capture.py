@@ -103,3 +103,25 @@ def test_cap_records_where_and_how_much(tmp_home):
     status = cap.capture(StubFetcher(cap_at=12), 10, 14, meta, writer=cap.Writer(), state=state, warmup=0)
     assert status == "archived_cap"
     assert meta["cap_at"]["height"] == 12 and meta["cap_at"]["fetched_today"] == 2
+
+
+# ---- lead-in: fetch LEAD_IN_BLOCKS before the chunk, score from the chunk start -------------------
+
+def test_lead_in_moves_the_fetch_start_and_scoring_starts_at_the_chunk():
+    assert cap.with_lead_in((102, 131), 0) == (102, 131, 0)
+    assert cap.with_lead_in((102, 131), 50) == (52, 131, 50)
+
+
+def test_lead_in_chunk_meta_marks_the_scoring_start(tmp_home):
+    state, w = {}, cap.Writer(lookup=lambda u, o: {"status": "order", "order": {}}, info_gap_s=0)
+    start, end, warmup = cap.with_lead_in((10, 14), 3)
+    meta = {"kind": "chunk", "snapshot_time": 999, "lead_in_blocks": warmup}
+    assert cap.capture(StubFetcher(), start, end, meta, writer=w, state=state, warmup=warmup, max_anchors=2) == "complete"
+    m = json.loads((tmp_home / "windows" / "7-14" / "window.json").read_text())
+    assert (m["start_height"], m["warmup_end_height"], m["lead_in_blocks"]) == (7, 10, 3)
+
+
+def test_a_resumed_chunk_keeps_its_lead_in():
+    assert cap.resume_warmup({"kind": "chunk", "lead_in_blocks": 150}) == 150
+    assert cap.resume_warmup({"kind": "chunk"}) == 0
+    assert cap.resume_warmup({}) is None                    # full windows: the WARMUP_BLOCKS default

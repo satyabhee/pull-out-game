@@ -21,6 +21,7 @@ Settings (environment variables):
   CAPTURE_MODE=chunks  chunks | windows
   CHUNK_BLOCKS=30      ~2 s of chain per chunk
   CHUNK_EVERY_S=60     at most one chunk per this many seconds
+  LEAD_IN_BLOCKS=0     chunks: also fetch this many blocks before the chunk (warm-up; ~145 = 10 s)
   WINDOW_BLOCKS=6100   windows mode only (~7 min of chain)
   WARMUP_BLOCKS=1740   windows mode: warmup_end_height = start + WARMUP_BLOCKS
   MAX_ANCHORS=100      orderStatus lookups per window (chunks: CHUNK_ANCHORS=2), max 1 per 2 s
@@ -40,6 +41,8 @@ WARMUP = int(os.environ.get("WARMUP_BLOCKS", 1740))
 MODE = os.environ.get("CAPTURE_MODE", "chunks")
 CHUNK_BLOCKS = int(os.environ.get("CHUNK_BLOCKS", 30))
 CHUNK_EVERY_S = float(os.environ.get("CHUNK_EVERY_S", 60))
+LEAD_IN_BLOCKS = int(os.environ.get("LEAD_IN_BLOCKS", 0))   # chunks: blocks fetched before the chunk, replayed as warm-up
+REQUEST_LOG = os.path.join(HOME, "requests.jsonl")
 MAX_ANCHORS = int(os.environ.get("MAX_ANCHORS", 100))
 CHUNK_ANCHORS = int(os.environ.get("CHUNK_ANCHORS", 2))
 FRESH_MIN = float(os.environ.get("FRESH_MIN", 20))
@@ -349,6 +352,17 @@ def plan_chunk(snap_ms, headers, n):
     return last + 1, last + n
 
 
+def with_lead_in(span, lead_in):
+    """(fetch start, end, warmup) for a chunk span with `lead_in` blocks before it; scoring starts at the span."""
+    start, end = span
+    return start - lead_in, end, lead_in
+
+
+def resume_warmup(meta):
+    """Warm-up for a resumed window: a chunk keeps its lead-in (0 if none); full windows use the default."""
+    return meta.get("lead_in_blocks", 0) if meta.get("kind") == "chunk" else None
+
+
 def recent_headers():
     p = os.path.join(HOME, "hl_data", time.strftime("%Y-%m-%d/%H", time.gmtime()), "blocks.jsonl")
     if not os.path.exists(p):
@@ -374,9 +388,9 @@ def run_chunks(fetcher, state, writer):
                 last_snap = snap
             time.sleep(0.5); continue
         last_snap, last_start = snap, time.time()
-        start, end = span
-        meta = {"kind": "chunk", "snapshot_time": snap}
-        status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=0, max_anchors=CHUNK_ANCHORS)
+        start, end, warmup = with_lead_in(span, LEAD_IN_BLOCKS)
+        meta = {"kind": "chunk", "snapshot_time": snap, "lead_in_blocks": warmup}
+        status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=warmup, max_anchors=CHUNK_ANCHORS)
         save_json(STATE, state)
         if status == "archived_cap":
             if ONCE:
@@ -393,15 +407,16 @@ def main():
     window_blocks = int(os.environ["WINDOW_BLOCKS"]) if "WINDOW_BLOCKS" in os.environ else state.get("window_blocks", 6100)
     keep = os.environ.get("KEEPALIVE") == "1"           # default: fresh connection per request (measured faster)
     fetcher = Fetcher(legacy=not keep, interval=float(os.environ.get("FETCH_INTERVAL", DEFAULT_INTERVAL)) if keep else 0,
-                      head=lambda: recorder_head(os.path.join(HOME, "hl_data")), max_age_min=MAX_AGE_MIN)
+                      head=lambda: recorder_head(os.path.join(HOME, "hl_data")), max_age_min=MAX_AGE_MIN,
+                      request_log=REQUEST_LOG)
     writer = Writer()
-    log(f"capture started (mode={MODE}, chunk_blocks={CHUNK_BLOCKS}, chunk_every_s={CHUNK_EVERY_S}, "
+    log(f"capture started (mode={MODE}, chunk_blocks={CHUNK_BLOCKS}, lead_in_blocks={LEAD_IN_BLOCKS}, chunk_every_s={CHUNK_EVERY_S}, "
         f"window_blocks={window_blocks}, max_age_min={MAX_AGE_MIN}, once={ONCE})")
     resume = unfinished_window()
     if resume:
         start, end, meta = resume
         capture(fetcher, start, end, meta, writer=writer, state=state,
-                warmup=0 if meta.get("kind") == "chunk" else None,
+                warmup=resume_warmup(meta),
                 max_anchors=CHUNK_ANCHORS if meta.get("kind") == "chunk" else None)
         save_json(STATE, state)
         resume = None

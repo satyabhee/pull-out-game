@@ -12,14 +12,17 @@ Run `python -m data.parse <window_dir> [--hl-data DIR]` for a summary.
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime
 import gzip
 import json
 import os
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
+
+import orjson
 
 from engine_py.types import (
     ASSETS, Block, Cancel, CancelByCloid, ConversionError, Modify, OutsideFill,
@@ -30,6 +33,16 @@ COIN_TO_ASSET = {spec.name: a for a, spec in ASSETS.items()}
 
 # Action types with no effect on the BTC/ETH book: dropped and counted.
 BOOK_TYPES = {"order", "cancel", "cancelByCloid", "modify", "batchModify", "scheduleCancel"}
+
+
+def _loads(text: str | bytes):
+    """JSON -> Python with orjson (~10% faster end to end, measured Nov 18); the stdlib parser decides
+    whatever orjson refuses (e.g. ints over 64 bits), so results never change. A JSONDecodeError still
+    means the text is not JSON."""
+    try:
+        return orjson.loads(text)
+    except orjson.JSONDecodeError:
+        return json.loads(text)
 
 
 class Stats(Counter):
@@ -48,8 +61,8 @@ def _block_files(window_dir: Path) -> list[tuple[int, Path]]:
 
 
 def read_block(path: Path) -> dict:
-    with gzip.open(path, "rt") as f:
-        raw = json.load(f)
+    with gzip.open(path, "rb") as f:
+        raw = _loads(f.read())
     b = raw.get("blockDetails", raw)
     if "txs" not in b or "numTxs" not in b:
         raise ValueError(f"{path}: not a block (error response saved as a file?)")
@@ -182,6 +195,27 @@ def iter_window(window_dir, hl_data=None, stats: Stats | None = None) -> Iterato
     stats["outside_fill_no_block"] += sum(len(v) for v in outside.values())
 
 
+_WINDOW_CACHE_MAX = 8
+
+
+def load_window(window_dir, hl_data=None) -> tuple[tuple[Block, ...], Stats]:
+    """iter_window's blocks as a tuple plus its parse stats, decoded once per process per window
+    (re-decoded when any block file changes). Blocks are frozen, so they are shared; the stats are a
+    fresh copy on every call."""
+    window_dir = Path(window_dir)
+    sig = tuple(sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns) for _, p in _block_files(window_dir)))
+    key = (window_dir.resolve(), None if hl_data is None else Path(hl_data).resolve())
+    hit = _window_cache.get(key)
+    if hit is None or hit[0] != sig:
+        stats = Stats()
+        hit = (sig, tuple(iter_window(window_dir, hl_data, stats)), stats)
+        _window_cache[key] = hit
+        while len(_window_cache) > _WINDOW_CACHE_MAX:
+            _window_cache.popitem(last=False)
+    _window_cache.move_to_end(key)
+    return hit[1], Stats(hit[2])
+
+
 # ------------------------------------------------------------------ recorder files
 
 HOUR_MS = 3_600_000
@@ -190,6 +224,9 @@ HOUR_MS = 3_600_000
 # [t0 - SLACK, t1 + SLACK]; this assumes no line is recorded more than SLACK after its event.
 RECORD_SLACK_MS = HOUR_MS
 _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC)
+
+
+_window_cache: OrderedDict = OrderedDict()
 
 
 def _hour_start_ms(day: str, hour: str) -> int | None:
@@ -227,18 +264,100 @@ def _hour_files(hl_data: Path, stem: str, t0_ms: int | None = None, t1_ms: int |
     return out
 
 
+def _open_text(path: Path):
+    return gzip.open(path, "rt") if path.suffix == ".gz" else open(path)
+
+
 def _lines(path: Path) -> Iterator[dict]:
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rt") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
+    """Every parsed line of one recorder file (see _records for ranged, cached reads)."""
+    yield from _records(path)
+
+
+# Ranged reads skip lines by their receive time (`{"recv_ms": N, ...}`, written first by the recorder)
+# before any JSON parsing. A line can hold an event in [t0, t1] only if its receive time is in
+# [t0 - RECV_SKEW_MS, t1 + RECV_LAG_MS]. Measured Nov 18 over every local recorder line (Nov 17-18
+# server + Mac): receive - event time was >= -1.0 s (clock skew) and <= 51 s (trades, once; p99.99 28 s,
+# books <= 3 s, bbo <= 1.5 s), and receive time never went backwards within a file.
+RECV_SKEW_MS = 60_000
+RECV_LAG_MS = 300_000
+_RECV_PREFIX = '{"recv_ms": '
+_FILE_CACHE_MAX = 32
+
+
+class _RecorderFile:
+    """One recorder file read once: raw lines, their receive times, and lines parsed so far."""
+
+    def __init__(self, path: Path):
+        with _open_text(path) as f:
+            self.lines = [ln for ln in (x.strip() for x in f) if ln]
+        self.recv: list[int | None] = [self._recv(ln) for ln in self.lines]
+        known = [r for r in self.recv if r is not None]
+        self.sorted = len(known) == len(self.recv) and all(a <= b for a, b in zip(known, known[1:]))
+        self.parsed: dict[int, dict | None] = {}
+
+    @staticmethod
+    def _recv(line: str) -> int | None:
+        if not line.startswith(_RECV_PREFIX):
+            return None
+        end = line.find(",", len(_RECV_PREFIX))
+        try:
+            return int(line[len(_RECV_PREFIX):end])
+        except ValueError:
+            return None                                   # cut mid-number: the full parse will fail too
+
+    def get(self, i: int) -> dict | None:
+        if i not in self.parsed:
             try:
-                yield json.loads(line)
+                self.parsed[i] = _loads(self.lines[i])
             except json.JSONDecodeError:
                 # the open hour's last line can be cut mid-write; anything else is real
-                continue
+                self.parsed[i] = None
+        return self.parsed[i]
+
+    def indices(self, lo: int | None, hi: int | None) -> range | list[int]:
+        if lo is None:
+            return range(len(self.lines))
+        if self.sorted:
+            return range(bisect.bisect_left(self.recv, lo), bisect.bisect_right(self.recv, hi))
+        return [i for i, r in enumerate(self.recv) if r is None or lo <= r <= hi]
+
+
+_file_cache: "OrderedDict[Path, tuple[tuple[int, int], _RecorderFile]]" = OrderedDict()
+
+
+def clear_caches() -> None:
+    """Forget every cached recorder file and window (tests; long-lived processes)."""
+    _file_cache.clear()
+    _window_cache.clear()
+
+
+def _recorder_file(path: Path) -> _RecorderFile:
+    """Per-process cache keyed by path; reloaded when the file's size or mtime changes (the open hour)."""
+    st = path.stat()
+    sig = (st.st_size, st.st_mtime_ns)
+    hit = _file_cache.get(path)
+    if hit is not None and hit[0] == sig:
+        _file_cache.move_to_end(path)
+        return hit[1]
+    rf = _RecorderFile(path)
+    _file_cache[path] = (sig, rf)
+    _file_cache.move_to_end(path)
+    while len(_file_cache) > _FILE_CACHE_MAX:
+        _file_cache.popitem(last=False)
+    return rf
+
+
+def _records(path: Path, t0_ms: int | None = None, t1_ms: int | None = None) -> Iterator[dict]:
+    """Parsed lines of one recorder file in file order; with t0/t1, only lines whose receive time is in
+    [t0 - RECV_SKEW_MS, t1 + RECV_LAG_MS] (lines without a receive time are always kept).
+    The dicts are shared through the cache: callers must not modify them."""
+    rf = _recorder_file(path)
+    lo = None if t0_ms is None else t0_ms - RECV_SKEW_MS
+    hi = None if t1_ms is None else t1_ms + RECV_LAG_MS
+    for i in rf.indices(lo, hi):
+        rec = rf.get(i)
+        if rec is not None:
+            yield rec
 
 
 @dataclass(frozen=True)
@@ -277,7 +396,7 @@ def iter_trades(hl_data, coins, t0_ms: int, t1_ms: int) -> Iterator[Trade]:
         asset = COIN_TO_ASSET[coin]
         spec = ASSETS[asset]
         for path in _hour_files(hl_data, f"trades_{coin}", t0_ms, t1_ms):
-            for rec in _lines(path):
+            for rec in _records(path, t0_ms, t1_ms):
                 for x in rec["msg"]["data"]:
                     if not (t0_ms <= x["time"] <= t1_ms) or x["coin"] != coin:
                         continue
@@ -308,7 +427,7 @@ def iter_books(hl_data, coin: str, t0_ms: int, t1_ms: int) -> Iterator[BookSnaps
     asset = COIN_TO_ASSET[coin]
     seen: dict[int, dict] = {}
     for path in _hour_files(Path(hl_data), f"book_{coin}", t0_ms, t1_ms):
-        for rec in _lines(path):
+        for rec in _records(path, t0_ms, t1_ms):
             d = rec["msg"]["data"]
             if t0_ms <= d["time"] <= t1_ms:
                 seen[d["time"]] = d
@@ -316,10 +435,14 @@ def iter_books(hl_data, coin: str, t0_ms: int, t1_ms: int) -> Iterator[BookSnaps
         yield _snapshot(asset, seen[t])
 
 
-def _nearest(paths, at_ms: int):
+NEAREST_RADIUS_MS = 60_000
+
+
+def _nearest(paths, at_ms: int, radius_ms: int | None = None):
     best = None
+    lo, hi = (None, None) if radius_ms is None else (at_ms - radius_ms, at_ms + radius_ms)
     for path in paths:
-        for rec in _lines(path):
+        for rec in _records(path, lo, hi):
             d = rec["msg"]["data"]
             key = (abs(d["time"] - at_ms), d["time"])
             if best is None or key < best[0]:
@@ -330,14 +453,14 @@ def _nearest(paths, at_ms: int):
 def nearest_book(hl_data, coin: str, at_ms: int) -> BookSnapshot:
     """The L2 snapshot whose time is nearest `at_ms` (ties: the earlier one).
 
-    Reads the hours around at_ms first; a snapshot found there within RECORD_SLACK_MS is the
-    nearest overall (anything in a skipped folder is farther, given RECORD_SLACK_MS). Otherwise
-    every hour is read."""
+    First reads only lines that can hold a snapshot within NEAREST_RADIUS_MS of at_ms (hour folders
+    and receive times, see recorder_hours / _records); a snapshot found there within the radius is the
+    nearest overall. Otherwise every line of every hour is read."""
     asset = COIN_TO_ASSET[coin]
     stem = f"book_{coin}"
-    lo, hi = at_ms - RECORD_SLACK_MS, at_ms + RECORD_SLACK_MS
-    best = _nearest(_hour_files(Path(hl_data), stem, lo, hi), at_ms)
-    if best is None or best[0][0] > RECORD_SLACK_MS:
+    r = NEAREST_RADIUS_MS
+    best = _nearest(_hour_files(Path(hl_data), stem, at_ms - r, at_ms + r), at_ms, r)
+    if best is None or best[0][0] > r:
         best = _nearest(_hour_files(Path(hl_data), stem), at_ms)
     if best is None:
         raise ValueError(f"no book_{coin} snapshots under {hl_data}")

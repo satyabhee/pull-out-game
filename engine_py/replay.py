@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from data.oids import OidEstimator, OidResolver
-from data.parse import COIN_TO_ASSET, Stats, _hour_files, _lines, iter_books, iter_trades, iter_window, nearest_book
+from data.parse import COIN_TO_ASSET, Stats, _hour_files, _records, iter_books, iter_trades, load_window, nearest_book
 from engine_py.matching import PLACEHOLDER, Engine
 from engine_py.types import (ASSETS, Action, Block, Cancel, CancelByCloid, Fill, Modify, OutsideFill, Place,
                              Reject, RejectReason, Side, Tif)
@@ -116,7 +116,7 @@ def iter_bbo(hl_data, coin: str, t0_ms: int, t1_ms: int):
     spec = ASSETS[asset]
     lv = lambda x: (spec.px_to_ticks(x["px"]), spec.sz_to_lots(x["sz"]), int(x["n"])) if x else None
     for path in _hour_files(Path(hl_data), f"bbo_{coin}", t0_ms, t1_ms):
-        for rec in _lines(path):
+        for rec in _records(path, t0_ms, t1_ms):
             d = rec["msg"]["data"]
             if t0_ms <= d["time"] <= t1_ms:
                 b, k = d["bbo"]
@@ -143,7 +143,8 @@ class Replay:
                  observer: Observer | None = None, engine: Engine | None = None,
                  alo_gate: str | None = None, gate_max_age_ms: int | None = None,
                  reconcile_known: str | None = None, reseed: bool = False,
-                 touch_reconcile: bool = False, touch_n_cap: bool = False):
+                 touch_reconcile: bool = False, touch_n_cap: bool = False,
+                 keep_known: bool = False, skip_lead_in: bool = False):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -156,7 +157,15 @@ class Replay:
         touch_reconcile=True (needs recorded bbo): before every block, rule 8 against the latest bbo
         as a one-level snapshot, evicting known orders oldest first: nothing rests better than the
         real touch, and the touch level holds at most its real size. touch_n_cap=True also evicts
-        known orders (oldest first) while our touch level has more orders than bbo's n."""
+        known orders (oldest first) while our touch level has more orders than bbo's n.
+        Lead-in chunks (window.json lead_in_blocks > 0, collect/capture.py LEAD_IN_BLOCKS): blocks before
+        warmup_end_height are replayed but never scored, also with reseed. skip_lead_in=True drops them
+        (exactly what a chunk without lead-in would replay). keep_known=True (needs reseed): at every
+        snapshot, instead of clearing, rule 8 with oldest-first eviction and then Engine.refill: the
+        snapshot size we lack goes in as placeholders at the FRONT of each level, and known orders
+        carry over (scoring treats them as known, not as pre-re-seed wildcards)."""
+        if keep_known and not reseed:
+            raise ValueError("keep_known needs reseed=True")
         self.window_dir = Path(window_dir)
         self.hl_data = Path(hl_data)
         self.policy = policy
@@ -164,12 +173,19 @@ class Replay:
         self.hasher = hasher
         self.observer = observer or Observer()
         self.engine = engine or Engine()
-        self.parse_stats = Stats()
-        self.blocks: list[Block] = list(iter_window(self.window_dir, self.hl_data, self.parse_stats))
-        self.t0, self.t1 = self.blocks[0].time_ms, self.blocks[-1].time_ms
         meta_path = self.window_dir / "window.json"
         self.window_meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-        self.warmup_end_height: int = self.window_meta.get("warmup_end_height", self.blocks[0].height)
+        blocks, self.parse_stats = load_window(self.window_dir, self.hl_data)   # decoded once per process
+        self.lead_in = int(self.window_meta.get("lead_in_blocks", 0) or 0)
+        self.skip_lead_in = skip_lead_in
+        if skip_lead_in and self.lead_in:
+            blocks = [b for b in blocks if b.height >= self.window_meta["warmup_end_height"]]
+            if not blocks:
+                raise ValueError(f"{self.window_dir}: nothing after the lead-in")
+        self.blocks: list[Block] = list(blocks)
+        self.t0, self.t1 = self.blocks[0].time_ms, self.blocks[-1].time_ms
+        self.warmup_end_height: int = max(self.window_meta.get("warmup_end_height", self.blocks[0].height),
+                                          self.blocks[0].height)
 
         self.placed: dict[int, Place] = {}         # engine oid -> the order placed (a modify's `new`)
         self.placed_by: dict[int, Action] = {}     # engine oid -> the Place or Modify action itself
@@ -190,8 +206,8 @@ class Replay:
         if alo_gate not in (None, "touch"):
             raise ValueError(f"unknown alo_gate {alo_gate!r}")
         self.alo_gate, self.gate_max_age_ms, self.reconcile_known = alo_gate, gate_max_age_ms, reconcile_known
-        self.reseed = reseed
-        if reseed:
+        self.reseed, self.keep_known = reseed, keep_known
+        if reseed and not self.lead_in:
             self.warmup_end_height = self.blocks[0].height     # every horizon starts from a snapshot
         self.touch: RealTouch | None = None
         self.touch_reconcile, self.touch_n_cap = touch_reconcile, touch_n_cap
@@ -348,7 +364,10 @@ class Replay:
             while si < len(snaps) and snaps[si].time_ms < nxt:
                 s = snaps[si]
                 if s.time_ms >= b.time_ms:
-                    if self.reseed:
+                    if self.reseed and self.keep_known:
+                        res = eng.reconcile(s.asset, s.bids, s.asks, known="oldest")
+                        res.update(eng.refill(s.asset, s.bids, s.asks), refill=1)
+                    elif self.reseed:
                         res = eng.reconcile(s.asset, s.bids, s.asks)     # measure drift, then rebuild
                         res.update(eng.clear(s.asset), reseed=1)
                         for px, sz in s.bids:

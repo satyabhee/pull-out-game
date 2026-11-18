@@ -10,6 +10,7 @@ dependencies = [
     "pandas>=2.2",             # replay validation + experiment tables
     "statsmodels>=0.14",       # regression with clustered standard errors
     "matplotlib>=3.9",         # report figures
+    "orjson>=3.10",
 ]
 
 [dependency-groups]

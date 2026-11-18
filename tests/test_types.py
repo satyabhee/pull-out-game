@@ -123,3 +123,70 @@ def test_outside_fill_and_fill():
 def test_no_float_in_types_module():
     src = pathlib.Path(__file__).parents[1].joinpath("engine_py/types.py").read_text()
     assert not re.search(r"\bfloat\b", src)
+
+
+# ---- fast to_units must equal the original Fraction implementation, exceptions included -------------
+
+from decimal import Decimal as _D, InvalidOperation as _IO
+from fractions import Fraction as _F
+
+from hypothesis import given, settings, strategies as st
+
+from engine_py import types as T
+
+
+def reference_to_units(value, unit):
+    """The pre-Nov-18 implementation, kept verbatim as the oracle."""
+    if not isinstance(value, str) or not isinstance(unit, str):
+        raise TypeError("to_units takes decimal strings only")
+    try:
+        v, u = _D(value.strip()), _D(unit.strip())
+    except _IO as e:
+        raise ConversionError(f"not a decimal: {value!r} / {unit!r}") from e
+    if not (v.is_finite() and u.is_finite()) or u <= 0:
+        raise ConversionError(f"bad value or unit: {value!r} / {unit!r}")
+    q = _F(v) / _F(u)
+    if q.denominator != 1:
+        raise ConversionError(f"{value} is not a whole multiple of {unit}")
+    return q.numerator
+
+
+def outcome(f, *args):
+    try:
+        return ("ok", f(*args))
+    except Exception as e:
+        return (type(e).__name__,)
+
+
+decimal_text = st.one_of(
+    st.decimals(allow_nan=True, allow_infinity=True, places=None).map(str),
+    st.builds(lambda i, f, e: f"{i}.{f}" + (f"e{e}" if e is not None else ""),
+              st.integers(-10 ** 9, 10 ** 9), st.integers(0, 10 ** 8), st.none() | st.integers(-12, 12)),
+    st.sampled_from(["", " ", "abc", "1.2.3", " 101.10 ", "-0", "-0.0", "1e3", "1E-3", "NaN", "-inf",
+                     "0.00001", "64893.0", "0.1", "0.01", "0", "-0.1", "1_000"]),
+)
+
+
+@settings(max_examples=3000, deadline=None)
+@given(decimal_text, st.sampled_from(["0.1", "0.01", "0.00001", "0.0001", "1", "0.5", "0", "-0.1", "x", " 0.1 "])
+       | decimal_text)
+def test_to_units_matches_the_reference_on_any_input(value, unit):
+    assert outcome(T.to_units, value, unit) == outcome(reference_to_units, value, unit)
+    assert outcome(T.to_units, value, unit) == outcome(reference_to_units, value, unit)   # cached path
+
+
+def test_errors_are_raised_every_time_not_cached():
+    for _ in range(3):
+        with pytest.raises(ConversionError):
+            to_units("101.105", "0.01")
+
+
+def test_non_strings_are_refused_even_if_an_equal_string_is_cached():
+    assert to_units("1", "1") == 1
+    for bad in (1, 1.0, True):
+        with pytest.raises(TypeError):
+            to_units(bad, "1")
+
+
+def test_asset_units_are_unchanged():
+    assert (ASSETS[0].tick, ASSETS[0].lot, ASSETS[1].tick, ASSETS[1].lot) == ("0.1", "0.00001", "0.01", "0.0001")

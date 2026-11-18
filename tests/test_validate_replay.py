@@ -2,6 +2,7 @@
 the ALO ground-truth join and the CSV outputs."""
 
 import csv
+import pytest
 import gzip
 import json
 
@@ -350,3 +351,59 @@ def test_cli_passes_options_and_names_the_output_after_them(tmp_path, monkeypatc
     summary = dict(csv.reader(open(out / "summary.csv")))
     assert summary["alo_gate"] == "touch" and summary["evict_known"] == "oldest"
     assert summary["reseed"] == "every snapshot" and "CSVs in" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ lead-in: keep known orders across re-seeds
+
+def lead_in_window(tmp_path, snap_sz="0.001"):
+    """Block 0 (lead-in): M quotes an ALO sell at PX, and B sends an IOC (lead-in: never scored).
+    Snapshot after block 0 shows `snap_sz` at PX. Block 1 (scoring starts): A's IOC buy takes 0.001."""
+    w = Window(tmp_path, kind="chunk", warmup_blocks=1, meta={"lead_in_blocks": 1})
+    w.book("BTC", T0 - 50, [], [])
+    w.book("ETH", T0 - 50, [], [])
+    w.block([alo_sell(M, "0xm1"), place_tx(B, "0xb0", 0, order(buy=True, px="59000", tif="Ioc"))], dt_ms=0)
+    w.book("BTC", T0 + 50, [], [(PX, snap_sz)])
+    h = w.block([ioc_buy(A, "0xa1")], dt_ms=100)
+    real_buy(w, h, "0xa1", M)
+    return w
+
+
+def test_keep_known_matches_a_lead_in_maker_strictly(tmp_path):
+    res, rows = run(lead_in_window(tmp_path), tmp_path, reseed=True, keep_known=True)
+    r = row(rows, "0xa1")
+    assert r["status"] == "match" and r["match_full"] == 1 and r["warmup"] == 0 and r["horizon_ms"] == 50
+    assert res["reseed"] == "every snapshot, keep known" and res["lead_in"] == "1 blocks"
+    assert all(x["hash"] != "0xb0" or x["warmup"] == 1 for x in rows)          # lead-in tx never scored
+    assert res["all:fill_recall_full"] == "1.0000"
+
+
+def test_clear_reseed_only_matches_by_wildcard_and_fails_full_strict(tmp_path):
+    res, rows = run(lead_in_window(tmp_path), tmp_path, reseed=True)
+    r = row(rows, "0xa1")
+    assert r["status"] == "match" and r["match_full"] == 0      # engine filled the re-seeded placeholder
+    assert res["all:fill_recall_full"] == "0.0000" and res["all:fill_recall"] == "1.0000"
+
+
+def test_skip_lead_in_replays_only_the_chunk(tmp_path):
+    res, rows = run(lead_in_window(tmp_path), tmp_path, reseed=True, skip_lead_in=True)
+    assert res["blocks"] == 1 and res["lead_in"] == "skipped" and {r["hash"] for r in rows} == {"0xa1"}
+    assert row(rows, "0xa1")["match_full"] == 0                  # M's quote is unknown without the lead-in
+
+
+def test_keep_known_refills_missing_size_ahead_of_the_known_order(tmp_path):
+    _, rows = run(lead_in_window(tmp_path, snap_sz="0.003"), tmp_path, reseed=True, keep_known=True)
+    assert row(rows, "0xa1")["match_full"] == 0                  # older (missing) liquidity fills first
+
+
+def test_keep_known_needs_reseed(tmp_path):
+    with pytest.raises(ValueError, match="keep_known"):
+        run(lead_in_window(tmp_path), tmp_path, keep_known=True)
+
+
+def test_cli_lead_in_flags_name_the_output(tmp_path, monkeypatch):
+    window, hl = lead_in_window(tmp_path).write()
+    monkeypatch.chdir(tmp_path)
+    vr.main([str(window), "--hl-data", str(hl), "--reseed", "--keep-known"])
+    vr.main([str(window), "--hl-data", str(hl), "--reseed", "--skip-lead-in"])
+    names = {p.name for p in (tmp_path / "report" / "validate").iterdir()}
+    assert names == {"w-listing-reseed-keep", "w-listing-reseed-nolead"}

@@ -91,3 +91,24 @@ def test_oid_before_the_window_is_prewindow():
     eng, res = setup({(1, 0, 0): 0}, [(0, 5000)])
     _, rej = eng.apply(Cancel(user="u", **META, asset=0, oid=4000))
     assert len(rej) == 1 and res.stats["prewindow"] == 1
+
+
+def test_from_files_is_built_once_per_process_and_rebuilt_when_an_input_changes(tmp_path, monkeypatch):
+    import json
+    from data import oids, parse as P
+    from tests.window_fixture import A, Window, order, place_tx
+    oids.clear_cache()
+    w = Window(tmp_path)
+    w.block([place_tx(A, "0xa", 0, order())])
+    window, _ = w.write()
+    anchors = window / "anchors.json"
+    anchors.write_text(json.dumps([{"oid": 500, "height": 1000, "tx": 0, "item": 0}]))
+    reads = []
+    real = P.read_block
+    monkeypatch.setattr(oids, "read_block", lambda p: reads.append(p) or real(p))
+    e1 = OidEstimator.from_files(window, anchors)
+    e2 = OidEstimator.from_files(window, anchors)
+    assert e1 is e2 and len(reads) == 1 and e1.anchors == [(0, 500)]
+    anchors.write_text(json.dumps([{"oid": 600, "height": 1000, "tx": 0, "item": 0}]))
+    assert OidEstimator.from_files(window, anchors).anchors == [(0, 600)] and len(reads) == 2
+    oids.clear_cache()

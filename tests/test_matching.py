@@ -321,3 +321,33 @@ def test_duplicate_cloid_is_unresolved_never_guessed(eng):
     eng.apply(place("t", S, 100, 5, Tif.IOC))
     assert eng.apply(CancelByCloid(**meta("u"), asset=0, cloid="0xdup")) == ([], [])
     assert resting(eng, B) == []
+
+
+# ---- refill (lead-in, keep-known re-seed): missing snapshot size as placeholders at the FRONT -----
+
+def test_refill_adds_missing_size_ahead_of_known_orders(eng):
+    eng.apply(place("m", B, 100, 3))             # known order, placed during the lead-in
+    out = eng.refill(0, bids=[(100, 7), (99, 2)], asks=[])
+    assert out == {"refilled": 6, "refilled_orders": 2}
+    # missing liquidity predates the lead-in, so it queues ahead of what we saw placed
+    assert resting(eng, B) == [(100, PLACEHOLDER, 4), (100, "m", 3), (99, PLACEHOLDER, 2)]
+    eng.books[0].check_invariants()
+
+
+def test_refill_never_trims_and_a_taker_hits_the_refill_first(eng):
+    eng.apply(place("m", S, 105, 3))
+    eng.seed(0, S, 106, 9)
+    assert eng.refill(0, bids=[], asks=[(105, 5), (106, 4)]) == {"refilled": 2, "refilled_orders": 1}
+    fills, _ = eng.apply(place("t", B, 105, 4, tif=Tif.IOC))
+    assert [(f.maker_user, f.sz) for f in fills] == [(PLACEHOLDER, 2), ("m", 2)]
+
+
+def test_reconcile_then_refill_equals_the_snapshot_at_every_snapshot_level(eng):
+    eng.apply(place("m", B, 101, 3))             # better than the snapshot's best bid: cannot exist
+    eng.apply(place("n", B, 100, 5))
+    eng.seed(0, S, 104, 1)
+    eng.reconcile(0, bids=[(100, 2), (99, 4)], asks=[(105, 1)], known="oldest")
+    eng.refill(0, bids=[(100, 2), (99, 4)], asks=[(105, 1)])
+    assert resting(eng, B) == [(100, "n", 2), (99, PLACEHOLDER, 4)]
+    assert resting(eng, S) == [(105, PLACEHOLDER, 1)]
+    eng.books[0].check_invariants()

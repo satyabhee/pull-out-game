@@ -5,7 +5,7 @@ Frozen once approved (AGENT_PLAN.md section 5.2). Change it only with Satya's OK
 Units
 -----
 Every price is an int number of ticks and every size an int number of lots.
-Decimal strings are converted once, at the edge, with exact rational arithmetic;
+Decimal strings are converted once, at the edge, with exact integer arithmetic (cached);
 anything that is not a whole multiple of the unit is rejected, never rounded.
 Only `str` input is accepted, so a binary approximation can never sneak in.
 
@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-from fractions import Fraction
+from functools import cached_property, lru_cache
 from typing import Union
 
 PERP_MAX_DECIMALS = 6
@@ -50,18 +50,30 @@ def to_units(value: str, unit: str) -> int:
 
     to_units("101.10", "0.01") == 10110; to_units("101.105", "0.01") raises.
     """
-    if not isinstance(value, str) or not isinstance(unit, str):
-        raise TypeError("to_units takes decimal strings only")
+    if type(value) is not str or type(unit) is not str:
+        if not isinstance(value, str) or not isinstance(unit, str):
+            raise TypeError("to_units takes decimal strings only")
+        value, unit = str(value), str(unit)            # str subclasses: plain str for the cache key
+    return _to_units(value, unit)
+
+
+@lru_cache(maxsize=1 << 16)
+def _to_units(value: str, unit: str) -> int:
+    """Exact integer arithmetic: value / unit = (nv * du) / (dv * nu) from the exact integer ratios.
+    Results are cached (prices and sizes repeat); errors are not cached, so they raise every time."""
     try:
         v, u = Decimal(value.strip()), Decimal(unit.strip())
     except InvalidOperation as e:
         raise ConversionError(f"not a decimal: {value!r} / {unit!r}") from e
     if not (v.is_finite() and u.is_finite()) or u <= 0:
         raise ConversionError(f"bad value or unit: {value!r} / {unit!r}")
-    q = Fraction(v) / Fraction(u)
-    if q.denominator != 1:
+    nv, dv = v.as_integer_ratio()
+    nu, du = u.as_integer_ratio()
+    num, den = nv * du, dv * nu                        # den > 0 because u > 0
+    q, r = divmod(num, den)
+    if r:
         raise ConversionError(f"{value} is not a whole multiple of {unit}")
-    return q.numerator
+    return q
 
 
 def from_units(n: int, unit: str) -> str:
@@ -76,11 +88,11 @@ class AssetSpec:
     name: str
     sz_decimals: int
 
-    @property
+    @cached_property
     def tick(self) -> str:
         return format(Decimal(1).scaleb(-(PERP_MAX_DECIMALS - self.sz_decimals)), "f")
 
-    @property
+    @cached_property
     def lot(self) -> str:
         return format(Decimal(1).scaleb(-self.sz_decimals), "f")
 

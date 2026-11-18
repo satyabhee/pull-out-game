@@ -227,3 +227,138 @@ def test_nearest_book_falls_back_to_every_hour_when_nothing_is_near(tmp_path):
     far.mkdir(parents=True)
     (far / "book_BTC.jsonl").write_text(json.dumps(snap(T + 6 * 3_600_000, "1.0")) + "\n")
     assert nearest_book(tmp_path, "BTC", T).time_ms == T + 6 * 3_600_000
+
+
+# ---- receive-time skip + per-process file cache ------------------------------------------------
+
+from data import parse as P
+
+
+@pytest.fixture(autouse=True)
+def _fresh_file_cache():
+    P.clear_caches()
+    yield
+    P.clear_caches()
+
+
+def trades_file(root, recs, hour="05", gz=False):
+    d = root / "2026-11-17" / hour
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"trades_BTC.jsonl{'.gz' if gz else ''}"
+    opener = gzip.open if gz else open
+    with opener(path, "wt") as f:
+        for r in recs:
+            f.write(json.dumps(r) + "\n")
+    return path
+
+
+def trade_rec(recv, tid, t=None):
+    return {"recv_ms": recv, "msg": {"channel": "trades", "data": [trade(TX_HASH, tid, t=T if t is None else t)]}}
+
+
+def count_parses(monkeypatch):
+    calls = []
+    real = P._loads
+    monkeypatch.setattr(P, "_loads", lambda s: calls.append(1) or real(s))
+    return calls
+
+
+def test_lines_received_far_outside_the_range_are_never_json_parsed(tmp_path, monkeypatch):
+    recs = [trade_rec(T + k * 60_000, 100 + k, t=T + k * 60_000) for k in range(-30, 31)]   # a line a minute
+    trades_file(tmp_path, recs)
+    calls = count_parses(monkeypatch)
+    assert [t.tid for t in iter_trades(tmp_path, ("BTC",), T, T)] == [100]   # only the line with time T
+    # parsed: receive times in [T - RECV_SKEW, T + RECV_LAG] = [T - 1 min, T + 5 min] -> 7 lines, not 61
+    assert len(calls) == 7
+
+
+def test_a_line_received_up_to_recv_lag_after_its_event_is_still_read(tmp_path):
+    trades_file(tmp_path, [trade_rec(T + P.RECV_LAG_MS, 1), trade_rec(T + P.RECV_LAG_MS + 1, 2)])
+    assert [t.tid for t in iter_trades(tmp_path, ("BTC",), T, T)] == [1]     # documented bound
+
+
+def test_event_slightly_after_receive_clock_skew_is_kept(tmp_path):
+    trades_file(tmp_path, [trade_rec(T - 1_000, 1)])                          # recv 1 s before event time
+    assert [t.tid for t in iter_trades(tmp_path, ("BTC",), T, T)] == [1]
+
+
+def test_lines_without_recv_ms_and_non_monotonic_files_are_filtered_linearly(tmp_path):
+    d = tmp_path / "2026-11-17" / "05"
+    d.mkdir(parents=True)
+    lines = [trade_rec(T + 3_600_000, 1, t=T), {"msg": {"channel": "trades", "data": [trade(TX_HASH, 2)]}},
+             trade_rec(T - 10, 3), trade_rec(T + 10, 4, t=T + 5_000)]
+    (d / "trades_BTC.jsonl").write_text("".join(json.dumps(r) + "\n" for r in lines) + '{"recv_ms": 17')
+    got = [t.tid for t in iter_trades(tmp_path, ("BTC",), T, T)]
+    assert got == [2, 3]          # 1: received an hour late (outside the lag bound); 4: event outside
+
+
+def test_each_file_is_read_once_per_process_and_reloaded_when_it_grows(tmp_path, monkeypatch):
+    path = trades_file(tmp_path, [trade_rec(T, 1)])
+    opened = []
+    real = P._open_text
+    monkeypatch.setattr(P, "_open_text", lambda p: opened.append(p) or real(p))
+    for _ in range(3):
+        assert [t.tid for t in iter_trades(tmp_path, ("BTC",), T, T)] == [1]
+    assert len(opened) == 1
+    with open(path, "a") as f:                                                 # the open hour grows
+        f.write(json.dumps(trade_rec(T + 5, 2)) + "\n")
+    assert [t.tid for t in iter_trades(tmp_path, ("BTC",), T, T)] == [1, 2]
+    assert len(opened) == 2
+
+
+def test_gz_files_use_the_same_skip(tmp_path, monkeypatch):
+    trades_file(tmp_path, [trade_rec(T + k * 60_000, 100 + k, t=T + k * 60_000) for k in range(-30, 31)], gz=True)
+    calls = count_parses(monkeypatch)
+    assert [t.tid for t in iter_trades(tmp_path, ("BTC",), T, T)] == [100] and len(calls) == 7
+
+
+def test_nearest_book_minutes_away_falls_back_to_the_full_scan_and_stays_exact(tmp_path):
+    write_hour(tmp_path, "book_BTC", [snap(T - 10 * 60_000), snap(T + 20 * 60_000)])
+    assert nearest_book(tmp_path, "BTC", T).time_ms == T - 10 * 60_000
+
+
+def test_load_window_decodes_once_and_hands_out_independent_stats(tmp_path, monkeypatch):
+    win = tmp_path / "win"
+    win.mkdir()
+    write_block(win, 1224258712, [REAL_IOC])
+    reads = []
+    real = P.read_block
+    monkeypatch.setattr(P, "read_block", lambda p: reads.append(p) or real(p))
+    b1, s1 = P.load_window(win)
+    b2, s2 = P.load_window(win)
+    assert len(reads) == 1 and b1 is b2 and b1 == tuple(iter_window(win))
+    s1["blocks"] += 100
+    assert s2["blocks"] == 1 and P.load_window(win)[1]["blocks"] == 1
+
+
+def test_load_window_rereads_when_a_block_file_changes(tmp_path):
+    win = tmp_path / "win"
+    win.mkdir()
+    write_block(win, 1224258712, [REAL_IOC])
+    P.load_window(win)
+    write_block(win, 1224258713, [])
+    assert [b.height for b in P.load_window(win)[0]] == [1224258712, 1224258713]
+
+
+
+def test_loads_falls_back_to_the_stdlib_parser_so_no_line_is_dropped(tmp_path):
+    huge = 2 ** 70                                            # orjson refuses ints over 64 bits
+    assert P._loads('{"a": 1}') == {"a": 1} and P._loads(f'{{"a": {huge}}}') == {"a": huge}
+    rec = trade_rec(T, 1)
+    rec["msg"]["extra"] = huge
+    trades_file(tmp_path, [rec])
+    assert [t.tid for t in iter_trades(tmp_path, ("BTC",), T, T)] == [1]
+
+
+def test_read_block_parses_a_block_with_a_huge_int(tmp_path):
+    win = tmp_path / "win"
+    win.mkdir()
+    write_block(win, 1224258712, [{**REAL_IOC, "nonce": 2 ** 70}])
+    assert P.read_block(win / "1224258712.json.gz")["txs"][0]["nonce"] == 2 ** 70
+
+
+def test_a_cut_last_line_is_still_skipped_with_orjson(tmp_path):
+    d = tmp_path / "2026-11-17" / "05"
+    d.mkdir(parents=True)
+    (d / "trades_BTC.jsonl").write_text(json.dumps(trade_rec(T, 1)) + "\n" + '{"recv_ms": %d, "msg": {"cha' % T)
+    assert [t.tid for t in iter_trades(tmp_path, ("BTC",), T, T)] == [1]

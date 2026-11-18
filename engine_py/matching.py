@@ -169,6 +169,28 @@ class Engine:
         self.stats["evicted_by_gate"] += 1
         return order
 
+    def refill(self, asset: int, bids, asks) -> dict[str, int]:
+        """Lead-in re-seed (keep known orders): wherever a snapshot level holds more than we do, add the
+        difference as one placeholder at the FRONT of that level. That liquidity rested before anything
+        we saw placed, so it queues ahead. Never trims; run reconcile(known=...) first so nothing better
+        than the snapshot's best remains (otherwise the crossed-book check fails loudly)."""
+        book = self.books[asset]
+        out = {"refilled": 0, "refilled_orders": 0}
+        for side, levels in ((Side.BUY, bids), (Side.SELL, asks)):
+            ours = book.side(side)
+            for px, sz in levels:
+                level = ours.get(px)
+                gap = sz - (level.total if level is not None else 0)
+                if gap > 0:
+                    order = self._new_order(PLACEHOLDER, asset, side, px, gap, Tif.GTC, None)
+                    book.add(order, gap, front=True)
+                    out["refilled"] += gap
+                    out["refilled_orders"] += 1
+        self._assert_not_crossed(asset)
+        for k, v in out.items():
+            self.stats[f"refill_{k}"] += v
+        return out
+
     def clear(self, asset: int) -> dict[str, int]:
         """Remove every resting order on one asset (G1 #3, short-horizon re-seed: the book is
         rebuilt from a snapshot). Best price first, queue order inside a level: deterministic."""

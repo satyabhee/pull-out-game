@@ -92,8 +92,12 @@ def acquire_lock(path):
 
 
 class Fetcher:
-    def __init__(self, legacy=False, interval=0.0, head=None, max_age_min=MAX_AGE_MIN, lock=LOCK):
-        """head: callable -> (height, blockTime_ms) of a recent block, or None. lock: path or None (tests)."""
+    def __init__(self, legacy=False, interval=0.0, head=None, max_age_min=MAX_AGE_MIN, lock=LOCK, request_log=None):
+        """head: callable -> (height, blockTime_ms) of a recent block, or None. lock: path or None (tests).
+        request_log: JSON-lines path; one line per request actually sent: t (ms), height, age_s (estimated),
+        ms (response time), status, outcome (ok | http_429 | http_<code> | archived_cap | not_yet | error |
+        exception), bytes. Response time vs age is how the archived-block rule can be read without probing."""
+        self.request_log = request_log
         self.legacy, self.conn, self.interval = legacy, None, interval
         self.gzip_seen = self.plain_seen = self.http429 = 0
         self._last = 0.0
@@ -163,6 +167,15 @@ class Fetcher:
             self.close()
         return r.status, data
 
+    def _log_request(self, t_ms, h, status, outcome, secs, nbytes):
+        if not self.request_log:
+            return
+        age = self.last_age_min
+        row = {"t": t_ms, "height": h, "age_s": None if age is None else round(age * 60, 1),
+               "ms": round(secs * 1000, 1), "status": status, "outcome": outcome, "bytes": nbytes}
+        with open(self.request_log, "a") as f:
+            f.write(json.dumps(row) + "\n")
+
     def close(self):
         if self.conn:
             try:
@@ -177,8 +190,11 @@ class Fetcher:
         delay, last = 1.0, None
         for _ in range(tries):
             self.last_age_min = self.check_age(h)   # before EVERY request, retries included
+            t_sent, t0 = int(time.time() * 1000), time.perf_counter()
+            status, data, outcome = None, b"", "exception"
             try:
                 status, data = self._raw(h)
+                outcome = "ok" if status == 200 else "http_429" if status == 429 else f"http_{status}"
                 if status == 429:
                     self.http429 += 1
                     last = "HTTP 429"
@@ -190,11 +206,15 @@ class Fetcher:
                 if not isinstance(b, dict) or blk.get("type") == "error" or not isinstance(b.get("txs"), list):
                     msg = blk.get("message", str(blk)[:200]) if isinstance(blk, dict) else str(blk)[:200]
                     if "archived blocks" in msg:
+                        outcome = "archived_cap"
                         raise ArchivedCap(msg)
                     if "invalid block height" in msg:
+                        outcome = "not_yet"
                         raise NotYet(msg)
+                    outcome = "error"
                     raise ValueError(msg)
                 if b.get("numTxs") is None or len(b["txs"]) != b["numTxs"]:
+                    outcome = "error"
                     raise ValueError(f"incomplete: {len(b['txs'])}/{b.get('numTxs')}")
                 if b.get("blockTime"):
                     self.ref = (h, int(b["blockTime"]))
@@ -203,6 +223,8 @@ class Fetcher:
                 raise
             except Exception as e:
                 last = e
+            finally:
+                self._log_request(t_sent, h, status, outcome, time.perf_counter() - t0, len(data or b""))
             time.sleep(delay); delay = min(delay * 2, 60)
         raise RuntimeError(f"block {h}: {last}")
 

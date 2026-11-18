@@ -1,8 +1,15 @@
 """Batch validation over many chunk folders: validate_replay on each chunk, rows pooled into one report.
 
-    python -m analysis.validate_chunks <windows_dir_or_chunk_dir>... --hl-data <dir> [--out DIR] [--jobs N]
+    python -m analysis.validate_chunks <windows_dir_or_chunk_dir>... --hl-data <dir> [--out DIR] [--jobs N, default 4]
                                        [same replay options as validate_replay, e.g.
                                         --alo-gate touch --reseed --nearest-ratio 3 --touch-reconcile]
+
+Compare configurations in one pass with --variant (repeatable; each adds options to the base ones,
+'' = the base options alone). Each chunk is decoded once and replayed per variant; output goes to one
+CSV folder per variant plus compare.csv (variant x scope):
+
+    python -m analysis.validate_chunks windows/ --hl-data hl_data --alo-gate touch --reseed --nearest-ratio 3 \
+        --variant '' --variant '--touch-reconcile'
 
 A chunk is a window folder whose window.json says kind="chunk" (collect/capture.py, CAPTURE_MODE=chunks):
 ~30 blocks right after an L2 snapshot. Each argument is either a chunk folder or a folder of them
@@ -27,8 +34,12 @@ Outputs (CSV, in --out, default report/validate/chunks-<policy><options>):
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
+import os
+import shlex
+import sys
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -36,11 +47,12 @@ from pathlib import Path
 from analysis import validate_replay as vr
 from engine_py.replay import COINS
 
+DEFAULT_JOBS = min(4, os.cpu_count() or 1)   # CLI default; parallel output is byte-identical to --jobs 1
 SETTINGS = ("policy", "outside_fill_position", "resolver", "alo_gate", "gate_max_age_ms", "evict_known",
-            "nearest_ratio", "reseed", "touch_reconcile")
+            "nearest_ratio", "reseed", "touch_reconcile", "lead_in")
 SCOPE_METRICS = ("scored", "matched", "match_rate", "match_rate_px_sz", "match_rate_real_linked_only",
                  "engine_only_txs", "fill_recall", "fill_precision", "fill_f1", "fill_recall_px_sz",
-                 "fill_precision_px_sz")
+                 "fill_precision_px_sz", "match_rate_full", "fill_recall_full", "fill_precision_full")
 CHUNK_METRICS = ("scored", "matched", "fill_recall", "fill_precision")
 SUMMED = ("gate_stats", "resolver_stats", "touch_reconciled", "alo_confusion")
 
@@ -81,15 +93,21 @@ def find_chunks(paths) -> tuple[list[Path], list[tuple[Path, str]]]:
 
 # ------------------------------------------------------------------ running
 
-def _run_one(job) -> dict:
-    """One chunk -> {"chunk", "status": ok|failed, "res", "rows", "error"}. Top level so it pickles."""
-    chunk, hl_data, policy_name, kw = job
-    try:
-        res, rows = vr.run(chunk, hl_data, policy_name, out_dir=None, quiet=True, **kw)
-    except Exception as e:                       # recorded per chunk and reported, never dropped
-        return {"chunk": Path(chunk).name, "status": "failed", "res": None, "rows": [],
-                "error": f"{type(e).__name__}: {e}"}
-    return {"chunk": Path(chunk).name, "status": "ok", "res": res, "rows": rows, "error": ""}
+def _run_one(job) -> list[dict]:
+    """One chunk under every variant -> [{"chunk", "status": ok|failed, "res", "rows", "error"}] in variant
+    order. Top level so it pickles. Variants after the first reuse the decoded blocks and recorder lines
+    (data.parse caches), so extra variants cost only the replay itself."""
+    chunk, hl_data, policy_name, variants = job
+    outs = []
+    for _, kw in variants:
+        try:
+            res, rows = vr.run(chunk, hl_data, policy_name, out_dir=None, quiet=True, **kw)
+        except Exception as e:                   # recorded per chunk and reported, never dropped
+            outs.append({"chunk": Path(chunk).name, "status": "failed", "res": None, "rows": [],
+                         "error": f"{type(e).__name__}: {e}"})
+            continue
+        outs.append({"chunk": Path(chunk).name, "status": "ok", "res": res, "rows": rows, "error": ""})
+    return outs
 
 
 def chunk_row(out: dict, meta: dict | None) -> dict:
@@ -134,22 +152,55 @@ def pool(outs: list[dict], skipped: list[tuple[Path, str]], kw: dict, policy_nam
     return res, rows
 
 
-def run_batch(chunks, hl_data, policy_name="listing", out_dir=None, jobs=1, skipped=(), **kw):
-    """Run every chunk and pool them. Returns (pooled result, pooled rows, per-chunk rows).
-    `skipped` ([(folder, why)], from find_chunks) only feeds the counts and chunks.csv."""
-    chunks, skipped = [Path(c) for c in chunks], list(skipped)
-    job_list = [(str(c), str(hl_data), policy_name, kw) for c in chunks]
-    if jobs > 1:
+def _run_all(chunks, hl_data, policy_name, variants, jobs) -> list[list[dict]]:
+    """[chunk][variant] outputs. Each worker gets a contiguous run of chunks so neighbours share
+    cached recorder hours."""
+    job_list = [(str(c), str(hl_data), policy_name, variants) for c in chunks]
+    if jobs > 1 and len(job_list) > 1:
+        size = -(-len(job_list) // jobs)
         with ProcessPoolExecutor(max_workers=jobs) as ex:
-            outs = list(ex.map(_run_one, job_list))      # map keeps input order
-    else:
-        outs = [_run_one(j) for j in job_list]
+            return list(ex.map(_run_one, job_list, chunksize=size))   # map keeps input order
+    return [_run_one(j) for j in job_list]
+
+
+def _pool_variant(outs, chunks, skipped, kw, policy_name):
     res, rows = pool(outs, skipped, kw, policy_name)
     per_chunk = [chunk_row(o, _meta(c)) for o, c in zip(outs, chunks)]
-    if out_dir is not None:
-        skipped_rows = [{"chunk": d.name, "status": f"skipped: {why}"} for d, why in skipped]
-        write_csvs(Path(out_dir), res, rows, per_chunk + skipped_rows)
     return res, rows, per_chunk
+
+
+def run_variants(chunks, hl_data, policy_name="listing", variants=(("base", {}),), out_dir=None, jobs=1,
+                 skipped=()) -> dict[str, tuple[dict, list, list]]:
+    """Every chunk under every variant ([(name, replay kwargs)]) in one pass: {name: (pooled result,
+    pooled rows, per-chunk rows)}. With out_dir: one CSV folder per variant plus compare.csv."""
+    chunks, skipped, variants = [Path(c) for c in chunks], list(skipped), list(variants)
+    names = [n for n, _ in variants]
+    if len(set(names)) != len(names):
+        raise ValueError(f"variant names must be unique: {names}")
+    grid = _run_all(chunks, hl_data, policy_name, variants, jobs)
+    got = {name: _pool_variant([g[i] for g in grid], chunks, skipped, kw, policy_name)
+           for i, (name, kw) in enumerate(variants)}
+    if out_dir is not None:
+        out_dir = Path(out_dir)
+        for name, (res, rows, per_chunk) in got.items():
+            write_csvs(out_dir / name, res, rows, per_chunk + _skipped_rows(skipped))
+        write_compare(out_dir / "compare.csv", got)
+    return got
+
+
+def run_batch(chunks, hl_data, policy_name="listing", out_dir=None, jobs=1, skipped=(), **kw):
+    """Run every chunk under one set of replay options and pool them. Returns (pooled result, pooled
+    rows, per-chunk rows). `skipped` ([(folder, why)], from find_chunks) only feeds the counts and chunks.csv."""
+    chunks, skipped = [Path(c) for c in chunks], list(skipped)
+    outs = [g[0] for g in _run_all(chunks, hl_data, policy_name, [("", kw)], jobs)]
+    res, rows, per_chunk = _pool_variant(outs, chunks, skipped, kw, policy_name)
+    if out_dir is not None:
+        write_csvs(Path(out_dir), res, rows, per_chunk + _skipped_rows(skipped))
+    return res, rows, per_chunk
+
+
+def _skipped_rows(skipped):
+    return [{"chunk": d.name, "status": f"skipped: {why}"} for d, why in skipped]
 
 
 # ------------------------------------------------------------------ output
@@ -185,6 +236,33 @@ def write_csvs(out: Path, res: dict, rows: list, chunk_rows: list) -> None:
           [[e, t, n] for (e, t), n in sorted(res["alo_confusion"].items())])
 
 
+COMPARE_METRICS = ("scored", "matched", "match_rate", "match_rate_px_sz", "fill_recall", "fill_precision",
+                   "fill_f1", "fill_recall_px_sz", "engine_only_txs", "match_rate_full", "fill_recall_full",
+                   "fill_precision_full")
+
+
+def write_compare(path: Path, got: dict) -> None:
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["variant", "scope", *COMPARE_METRICS])
+        for name, (res, _, _) in got.items():
+            for scope in ("all", *COINS):
+                w.writerow([name, scope, *(res[f"{scope}:{m}"] for m in COMPARE_METRICS)])
+
+
+def print_compare(got: dict) -> None:
+    """Strict (pre-re-seed makers as wildcards), full strict (no wildcards: an engine placeholder fill never
+    matches) and per-fill notional recall/precision, per variant and scope."""
+    print(f"{'variant':<34} {'scope':<4} {'tx strict':>13} {'tx full':>7} {'recall':>7} {'recall full':>11} "
+          f"{'precision':>9} {'prec full':>9} {'eng-only':>8}")
+    for name, (res, _, _) in got.items():
+        for scope in ("all", *COINS):
+            g = lambda m: res[f"{scope}:{m}"] or "n/a"
+            print(f"{name:<34} {scope:<4} {res[f'{scope}:matched']:>4}/{res[f'{scope}:scored']:<4}{g('match_rate'):>5} "
+                  f"{g('match_rate_full'):>7} {g('fill_recall'):>7} {g('fill_recall_full'):>11} "
+                  f"{g('fill_precision'):>9} {g('fill_precision_full'):>9} {res[f'{scope}:engine_only_txs']:>8}")
+
+
 def print_report(res: dict, per_chunk: list) -> None:
     print(f"chunks: {res['chunks_ok']} ok, {res['chunks_failed']} failed, {res['chunks_skipped']} skipped; "
           f"blocks {res['blocks']}")
@@ -213,20 +291,59 @@ def print_report(res: dict, per_chunk: list) -> None:
                   f"fill recall {h['fill_recall'] or 'n/a'} (px/size {h['fill_recall_px_sz'] or 'n/a'})")
 
 
+def _join_variant_values(argv: list[str]) -> list[str]:
+    """`--variant --touch-reconcile` -> `--variant=--touch-reconcile` (argparse would read the value as an option)."""
+    out, it = [], iter(argv)
+    for tok in it:
+        if tok == "--variant":
+            out.append("--variant=" + next(it, ""))
+        else:
+            out.append(tok)
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("paths", nargs="+", help="chunk folders, or folders of them (e.g. windows/)")
     ap.add_argument("--out", help="directory for the CSVs (default: report/validate/chunks-<policy><options>)")
-    ap.add_argument("--jobs", type=int, default=1, help="chunks replayed in parallel processes")
+    ap.add_argument("--jobs", type=int, default=DEFAULT_JOBS,
+                    help=f"chunks replayed in parallel processes (default {DEFAULT_JOBS}; 1 = one process)")
+    ap.add_argument("--variant", action="append", default=[], metavar="OPTIONS",
+                    help="replay options added to the base options, e.g. --variant '--touch-reconcile'; "
+                         "repeat to compare several configurations in one pass ('' = the base options)")
     vr.add_replay_args(ap)
-    a = ap.parse_args(argv)
+    a = ap.parse_args(_join_variant_values(sys.argv[1:] if argv is None else list(argv)))
     chunks, skipped = find_chunks(a.paths)
     if not chunks:
         raise SystemExit(f"no complete chunk folders under {' '.join(a.paths)} ({len(skipped)} skipped)")
-    out = a.out or f"report/validate/chunks-{a.policy}{vr.options_tag(a)}"
-    res, _, per_chunk = run_batch(chunks, a.hl_data, a.policy, out, a.jobs, skipped, **vr.replay_kwargs(a))
-    print_report(res, per_chunk)
-    print(f"\nCSVs in {out}")
+    if not a.variant:
+        out = a.out or f"report/validate/chunks-{a.policy}{vr.options_tag(a)}"
+        res, _, per_chunk = run_batch(chunks, a.hl_data, a.policy, out, a.jobs, skipped, **vr.replay_kwargs(a))
+        print_report(res, per_chunk)
+        print(f"\nCSVs in {out}")
+        return
+    vp = argparse.ArgumentParser(prog="--variant", argument_default=argparse.SUPPRESS)
+    vr.add_replay_args(vp, hl_data_required=False)
+    variants = []
+    for v in a.variant:
+        ns = vp.parse_args(shlex.split(v), namespace=copy.copy(a))
+        variants.append((vr.options_tag(ns).lstrip("-") or "base", vr.replay_kwargs(ns)))
+    names = [n for n, _ in variants]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise SystemExit(f"two variants have the same options: {', '.join(dup)}")
+    out = a.out or f"report/validate/chunks-{a.policy}{vr.options_tag(a)}-compare"
+    got = run_variants(chunks, a.hl_data, a.policy, variants, out, a.jobs, skipped)
+    first = next(iter(got.values()))[0]
+    print(f"chunks: {first['chunks_ok']} ok, {first['chunks_failed']} failed, {first['chunks_skipped']} skipped; "
+          f"blocks {first['blocks']}")
+    for name, (res, _, per_chunk) in got.items():
+        for c in per_chunk:
+            if c["status"] == "failed":
+                print(f"  FAILED {name} {c['chunk']}: {c['error']}")
+    print()
+    print_compare(got)
+    print(f"\nCSVs in {out}/<variant>/, comparison in {out}/compare.csv")
 
 
 if __name__ == "__main__":

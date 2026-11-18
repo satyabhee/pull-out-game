@@ -2,6 +2,7 @@
 
 import csv
 import json
+import os
 from collections import Counter
 
 from analysis import validate_chunks as vc
@@ -145,3 +146,71 @@ def test_cli_with_no_chunks_says_so(tmp_path, capsys):
 def test_window_json_kind_written_by_capture_is_what_we_filter_on(tmp_path):
     c0, _ = chunk(tmp_path, 0, M)
     assert json.loads((c0 / "window.json").read_text())["kind"] == "chunk"
+
+
+# ------------------------------------------------------------------ variants: several configurations in one pass
+
+def test_variants_equal_separate_runs(tmp_path):
+    paths = [chunk(tmp_path, i, M if i % 2 else N)[0] for i in range(3)]
+    hl = tmp_path / "hl_data"
+    variants = [("base", {}), ("gate-reseed", dict(alo_gate="touch", reseed=True))]
+    got = vc.run_variants(paths, hl, variants=variants)
+    for name, kw in variants:
+        assert got[name] == vc.run_batch(paths, hl, **kw)
+    assert vc.run_variants(paths, hl, variants=variants, jobs=2) == got
+
+
+def test_variants_decode_each_chunk_once(tmp_path, monkeypatch):
+    from data import parse as P
+    P.clear_caches()
+    paths = [chunk(tmp_path, i, M)[0] for i in range(2)]
+    reads = []
+    real = P.read_block
+    monkeypatch.setattr(P, "read_block", lambda p: reads.append(p) or real(p))
+    vc.run_variants(paths, tmp_path / "hl_data", variants=[("a", {})])
+    one = len(reads)
+    P.clear_caches()
+    reads.clear()
+    vc.run_variants(paths, tmp_path / "hl_data", variants=[("a", {}), ("b", dict(reseed=True)), ("c", {})])
+    assert one > 0 and len(reads) == one                      # three variants decode as much as one
+
+
+def test_cli_variants_write_one_folder_each_and_a_compare_table(tmp_path, monkeypatch, capsys):
+    chunk(tmp_path, 0, M)
+    chunk(tmp_path, 1, N)
+    monkeypatch.chdir(tmp_path)
+    vc.main(["windows", "--hl-data", "hl_data", "--alo-gate", "touch", "--reseed", "--out", "out",
+             "--variant", "", "--variant", "--touch-reconcile", "--variant", "--touch-reconcile --touch-n-cap"])
+    out = tmp_path / "out"
+    assert {p.name for p in out.iterdir()} == {"gate-reseed", "gate-reseed-touch", "gate-reseed-touch-ncap",
+                                               "compare.csv"}
+    s = dict(csv.reader(open(out / "gate-reseed-touch" / "summary.csv")))
+    assert s["touch_reconcile"] == "bbo every block" and s["alo_gate"] == "touch"
+    cmp_rows = csv_rows(out / "compare.csv")
+    assert [(r["variant"], r["scope"]) for r in cmp_rows][:3] == [("gate-reseed", "all"), ("gate-reseed", "BTC"),
+                                                                 ("gate-reseed", "ETH")]
+    assert len(cmp_rows) == 9 and cmp_rows[0]["scored"] == "2"
+    assert "variant" in capsys.readouterr().out
+
+
+def test_cli_rejects_two_variants_with_the_same_options(tmp_path):
+    chunk(tmp_path, 0, M)
+    try:
+        vc.main([str(tmp_path / "windows"), "--hl-data", str(tmp_path / "hl_data"),
+                 "--variant", "--reseed", "--variant", "--reseed"])
+    except SystemExit as e:
+        assert "same options" in str(e.code)
+    else:
+        raise AssertionError("expected SystemExit")
+
+
+
+def test_cli_runs_in_parallel_by_default(tmp_path, monkeypatch):
+    chunk(tmp_path, 0, M)
+    seen = []
+    real = vc._run_all
+    monkeypatch.setattr(vc, "_run_all", lambda *a: seen.append(a[-1]) or real(*a))
+    vc.main([str(tmp_path / "windows"), "--hl-data", str(tmp_path / "hl_data"), "--out", str(tmp_path / "o")])
+    vc.main([str(tmp_path / "windows"), "--hl-data", str(tmp_path / "hl_data"), "--out", str(tmp_path / "o1"),
+             "--jobs", "1"])
+    assert seen == [vc.DEFAULT_JOBS, 1] and vc.DEFAULT_JOBS == min(4, os.cpu_count() or 1)

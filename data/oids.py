@@ -19,12 +19,20 @@ resting orders on that asset has an estimated oid within the tolerance. Integers
 from __future__ import annotations
 
 import json
-from collections import Counter
+from collections import Counter, OrderedDict
 from decimal import Decimal
 from pathlib import Path
 
 from data.parse import _block_files, read_block
 from engine_py.types import ASSETS, Modify, Place
+
+_ESTIMATOR_CACHE_MAX = 8
+_estimator_cache: OrderedDict = OrderedDict()
+
+
+def clear_cache() -> None:
+    _estimator_cache.clear()
+
 
 Pos = tuple[int, int, int]           # (height, tx_index, item_index), as in the decoded actions
 
@@ -101,7 +109,21 @@ class OidEstimator:
 
     @classmethod
     def from_files(cls, window_dir, anchor_file) -> "OidEstimator":
-        return cls.from_window(window_dir, json.loads(Path(anchor_file).read_text()))
+        """from_window on the anchor file, built once per process per (window, anchors) and rebuilt when
+        a block file or the anchor file changes. The estimator is read-only, so it is shared."""
+        window_dir, anchor_file = Path(window_dir), Path(anchor_file)
+        st = anchor_file.stat()
+        sig = (tuple(sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns) for _, p in _block_files(window_dir))),
+               st.st_size, st.st_mtime_ns)
+        key = (window_dir.resolve(), anchor_file.resolve())
+        hit = _estimator_cache.get(key)
+        if hit is None or hit[0] != sig:
+            hit = (sig, cls.from_window(window_dir, json.loads(anchor_file.read_text())))
+            _estimator_cache[key] = hit
+            while len(_estimator_cache) > _ESTIMATOR_CACHE_MAX:
+                _estimator_cache.popitem(last=False)
+        _estimator_cache.move_to_end(key)
+        return hit[1]
 
     # -------------------------------------------------------------- estimating
     def estimate_count(self, k: int) -> int | None:

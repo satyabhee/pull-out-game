@@ -55,6 +55,13 @@ class Level:
         self.total += node.remaining
         self.count += 1
 
+    def prepend(self, node: Node) -> None:
+        first = self.head.next
+        self.head.next, node.prev, node.next, first.prev = node, self.head, first, node
+        node.level = self
+        self.total += node.remaining
+        self.count += 1
+
     def unlink(self, node: Node) -> None:
         node.prev.next, node.next.prev = node.next, node.prev
         node.prev = node.next = node.level = None
@@ -117,8 +124,8 @@ class Book:
         return bb is not None and ba is not None and bb >= ba
 
     # ---- mutations
-    def add(self, order: Order, remaining: int) -> Node:
-        """Rest an order at the tail of its level."""
+    def add(self, order: Order, remaining: int, front: bool = False) -> Node:
+        """Rest an order at the tail of its level (front=True: at the head, ahead of every order there)."""
         if order.asset != self.asset:
             raise BookError(f"order for asset {order.asset} added to book {self.asset}")
         if order.oid in self.index:
@@ -130,7 +137,10 @@ class Book:
         if level is None:
             level = levels[order.px] = Level(order.px)
         node = Node(order, remaining)
-        level.append(node)
+        if front:
+            level.prepend(node)
+        else:
+            level.append(node)
         self.index[order.oid] = node
         return node
 
