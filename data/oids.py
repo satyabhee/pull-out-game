@@ -14,11 +14,26 @@ real ids, and between anchors the oid is interpolated linearly.
 
 The resolver never guesses: it returns an engine oid only when exactly one of the user's
 resting orders on that asset has an estimated oid within the tolerance. Integers only.
+
+Joint resolution (data/oids.py only, no engine change). Two layers before the per-order rule:
+- in-tx (joint_tx): items of one tx get consecutive oids, so counted positions inside a placement tx are
+  exact relative oids. A cancel/batchModify tx with >= 2 int oids is matched to the user's resting
+  orders per placement tx: hypothesis (T, c), c = oid - counted position, support >= 2. (On real data
+  cancel txs never hold 2+ oids, so this fires ~never; kept because the spec asked for it.)
+- cross-tx (joint_block): all int-oid cancel/modify-target items of one user in one block. Relative
+  spacing of the cancelled oids must match the relative counted positions of the orders they hit, up
+  to invisible-event drift: for items a, b with candidate orders xa, xb (each within the per-order
+  tolerance)  -lo <= (o_b - o_a) - (k_b - k_a) <= slack + rate * |k_b - k_a|  (a<b by k).
+  An item is resolved only if every consistent complete assignment of the group gives it the same
+  order (bounded search; budget exceeded = give up). Anything else falls back to the per-order rule.
+Groups are read from the window's blocks; the call is located by (engine.block, user, asset, oid).
+Counters: resolved_group, resolved_block (both also counted in `resolved`), block_conflict.
 """
 
 from __future__ import annotations
 
 import json
+from bisect import bisect_left, bisect_right
 from collections import Counter, OrderedDict
 from decimal import Decimal
 from pathlib import Path
@@ -48,13 +63,31 @@ def _order_items(action: dict) -> list[dict]:
     return []
 
 
+def _cancel_items(action: dict) -> list[tuple[int, int]]:
+    """(asset, int oid) of every BTC/ETH int-oid cancel item of a cancel, modify or batchModify tx."""
+    kind = action.get("type")
+    out = []
+    if kind == "cancel":
+        out = [(c.get("a"), c.get("o")) for c in action.get("cancels", [])]
+    elif kind == "modify":
+        out = [(action.get("order", {}).get("a"), action.get("oid"))]
+    elif kind == "batchModify":
+        out = [(m.get("order", {}).get("a"), m.get("oid")) for m in action.get("modifies", [])]
+    return [(a, o) for a, o in out if a in ASSETS and isinstance(o, int) and not isinstance(o, bool)]
+
+
 class OidEstimator:
     """Map a placement position to an estimated Hyperliquid oid."""
 
-    def __init__(self, counts: dict[Pos, int], anchors: list[tuple[int, int]]):
+    def __init__(self, counts: dict[Pos, int], anchors: list[tuple[int, int]],
+                 groups: dict | None = None, block_groups: dict | None = None):
         """counts: position -> number of id-consuming items before it in the window.
-        anchors: (count, real oid) pairs, any order."""
+        anchors: (count, real oid) pairs, any order.
+        groups: (height, user) -> list of per-tx cancel groups (>= 2 items each) of (asset, oid).
+        block_groups: (height, user) -> every int-oid cancel item of that user in the block, in order."""
         self.counts = counts
+        self.groups = groups or {}
+        self.block_groups = block_groups or {}
         self.anchors = sorted(set(anchors))
         for (k0, o0), (k1, o1) in zip(self.anchors, self.anchors[1:]):
             if k1 == k0 or o1 <= o0:
@@ -69,6 +102,8 @@ class OidEstimator:
         The second kind is located in the blocks by (user, asset, side, px, sz, time[, cloid]);
         an answer that matches zero or several placements is dropped."""
         counts: dict[Pos, int] = {}
+        groups: dict = {}
+        block_groups: dict = {}
         want: dict[tuple, int] = {}
         for a in anchors:
             if "height" in a:
@@ -90,6 +125,12 @@ class OidEstimator:
             for t, tx in enumerate(b["txs"]):
                 if tx["error"] is not None:
                     continue
+                g = _cancel_items(tx["action"])
+                if g:
+                    ukey = (height, tx["user"].lower())
+                    block_groups.setdefault(ukey, []).extend(g)
+                    if len(g) >= 2:
+                        groups.setdefault(ukey, []).append(g)
                 for i, item in enumerate(_order_items(tx["action"])):
                     if item.get("a") in ASSETS:
                         counts[(height, t, i)] = k
@@ -105,7 +146,7 @@ class OidEstimator:
         pts = [(counts[(a["height"], a["tx"], a["item"])], int(a["oid"]))
                for a in anchors if "height" in a and (a["height"], a["tx"], a["item"]) in counts]
         pts += [(counts[p[0]], oid) for oid, p in located.items() if len(p) == 1]
-        return cls(counts, pts)
+        return cls(counts, pts, groups, block_groups)
 
     @classmethod
     def from_files(cls, window_dir, anchor_file) -> "OidEstimator":
@@ -172,9 +213,19 @@ class OidEstimator:
 class OidResolver:
     """resolve_oid(user, asset, hl_oid) -> engine oid | None, for Engine(resolve_oid=...)."""
 
-    def __init__(self, engine, est: OidEstimator, base: int = 50, per_mille: int = 50, nearest_ratio: int = 0):
+    def __init__(self, engine, est: OidEstimator, base: int = 50, per_mille: int = 50, nearest_ratio: int = 0,
+                 joint_tx: bool = True, joint_block: bool = True, group_gap: int = 0,
+                 pair_slack: int = 3, pair_lo: int = 2, pair_per_mille: int = 80, node_budget: int = 20000):
         """nearest_ratio > 0: when several orders are within tolerance, accept the nearest one only if
-        every other is at least nearest_ratio times farther (and >= base ids farther); 0 = never."""
+        every other is at least nearest_ratio times farther (and >= base ids farther); 0 = never.
+        joint_tx / joint_block: the two joint layers (module doc). group_gap: ids that may be missing
+        between two items of one placement tx. pair_*: cross-tx spacing tolerance (module doc)."""
+        self.joint_tx, self.joint_block, self.group_gap = joint_tx, joint_block, group_gap
+        self.pair_slack, self.pair_lo, self.pair_per_mille = pair_slack, pair_lo, pair_per_mille
+        self.node_budget = node_budget
+        self.meta: dict[int, tuple[int, tuple[int, int]]] = {}   # engine oid -> (count k, (block, tx_index))
+        self._jc_block: int | None = None
+        self._jc: dict = {}
         self.engine, self.est = engine, est
         self.base, self.per_mille, self.nearest_ratio = base, per_mille, nearest_ratio
         self.hl: dict[int, tuple[int, int]] = {}       # engine oid -> (estimated hl oid, tolerance)
@@ -195,6 +246,7 @@ class OidResolver:
         e = self.est.estimate_count(k)
         if e is not None:
             self.hl[engine_oid] = (e, self.est.tolerance(k, self.base, self.per_mille))
+            self.meta[engine_oid] = (k, (action.block, action.tx_index))
 
     def __call__(self, user: str, asset: int, hl_oid: int) -> int | None:
         self.last, self._last_reason = None, None
@@ -202,6 +254,12 @@ class OidResolver:
             self.stats["prewindow"] += 1
             self._last_reason = "prewindow"                # placed before the window: a placeholder at best
             return None
+        if self.joint_tx or self.joint_block:
+            oid = self._joint(user, asset, hl_oid)
+            if oid is not None:
+                self.stats["resolved"] += 1
+                self.last = oid
+                return oid
         book = self.engine.books[asset]
         hits = []
         for oid in self.engine.by_user.get(user, {}):
@@ -225,3 +283,137 @@ class OidResolver:
         self.stats["resolved"] += 1
         self.last = hits[0][1]
         return self.last
+
+    # ------------------------------------------------------------------ joint
+    def _joint(self, user: str, asset: int, hl_oid: int) -> int | None:
+        block = self.engine.block
+        if block != self._jc_block:
+            self._jc_block, self._jc = block, {}
+        item = (asset, hl_oid)
+        for layer, enabled, source in (("tx", self.joint_tx, self.est.groups),
+                                       ("block", self.joint_block, self.est.block_groups)):
+            if not enabled:
+                continue
+            groups = source.get((block, user))
+            if not groups:
+                continue
+            if layer == "tx":
+                gi = next((i for i, g in enumerate(groups) if item in g), None)
+                if gi is None:
+                    continue
+                key, grp = ("tx", user, gi), groups[gi]
+            else:
+                if item not in groups:
+                    continue
+                key, grp = ("block", user), groups
+            res = self._jc.get(key)
+            if res is None:
+                res = self._jc[key] = (self._analyse_tx(user, grp) if layer == "tx"
+                                       else self._analyse_block(user, grp))
+            oid = res.get(item)
+            if oid is not None and oid in self.engine.books[asset]:
+                self.stats["resolved_group" if layer == "tx" else "resolved_block"] += 1
+                return oid
+        return None
+
+    def _mine(self, user: str):
+        """The user's resting, estimated orders as [(est oid, tol, k, tx key, engine oid)] sorted by est."""
+        out = [(self.hl[x][0], self.hl[x][1], self.meta[x][0], self.meta[x][1], x)
+               for x in self.engine.by_user.get(user, {}) if x in self.hl and x in self.meta]
+        out.sort()
+        return out
+
+    def _candidates(self, mine, keys, asset: int, o: int, maxtol: int):
+        book = self.engine.books[asset]
+        lo, hi = bisect_left(keys, o - maxtol), bisect_right(keys, o + maxtol)
+        return [(k, tx, x) for e, tol, k, tx, x in mine[lo:hi] if abs(e - o) <= tol and x in book]
+
+    def _analyse_tx(self, user: str, group) -> dict:
+        items = sorted(set(group))
+        if len(items) < 2:
+            return {}
+        mine = self._mine(user)
+        keys = [m[0] for m in mine]
+        maxtol = max((m[1] for m in mine), default=0)
+        pairs = []                                       # (tx key, c, item index, engine oid)
+        for j, (a, o) in enumerate(items):
+            for k, tx, x in self._candidates(mine, keys, a, o, maxtol):
+                pairs.append((tx, o - k, j, x))
+        pairs.sort()
+        hyps, i = [], 0
+        while i < len(pairs):
+            tx, c0 = pairs[i][0], pairs[i][1]
+            n = i
+            while n < len(pairs) and pairs[n][0] == tx and pairs[n][1] - c0 <= self.group_gap:
+                n += 1
+            hyps.append([(j, x) for _, _, j, x in pairs[i:n]])
+            i = n
+        cover: dict[int, list] = {}
+        for h in hyps:
+            js = {j for j, _ in h}
+            if len(js) >= 2:
+                for j in js:
+                    cover.setdefault(j, []).append(h)
+        out = {}
+        for j, hs in cover.items():
+            xs = {x for jj, x in hs[0] if jj == j}
+            if len(hs) == 1 and len(xs) == 1:
+                out[items[j]] = next(iter(xs))
+            else:
+                self.stats["block_conflict"] += 1
+        return out
+
+    def _pair_ok(self, oa: int, ka: int, ob: int, kb: int) -> bool:
+        """Offsets of two cancelled oids agree with the counted positions up to invisible-id drift."""
+        if kb < ka:
+            oa, ka, ob, kb = ob, kb, oa, ka
+        d = (ob - oa) - (kb - ka)                       # ids spent on events we cannot see (>= 0 ideally)
+        return -self.pair_lo <= d <= self.pair_slack + (kb - ka) * self.pair_per_mille // 1000
+
+    def _analyse_block(self, user: str, group) -> dict:
+        """Items pinned to one order in every consistent complete assignment of the user's block cancels."""
+        items = sorted(set(group))
+        if len(items) < 2:
+            return {}
+        mine = self._mine(user)
+        keys = [m[0] for m in mine]
+        maxtol = max((m[1] for m in mine), default=0)
+        cands = [self._candidates(mine, keys, a, o, maxtol) for a, o in items]
+        live = [j for j in range(len(items)) if cands[j]]
+        if len(live) < 2:
+            return {}
+        live.sort(key=lambda j: (len(cands[j]), j))     # fewest candidates first: prunes early
+        sols: list[list[int]] = []
+        nodes = 0
+        assign: list[tuple[int, int, int]] = []         # (j, k, x) in DFS order
+        used: set[int] = set()
+        def dfs(d: int) -> bool:
+            nonlocal nodes
+            if d == len(live):
+                sols.append([x for _, _, x in sorted(assign)])
+                return len(sols) <= 64
+            j = live[d]
+            o = items[j][1]
+            for k, tx, x in cands[j]:
+                nodes += 1
+                if nodes > self.node_budget:
+                    return False
+                if x in used or any(not self._pair_ok(o, k, items[jj][1], kk) for jj, kk, _ in assign):
+                    continue
+                assign.append((j, k, x)); used.add(x)
+                ok = dfs(d + 1)
+                assign.pop(); used.discard(x)
+                if not ok:
+                    return False
+            return True
+        if not dfs(0) or not sols:
+            self.stats["block_conflict"] += 1
+            return {}
+        out = {}
+        for pos, j in enumerate(sorted(live)):
+            xs = {s[pos] for s in sols}
+            if len(xs) == 1:
+                out[items[j]] = next(iter(xs))
+        if len(out) < len(live):
+            self.stats["block_conflict"] += 1
+        return out
