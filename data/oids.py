@@ -219,9 +219,9 @@ class OidResolver:
     """resolve_oid(user, asset, hl_oid) -> engine oid | None, for Engine(resolve_oid=...)."""
 
     def __init__(self, engine, est: OidEstimator, base: int = 50, per_mille: int = 50, nearest_ratio: int = 0,
-                 joint_tx: bool = False, joint_block: bool = False, group_gap: int = 0,
+                 joint_tx: bool = True, joint_block: bool = True, group_gap: int = 0,
                  pair_slack: int = 3, pair_lo: int = 2, pair_per_mille: int = 80, node_budget: int = 20000,
-                 guard_mult: int = 2, ghost_guard: bool = False, max_tol: int | None = 3000,
+                 guard_mult: int = 2, ghost_guard: bool = True, max_tol: int | None = None,
                  ratio_per_mille: int | None = None):
         """nearest_ratio > 0: when several orders are within tolerance, accept the nearest one only if
         every other is at least nearest_ratio times farther (and >= base ids farther); 0 = never.

@@ -338,4 +338,4 @@ def test_ratio_guard_refuses_a_candidate_far_inside_the_tolerance():
 
 def test_defaults_are_the_safe_ones():
     r = OidResolver(Engine(), OidEstimator({}, []))
-    assert (r.joint_tx, r.joint_block, r.ghost_guard, r.max_tol, r.ratio_per_mille) == (False, False, False, 3000, None)
+    assert (r.joint_tx, r.joint_block, r.ghost_guard, r.max_tol, r.ratio_per_mille) == (True, True, True, None, None)
