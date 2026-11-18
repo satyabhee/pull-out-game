@@ -115,6 +115,7 @@ class _Observer(Observer):
         self.outcome: Counter = Counter()
         self.by_bucket: Counter = Counter()          # (bucket, outcome)
         self.heldout: Counter = Counter()            # total / resolved / correct / WRONG / <unresolved outcome>
+        self.wrong: list[dict] = []                  # one entry per WRONG resolution, for triage
         self._before: Counter | None = None
 
     def before_action(self, rp, block, a):
@@ -139,6 +140,11 @@ class _Observer(Observer):
                 placed = rp.placed_by.get(res.last)
                 got = (placed.block, placed.tx_index, placed.item_index) if placed is not None else None
                 self.heldout["correct" if got == truth else "WRONG"] += 1
+                if got != truth:
+                    est, tol = res.hl.get(res.last, (None, None))
+                    self.wrong.append({"user": a.user, "block": a.block, "cancel_oid": a.oid, "true_pos": list(truth),
+                                       "chose_pos": list(got) if got else None, "chosen_est_oid": est,
+                                       "chosen_tolerance": tol, "dist_to_nearest_anchor": d})
             else:
                 self.heldout[out] += 1
 
@@ -156,7 +162,7 @@ def run_one(window, hl_data, counts, located, subset, nearest_ratio=3) -> dict:
         pass
     return {"n": len(subset), "outcome": dict(obs.outcome),
             "by_bucket": {f"{b}|{o}": c for (b, o), c in sorted(obs.by_bucket.items())},
-            "heldout": dict(obs.heldout), "stats": dict(rp.resolver.stats)}
+            "heldout": dict(obs.heldout), "wrong_cases": obs.wrong, "stats": dict(rp.resolver.stats)}
 
 
 # ------------------------------------------------------------------ pool plumbing (window decoded once per worker)

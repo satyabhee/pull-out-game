@@ -66,6 +66,8 @@ def test_wrong_resolution_is_counted_when_truth_disagrees(tmp_path):
     lied[1]["pos"] = (1000, 0, 0)                       # pretend oid 6000 was really the FIRST placement
     r = ad.run_one(d, hl, counts, lied, [located[0], located[2]])
     assert r["heldout"]["WRONG"] == 1 and "correct" not in r["heldout"]
+    w, = r["wrong_cases"]
+    assert w["true_pos"] == [1000, 0, 0] and w["chose_pos"] == [1001, 0, 0] and w["cancel_oid"] == 6000
 
 
 def test_summarize_and_bucket_table():
