@@ -104,6 +104,9 @@ def locate_anchors(window) -> list[dict]:
     return [dict(user=u, oid=o, pos=v[0][0], k=v[0][1]) for (u, o), v in sorted(found.items()) if len(v) == 1]
 
 
+WRONG_DETAILS: list[dict] = []        # filled by _replay: the evidence for every wrong held-out resolution
+
+
 class _Recorder:
     """Replay observer: engine oid created at each position."""
 
@@ -136,19 +139,31 @@ def _replay(window, hl_data, anchors_path, truth: dict[tuple, tuple] | None, nea
     def wrapped(user, asset, hl_oid):
         before = Counter(inner.stats)
         r = inner(user, asset, hl_oid)
-        calls.append((user, asset, hl_oid, r, sorted((inner.stats - before).keys())))
+        pos = (truth or {}).get((user, asset, hl_oid))
+        info = None
+        if pos is not None:
+            t_oid = rec.created.get(pos)
+            book = rp.engine.books[asset]
+            info = dict(user=user, hl_oid=hl_oid, true_pos=pos, block=rp.engine.block, resolved_to=r,
+                        true_engine_oid=t_oid, true_in_book=t_oid in book if t_oid is not None else None,
+                        true_est_tol=inner.hl.get(t_oid), picked_est_tol=inner.hl.get(r) if r is not None else None,
+                        picked_pos=(lambda a: (a.block, a.tx_index, a.item_index))(rp.placed_by[r])
+                        if r in rp.placed_by else None)
+        calls.append((user, asset, hl_oid, r, sorted((inner.stats - before).keys()), info))
         return r
 
     rp.engine.resolve_oid = wrapped
     for _ in rp:
         pass
-    for user, asset, hl_oid, r, how in calls:
+    for user, asset, hl_oid, r, how, info in calls:
         pos = (truth or {}).get((user, asset, hl_oid))
         if pos is None:
             continue
         true_oid = rec.created.get(pos)
         v = "correct" if r is not None and r == true_oid else "abstained" if r is None else "WRONG"
         verdicts[v] += 1
+        if v == "WRONG":
+            WRONG_DETAILS.append(info)
         verdicts[f"{v} via {'+'.join(how)}"] += 1
     return dict(inner.stats), verdicts
 
@@ -169,7 +184,8 @@ def heldout(window, hl_data, folds=3, nearest_ratio=3, resolver_kw=None) -> dict
             stats, v = _replay(window, hl_data, ap, truth, nearest_ratio, None, **(resolver_kw or {}))
         total += v
         stats_all.append(stats)
-    return dict(located=len(located), folds=folds, verdicts=dict(total), fold_stats=stats_all)
+    return dict(located=len(located), folds=folds, verdicts=dict(total), wrong_details=list(WRONG_DETAILS),
+                fold_stats=stats_all)
 
 
 def ASSET_OF(anchors, loc) -> int:
