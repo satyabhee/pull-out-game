@@ -289,3 +289,55 @@ def test_locate_anchors_finds_the_unique_placement(tmp_path):
     window, _ = w.write()
     loc = ev.locate_anchors(window)
     assert loc == [dict(user=A, oid=777, pos=(h, 0, 1), k=1)]
+
+
+def _tiny_window(tmp_path, n=6):
+    """Two users each rest n ALOs (cloids) in block 1, then cancel them by cloid in block 2."""
+    from tests.window_fixture import A, B, Window, order, place_tx, tx
+    w = Window(tmp_path)
+    placing = [place_tx(u, f"0x{u[2]}{i}", 0, order(px=str(60000 - 10 * i - (5 if u == B else 0)), cloid=f"0x{ord(u[2]):02x}{i:02x}"))
+               for i in range(n) for u in (A, B)]
+    w.block(placing)
+    w.block([tx(u, {"type": "cancelByCloid", "cancels": [{"asset": 0, "cloid": f"0x{ord(u[2]):02x}{i:02x}"}]},
+                f"0xc{u[2]}{i}", 0) for i in range(n) for u in (A, B)])
+    w.anchors = [{"oid": 500, "height": w.h0, "tx": 0, "item": 0},
+                 {"oid": 500 + 2 * n + 4, "height": w.h0, "tx": 2 * n - 1, "item": 0}]
+    window, hl = w.write()
+    return window, hl
+
+
+def test_synth_runs_and_never_resolves_wrongly(tmp_path):
+    window, hl = _tiny_window(tmp_path)
+    r = ev.synth(window, hl, seed=3, n_anchors=2)
+    assert r["outcomes"].get("WRONG", 0) == 0
+    assert sum(v for k, v in r["outcomes"].items() if k != "real_unmapped") == 12      # every cloid cancel was mapped
+
+
+def test_synth_is_deterministic(tmp_path):
+    window, hl = _tiny_window(tmp_path)
+    assert ev.synth(window, hl, seed=5, n_anchors=2) == ev.synth(window, hl, seed=5, n_anchors=2)
+
+
+def test_guard_configs_are_valid_resolver_options():
+    import inspect
+    params = inspect.signature(OidResolver.__init__).parameters
+    for cfg in ev.GUARD_CONFIGS.values():
+        assert set(cfg) <= set(params)
+
+
+def test_guards_smoke_tallies_every_config(tmp_path):
+    from tests.window_fixture import A, B, Window, order, place_tx
+    w = Window(tmp_path)
+    px = {}
+    txs = []
+    for i in range(6):
+        for u in (A, B):
+            px[(u, i)] = str(60000 - 10 * i - (5 if u == B else 0))
+            txs.append(place_tx(u, f"0x{u[2]}{i}", 0, order(px=px[(u, i)])))
+    h = w.block(txs)
+    w.anchors = [{"user": u, "oid": 700 + 2 * i + (u == B), "answer": {"status": "order", "order": {"status": "canceled", "order": {
+        "coin": "BTC", "side": "B", "limitPx": px[(u, i)] + ".0", "origSz": "0.001", "oid": 700 + 2 * i + (u == B),
+        "timestamp": w.time_of(h)}}}} for i in range(6) for u in (A, B)]
+    window, hl = w.write()
+    r = ev.guards(window, hl, folds=2)
+    assert r["located"] == 12 and set(r["tally"]) == set(ev.GUARD_CONFIGS) and r["wrong"] == []
