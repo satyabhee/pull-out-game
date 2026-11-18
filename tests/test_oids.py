@@ -320,3 +320,15 @@ def test_far_from_anchor_orders_are_never_candidates():
         assert res.stats["resolved"] == resolved
         if cap:
             assert res.stats["far_from_anchor"] == 1 and oid in eng.books[0] and res.stats["no_candidate"] == 1
+
+
+def test_ratio_guard_refuses_a_candidate_far_inside_the_tolerance():
+    counts = {(1, 0, 0): 0, (1, 1, 0): 500, (1, 2, 0): 1000}
+    for r, resolved in ((None, 1), (500, 0), (900, 1)):
+        eng = Engine()
+        res = OidResolver(eng, OidEstimator(counts, [(0, 5000), (1000, 6000)]), ratio_per_mille=r, ghost_guard=False)
+        eng.resolve_oid = res
+        place(eng, res, "u", (1, 1, 0), 100)               # estimate 5500, tolerance 50 + 5% * 500 = 75
+        eng.apply(Cancel(user="u", **{**META, "block": 2}, asset=0, oid=5500 + 60))   # 60 of 75 = 0.8
+        assert res.stats["resolved"] == resolved
+        assert res.stats["ratio"] == (1 - resolved if r else 0)
