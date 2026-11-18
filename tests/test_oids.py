@@ -264,3 +264,43 @@ def test_stress_worlds_have_zero_wrong_and_the_joint_layer_still_fires():
         c, bad = w.run(groups)
         correct, wrong, fired = correct + c, wrong + bad, fired + w.res.stats["resolved_block"]
     assert wrong == 0 and fired > 0
+
+
+def ghost_setup(ks_resting, ks_gone, ghost_guard=True):
+    """User 'u' placed orders at counts ks_resting (they rest) and ks_gone (already left the book)."""
+    allk = sorted(ks_resting + ks_gone)
+    counts = {(1, i, 0): k for i, k in enumerate(allk)}
+    e = OidEstimator(counts, [(0, 5000), (1000, 6000)], placers={("u", 0): allk})
+    eng = Engine()
+    res = OidResolver(eng, e, ghost_guard=ghost_guard)
+    eng.resolve_oid = res
+    rest = {}
+    for i, k in enumerate(allk):
+        if k in ks_resting:
+            rest[k] = place(eng, res, "u", (1, i, 0), 100 + i)
+    return eng, res, rest
+
+
+def test_ghost_guard_abstains_when_a_departed_placement_is_also_within_tolerance():
+    eng, res, rest = ghost_setup([10], [30])            # estimates 5010 and 5030, tolerance 50
+    assert len(cancel2(eng, 5010)) == 1 and rest[10] in eng.books[0]
+    assert res.stats["ghost"] == 1 and res.stats["resolved"] == 0
+
+
+def test_ghost_guard_is_silent_when_the_candidate_is_the_only_placement_in_range():
+    eng, res, rest = ghost_setup([10], [400])
+    assert cancel2(eng, 5010) == [] and rest[10] not in eng.books[0] and res.stats["ghost"] == 0
+
+
+def test_ghost_guard_can_be_turned_off():
+    eng, res, rest = ghost_setup([10], [30], ghost_guard=False)
+    assert cancel2(eng, 5010) == [] and res.stats["resolved"] == 1
+
+
+def test_estimator_collects_every_placement_per_user_and_asset(tmp_path):
+    from tests.window_fixture import A, Window, order, place_tx
+    w = Window(tmp_path)
+    w.block([place_tx(A, "0xa", 0, order(), order(asset=1)), place_tx(A, "0xb", 0, order())])
+    window, _ = w.write()
+    est = OidEstimator.from_window(window, [])
+    assert est.placers[(A.lower(), 0)] == [0, 2] and est.placers[(A.lower(), 1)] == [1]
