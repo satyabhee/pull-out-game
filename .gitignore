@@ -35,3 +35,6 @@ collect/explorer.lock
 
 # derived validation outputs (regenerate with analysis.validate_replay)
 report/validate/
+
+# prompts handed to other Claude sessions
+handoff/
