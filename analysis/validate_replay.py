@@ -52,7 +52,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from data.parse import iter_trades
+from data.parse import iter_trades, recorder_hours
 from engine_py.matching import PLACEHOLDER
 from engine_py.replay import COINS, OUTSIDE_FILL_POSITION, Observer, Replay, listing
 from engine_py.types import (ASSETS, Cancel, CancelByCloid, Modify, OutsideFill, Place, RejectReason, Side,
@@ -84,10 +84,13 @@ def alo_truth_class(answer: dict) -> str:
     return "accepted" if st else "unknown"
 
 
-def load_alo_status(hl_data, heights: range | None = None) -> dict[tuple[int, str, int], dict]:
-    """(block, hash, item) -> {"truth": class, "status": raw status} from every alo_status file."""
+def load_alo_status(hl_data, heights: range | None = None, t0_ms: int | None = None,
+                    t1_ms: int | None = None) -> dict[tuple[int, str, int], dict]:
+    """(block, hash, item) -> {"truth": class, "status": raw status} from every alo_status file
+    (with t0/t1: only the hour folders around that time range, see data.parse.recorder_hours)."""
     out = {}
-    for path in sorted(Path(hl_data).glob("*/*/alo_status.jsonl*")):
+    paths = sorted(p for hour in recorder_hours(hl_data, t0_ms, t1_ms) for p in hour.glob("alo_status.jsonl*"))
+    for path in paths:
         opener = gzip.open if path.suffix == ".gz" else open
         with opener(path, "rt") as f:
             for line in f:
@@ -347,7 +350,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
         if tr.hash != ZERO_HASH:
             real_by_hash[tr.hash].append(tr)
-    alo_truth = load_alo_status(hl_data, heights)
+    alo_truth = load_alo_status(hl_data, heights, rp.t0, rp.t1)
     obs = ValidateObserver(real_by_hash, alo_truth)
     rp.observer = obs
     for _ in rp:
@@ -404,17 +407,15 @@ def rate(n, d):
     return f"{n / d:.4f}" if d else ""
 
 
-def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
-    scored = [r for r in rows if not r["warmup"] and r["status"] in ("match", "mismatch")]
-    res = {"window": rp.window_dir.name, "policy": policy_name, "outside_fill_position": OUTSIDE_FILL_POSITION,
-           "blocks": len(rp.blocks), "warmup_end_height": rp.warmup_end_height,
-           "resolver": "on" if rp.resolver is not None else "off",
-           "alo_gate": rp.alo_gate or "off", "gate_max_age_ms": rp.gate_max_age_ms if rp.gate_max_age_ms is not None else "",
-           "evict_known": rp.reconcile_known or "off",
-           "nearest_ratio": rp.resolver.nearest_ratio if rp.resolver is not None else "",
-           "reseed": "every snapshot" if rp.reseed else "off",
-           "touch_reconcile": ("bbo every block" + (" + n cap" if rp.touch_n_cap else "")) if rp.touch_reconcile else "off",
-           "real_linked_txs_not_in_window": unlinked}
+def scored_rows(rows: list) -> list:
+    """The scored population: post-warm-up txs with status match or mismatch."""
+    return [r for r in rows if not r["warmup"] and r["status"] in ("match", "mismatch")]
+
+
+def scope_metrics(scored: list) -> dict:
+    """'<scope>:<metric>' for scope all/BTC/ETH, plus g1_target, from scored tx rows only
+    (so pooled rows from many windows/chunks use the same definitions)."""
+    res = {}
     for scope, rs in [("all", scored)] + [(c, [r for r in scored if r["coin"] == c]) for c in COINS]:
         n = len(rs)
         m = sum(r["status"] == "match" for r in rs)
@@ -435,13 +436,50 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
         res[f"{scope}:fill_precision"] = rate(sum(r["matched_notional"] for r in rs), en)
         res[f"{scope}:fill_recall_px_sz"] = rate(sum(r["matched_notional_px"] for r in rs), rn)
         res[f"{scope}:fill_precision_px_sz"] = rate(sum(r["matched_notional_px"] for r in rs), en)
+    return res
+
+
+def mismatch_tables(scored: list) -> tuple[dict, dict]:
+    """(first-category counts by (category, coin), flagged counts by category) over mismatched rows."""
+    mism = [r for r in scored if r["status"] == "mismatch"]
+    table = {(cat, coin): sum(1 for r in mism if r["category"] == cat and r["coin"] == coin)
+             for cat in CATEGORIES for coin in COINS}
+    flags = {cat: sum(1 for r in mism if cat in r["flags"].split("|")) for cat in CATEGORIES[:-1]}
+    return table, flags
+
+
+def horizon_table(scored: list) -> list[dict]:
+    """Match and fill recall by time since the last re-seed (rows with a horizon_ms only)."""
+    hz = []
+    edges = (0, *HORIZON_BUCKETS_MS, None)
+    for lo, hi in zip(edges, edges[1:]):
+        rs = [r for r in scored if r["horizon_ms"] != "" and r["horizon_ms"] >= lo
+              and (hi is None or r["horizon_ms"] < hi)]
+        rn = sum(r["real_notional"] for r in rs)
+        hz.append(dict(horizon=f"{lo // 1000}-{hi // 1000}s" if hi else f"{lo // 1000}s+", scored=len(rs),
+                       matched=sum(r["status"] == "match" for r in rs),
+                       match_rate=rate(sum(r["status"] == "match" for r in rs), len(rs)),
+                       fill_recall=rate(sum(r["matched_notional"] for r in rs), rn),
+                       fill_recall_px_sz=rate(sum(r["matched_notional_px"] for r in rs), rn)))
+    return hz
+
+
+def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
+    scored = scored_rows(rows)
+    res = {"window": rp.window_dir.name, "policy": policy_name, "outside_fill_position": OUTSIDE_FILL_POSITION,
+           "blocks": len(rp.blocks), "warmup_end_height": rp.warmup_end_height,
+           "resolver": "on" if rp.resolver is not None else "off",
+           "alo_gate": rp.alo_gate or "off", "gate_max_age_ms": rp.gate_max_age_ms if rp.gate_max_age_ms is not None else "",
+           "evict_known": rp.reconcile_known or "off",
+           "nearest_ratio": rp.resolver.nearest_ratio if rp.resolver is not None else "",
+           "reseed": "every snapshot" if rp.reseed else "off",
+           "touch_reconcile": ("bbo every block" + (" + n cap" if rp.touch_n_cap else "")) if rp.touch_reconcile else "off",
+           "real_linked_txs_not_in_window": unlinked}
+    res.update(scope_metrics(scored))
     post = [r for r in rows if not r["warmup"]]
     res["excluded_real_maker_prewindow"] = sum(r["status"].startswith("excluded") for r in post)
     res["warmup_txs"] = sum(r["warmup"] for r in rows)
-    mism = [r for r in scored if r["status"] == "mismatch"]
-    res["mismatch_table"] = {(cat, coin): sum(1 for r in mism if r["category"] == cat and r["coin"] == coin)
-                             for cat in CATEGORIES for coin in COINS}
-    res["flag_table"] = {cat: sum(1 for r in mism if cat in r["flags"].split("|")) for cat in CATEGORIES[:-1]}
+    res["mismatch_table"], res["flag_table"] = mismatch_tables(scored)
     res["alo_truth_rows"] = len(obs.alo_truth)
     res["alo_confusion"] = dict(obs.alo_confusion)
     res["resolver_stats"] = dict(rp.resolver.stats) if rp.resolver is not None else {}
@@ -482,19 +520,7 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
             oid_cancels=ms["oid_cancels"], oid_unknown=ms["oid_unknown"],
             resting_known_orders=obs.resting.get((minute, coin), "")))
     res["per_minute"] = per_min
-    hz = []
-    if rp.reseed:
-        edges = (0, *HORIZON_BUCKETS_MS, None)
-        for lo, hi in zip(edges, edges[1:]):
-            rs = [r for r in scored if r["horizon_ms"] != "" and r["horizon_ms"] >= lo
-                  and (hi is None or r["horizon_ms"] < hi)]
-            rn = sum(r["real_notional"] for r in rs)
-            hz.append(dict(horizon=f"{lo // 1000}-{hi // 1000}s" if hi else f"{lo // 1000}s+", scored=len(rs),
-                           matched=sum(r["status"] == "match" for r in rs),
-                           match_rate=rate(sum(r["status"] == "match" for r in rs), len(rs)),
-                           fill_recall=rate(sum(r["matched_notional"] for r in rs), rn),
-                           fill_recall_px_sz=rate(sum(r["matched_notional_px"] for r in rs), rn)))
-    res["horizons"] = hz
+    res["horizons"] = horizon_table(scored) if rp.reseed else []
     return res
 
 
@@ -582,13 +608,10 @@ def print_report(res: dict) -> None:
               f"resting {r['resting_known_orders']}")
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("window")
+def add_replay_args(ap: argparse.ArgumentParser) -> None:
+    """The replay options shared by validate_replay and validate_chunks."""
     ap.add_argument("--hl-data", required=True)
     ap.add_argument("--policy", default="listing", choices=sorted(POLICIES))
-    ap.add_argument("--out", help="directory for the CSVs (default: report/validate/<window>-<policy>)")
-    ap.add_argument("--anchors", help="anchors file (default: the window's anchors.json)")
     ap.add_argument("--no-resolver", action="store_true")
     ap.add_argument("--alo-gate", choices=["touch"], help="G1 fix #1: admit ALOs against the real touch")
     ap.add_argument("--gate-max-age-ms", type=int, help="gate abstains when the touch is older than this")
@@ -598,15 +621,32 @@ def main(argv=None):
     ap.add_argument("--reseed", action="store_true", help="G1 #3: rebuild each book from every snapshot")
     ap.add_argument("--touch-reconcile", action="store_true", help="rule 8 against the recorded bbo before every block")
     ap.add_argument("--touch-n-cap", action="store_true", help="with --touch-reconcile: cap touch order count at bbo n")
+
+
+def replay_kwargs(a) -> dict:
+    """Keyword arguments for run() from add_replay_args options (all but hl_data, policy, anchors)."""
+    return dict(use_resolver=not a.no_resolver, alo_gate=a.alo_gate, gate_max_age_ms=a.gate_max_age_ms,
+                evict_known=a.evict_known, nearest_ratio=a.nearest_ratio, reseed=a.reseed,
+                touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap)
+
+
+def options_tag(a) -> str:
+    """Output-folder suffix naming the replay options, e.g. '-gate-nr3-reseed'."""
+    return "".join([f"-gate{a.gate_max_age_ms if a.gate_max_age_ms is not None else ''}" if a.alo_gate else "",
+                    f"-evict{a.evict_known}" if a.evict_known else "",
+                    f"-nr{a.nearest_ratio}" if a.nearest_ratio else "", "-reseed" if a.reseed else "",
+                    "-touch" if a.touch_reconcile else "", "-ncap" if a.touch_n_cap else ""])
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("window")
+    ap.add_argument("--out", help="directory for the CSVs (default: report/validate/<window>-<policy>)")
+    ap.add_argument("--anchors", help="anchors file (default: the window's anchors.json)")
+    add_replay_args(ap)
     a = ap.parse_args(argv)
-    tag = "".join([f"-gate{a.gate_max_age_ms if a.gate_max_age_ms is not None else ''}" if a.alo_gate else "",
-                   f"-evict{a.evict_known}" if a.evict_known else "",
-                   f"-nr{a.nearest_ratio}" if a.nearest_ratio else "", "-reseed" if a.reseed else "",
-                   "-touch" if a.touch_reconcile else "", "-ncap" if a.touch_n_cap else ""])
-    out = a.out or f"report/validate/{Path(a.window).name}-{a.policy}{tag}"
-    run(a.window, a.hl_data, a.policy, out, a.anchors, not a.no_resolver, alo_gate=a.alo_gate,
-        gate_max_age_ms=a.gate_max_age_ms, evict_known=a.evict_known, nearest_ratio=a.nearest_ratio,
-        reseed=a.reseed, touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap)
+    out = a.out or f"report/validate/{Path(a.window).name}-{a.policy}{options_tag(a)}"
+    run(a.window, a.hl_data, a.policy, out, a.anchors, **replay_kwargs(a))
     print(f"\nCSVs in {out}")
 
 

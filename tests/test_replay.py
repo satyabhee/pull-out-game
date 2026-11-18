@@ -189,13 +189,24 @@ def test_real_touch_follows_snapshots_and_trades_and_scores_itself():
     assert rt.get(0, 401)[:2] == (14, 16) and rt.errors[0] == [(1, 0)]
 
 
+T_0430 = 1794976200000                               # 2026-11-18 04:30:00 UTC
+
+
 def test_iter_bbo_reads_the_recorded_feed(tmp_path):
     d = tmp_path / "2026-11-18" / "04"
     d.mkdir(parents=True)
-    rec = {"channel": "bbo", "data": {"coin": "BTC", "time": 5, "bbo": [{"px": "64407.0", "sz": "1", "n": 2}, None]}}
+    rec = {"channel": "bbo", "data": {"coin": "BTC", "time": T_0430 + 5,
+                                      "bbo": [{"px": "64407.0", "sz": "1", "n": 2}, None]}}
     (d / "bbo_BTC.jsonl").write_text(json.dumps({"recv_ms": 0, "msg": rec}) + "\n")
-    assert list(iter_bbo(tmp_path, "BTC", 0, 10)) == [(5, 0, (ticks("64407"), lots("1"), 2), None)]
-    assert list(iter_bbo(tmp_path, "BTC", 6, 10)) == []
+    assert list(iter_bbo(tmp_path, "BTC", T_0430, T_0430 + 10)) == [(T_0430 + 5, 0, (ticks("64407"), lots("1"), 2), None)]
+    assert list(iter_bbo(tmp_path, "BTC", T_0430 + 6, T_0430 + 10)) == []
+
+
+def test_iter_bbo_opens_only_the_hours_around_the_range(tmp_path):
+    far = tmp_path / "2026-11-18" / "09"
+    far.mkdir(parents=True)
+    (far / "bbo_BTC.jsonl.gz").write_bytes(b"not gzip")       # raises if opened
+    assert list(iter_bbo(tmp_path, "BTC", T_0430, T_0430 + 10)) == []
 
 
 def gate_window(tmp_path, snap_bid, snap_ask, txs, dt_ms=100):

@@ -115,7 +115,7 @@ def iter_bbo(hl_data, coin: str, t0_ms: int, t1_ms: int):
     asset = COIN_TO_ASSET[coin]
     spec = ASSETS[asset]
     lv = lambda x: (spec.px_to_ticks(x["px"]), spec.sz_to_lots(x["sz"]), int(x["n"])) if x else None
-    for path in _hour_files(Path(hl_data), f"bbo_{coin}"):
+    for path in _hour_files(Path(hl_data), f"bbo_{coin}", t0_ms, t1_ms):
         for rec in _lines(path):
             d = rec["msg"]["data"]
             if t0_ms <= d["time"] <= t1_ms:

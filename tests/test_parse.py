@@ -176,3 +176,54 @@ def test_nearest_book(tmp_path):
     write_hour(tmp_path, "book_BTC", [snap(T - 900, "65012.0"), snap(T + 5000, "65000.0")])
     b = nearest_book(tmp_path, "BTC", T)
     assert b.time_ms == T - 900 and b.bids == ((650120, 50000),) and b.asks == ((650130, 100000),)
+
+
+# ---- hour-range speed-up: only the hour folders around [t0, t1] are opened -----------------
+
+from data.parse import iter_books, recorder_hours
+
+
+def corrupt_hour(root, hour, stem):
+    """A file that raises if anything opens and reads it."""
+    d = root / "2026-11-17" / hour
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{stem}.jsonl.gz").write_bytes(b"not gzip")
+
+
+def snap(t, bid="65012.0"):
+    return {"recv_ms": t, "msg": {"channel": "l2Book", "data": {"coin": "BTC", "time": t, "levels": [
+        [{"px": bid, "sz": "0.5", "n": 2}], [{"px": "65013.0", "sz": "1", "n": 1}]]}}}
+
+
+def test_recorder_hours_keeps_one_hour_of_slack_each_side_and_unknown_folders(tmp_path):
+    for day, hour in [("2026-11-17", h) for h in ("02", "03", "04", "05", "06", "07", "08")] + [("misc", "x")]:
+        (tmp_path / day / hour).mkdir(parents=True)
+    got = [f"{p.parent.name}/{p.name}" for p in recorder_hours(tmp_path, T, T)]      # T is 05:06 UTC
+    assert got == ["2026-11-17/04", "2026-11-17/05", "2026-11-17/06", "misc/x"]       # unknown names: kept
+    assert len(recorder_hours(tmp_path)) == 8                                          # no range: every folder
+
+
+def test_trades_and_books_skip_far_hours_and_read_a_late_recorded_line(tmp_path):
+    for stem in ("trades_BTC", "book_BTC"):
+        corrupt_hour(tmp_path, "02", stem)
+        corrupt_hour(tmp_path, "09", stem)
+    late = tmp_path / "2026-11-17" / "06"                       # recorded after the hour rolled over
+    late.mkdir(parents=True)
+    (late / "trades_BTC.jsonl").write_text(json.dumps(
+        {"recv_ms": T, "msg": {"channel": "trades", "data": [trade(TX_HASH, 1)]}}) + "\n")
+    (late / "book_BTC.jsonl").write_text(json.dumps(snap(T)) + "\n")
+    assert [t.tid for t in iter_trades(tmp_path, ("BTC",), T, T)] == [1]
+    assert [b.time_ms for b in iter_books(tmp_path, "BTC", T, T)] == [T]
+
+
+def test_nearest_book_reads_only_nearby_hours_when_a_snapshot_is_near(tmp_path):
+    write_hour(tmp_path, "book_BTC", [snap(T - 900)])
+    corrupt_hour(tmp_path, "10", "book_BTC")
+    assert nearest_book(tmp_path, "BTC", T).time_ms == T - 900
+
+
+def test_nearest_book_falls_back_to_every_hour_when_nothing_is_near(tmp_path):
+    far = tmp_path / "2026-11-17" / "11"                        # 6 h after T, the only snapshot
+    far.mkdir(parents=True)
+    (far / "book_BTC.jsonl").write_text(json.dumps(snap(T + 6 * 3_600_000, "1.0")) + "\n")
+    assert nearest_book(tmp_path, "BTC", T).time_ms == T + 6 * 3_600_000

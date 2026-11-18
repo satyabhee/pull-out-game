@@ -69,6 +69,18 @@ def test_load_alo_status_reads_plain_and_gz_filters_heights_and_skips_a_cut_line
     assert got[(5, "0x5", 0)] == {"truth": "rejected_alo", "status": "badAloPxRejected"}
 
 
+def test_load_alo_status_with_a_time_range_skips_far_hours(tmp_path):
+    t = 1794976200000                                         # 2026-11-18 04:30 UTC
+    near, far = tmp_path / "2026-11-18" / "04", tmp_path / "2026-11-18" / "09"
+    near.mkdir(parents=True)
+    far.mkdir(parents=True)
+    (far / "alo_status.jsonl.gz").write_bytes(b"not gzip")  # raises if opened
+    (near / "alo_status.jsonl").write_text(json.dumps({"msg": {"block": 5, "hash": "0x5", "item": 0,
+                                                                "answer": {"status": "unknownOid"}}}) + "\n")
+    got = vr.load_alo_status(tmp_path, range(0, 10), t, t + 1000)
+    assert got == {(5, "0x5", 0): {"truth": "unknown", "status": "unknownOid"}}
+
+
 def test_match_is_per_price_and_maker_px_sz_ignores_makers():
     real = [(10, 3, M), (10, 2, N)]
     assert vr.is_match(real, [(10, 2, N, 7), (10, 3, M, 8)])
@@ -325,3 +337,16 @@ def test_touch_reconcile_reaches_the_replay_and_the_summary(tmp_path):
     assert res["touch_reconciled"]["BTC:trimmed"] == ASSETS_BTC.sz_to_lots("0.002")
     summary = dict(csv.reader(open(tmp_path / "out" / "summary.csv")))
     assert summary["touch_reconcile:BTC:trimmed"] == str(ASSETS_BTC.sz_to_lots("0.002"))
+
+
+def test_cli_passes_options_and_names_the_output_after_them(tmp_path, monkeypatch, capsys):
+    w = Window(tmp_path)
+    h = two_makers_then_taker(w)
+    real_buy(w, h, "0xa1", M)
+    window, hl = w.write()
+    monkeypatch.chdir(tmp_path)
+    vr.main([str(window), "--hl-data", str(hl), "--alo-gate", "touch", "--evict-known", "oldest", "--reseed"])
+    out = tmp_path / "report" / "validate" / "w-listing-gate-evictoldest-reseed"
+    summary = dict(csv.reader(open(out / "summary.csv")))
+    assert summary["alo_gate"] == "touch" and summary["evict_known"] == "oldest"
+    assert summary["reseed"] == "every snapshot" and "CSVs in" in capsys.readouterr().out

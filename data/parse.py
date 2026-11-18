@@ -12,6 +12,7 @@ Run `python -m data.parse <window_dir> [--hl-data DIR]` for a summary.
 from __future__ import annotations
 
 import argparse
+import datetime
 import gzip
 import json
 import os
@@ -183,16 +184,46 @@ def iter_window(window_dir, hl_data=None, stats: Stats | None = None) -> Iterato
 
 # ------------------------------------------------------------------ recorder files
 
-def _hour_files(hl_data: Path, stem: str) -> list[Path]:
-    """One file per hour folder: plain .jsonl if present, else .jsonl.gz."""
+HOUR_MS = 3_600_000
+# Recorder lines land in the hour folder of their RECEIVE time, which trails the event time by a
+# little (and can sit just over an hour boundary). Ranged reads open the hour folders that overlap
+# [t0 - SLACK, t1 + SLACK]; this assumes no line is recorded more than SLACK after its event.
+RECORD_SLACK_MS = HOUR_MS
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC)
+
+
+def _hour_start_ms(day: str, hour: str) -> int | None:
+    try:
+        d = datetime.datetime.strptime(f"{day} {hour}", "%Y-%m-%d %H").replace(tzinfo=datetime.UTC)
+    except ValueError:
+        return None
+    return (d - _EPOCH) // datetime.timedelta(milliseconds=1)        # integer ms, no float
+
+
+def recorder_hours(hl_data, t0_ms: int | None = None, t1_ms: int | None = None) -> list[Path]:
+    """hl_data/<YYYY-MM-DD>/<HH>/ folders in order; with a range, only those overlapping
+    [t0 - RECORD_SLACK_MS, t1 + RECORD_SLACK_MS]. Folders whose names are not a date/hour are kept."""
+    hl_data = Path(hl_data)
     out = []
     for day in sorted(p for p in hl_data.iterdir() if p.is_dir()):
         for hour in sorted(p for p in day.iterdir() if p.is_dir()):
-            plain, gz = hour / f"{stem}.jsonl", hour / f"{stem}.jsonl.gz"
-            if plain.exists():
-                out.append(plain)
-            elif gz.exists():
-                out.append(gz)
+            start = _hour_start_ms(day.name, hour.name)
+            if t0_ms is not None and start is not None and not (
+                    start <= t1_ms + RECORD_SLACK_MS and start + HOUR_MS > t0_ms - RECORD_SLACK_MS):
+                continue
+            out.append(hour)
+    return out
+
+
+def _hour_files(hl_data: Path, stem: str, t0_ms: int | None = None, t1_ms: int | None = None) -> list[Path]:
+    """One file per hour folder (see recorder_hours): plain .jsonl if present, else .jsonl.gz."""
+    out = []
+    for hour in recorder_hours(hl_data, t0_ms, t1_ms):
+        plain, gz = hour / f"{stem}.jsonl", hour / f"{stem}.jsonl.gz"
+        if plain.exists():
+            out.append(plain)
+        elif gz.exists():
+            out.append(gz)
     return out
 
 
@@ -245,7 +276,7 @@ def iter_trades(hl_data, coins, t0_ms: int, t1_ms: int) -> Iterator[Trade]:
     for coin in coins:
         asset = COIN_TO_ASSET[coin]
         spec = ASSETS[asset]
-        for path in _hour_files(hl_data, f"trades_{coin}"):
+        for path in _hour_files(hl_data, f"trades_{coin}", t0_ms, t1_ms):
             for rec in _lines(path):
                 for x in rec["msg"]["data"]:
                     if not (t0_ms <= x["time"] <= t1_ms) or x["coin"] != coin:
@@ -276,7 +307,7 @@ def iter_books(hl_data, coin: str, t0_ms: int, t1_ms: int) -> Iterator[BookSnaps
     """L2 snapshots with t0 <= time <= t1, deduplicated by time, in time order."""
     asset = COIN_TO_ASSET[coin]
     seen: dict[int, dict] = {}
-    for path in _hour_files(Path(hl_data), f"book_{coin}"):
+    for path in _hour_files(Path(hl_data), f"book_{coin}", t0_ms, t1_ms):
         for rec in _lines(path):
             d = rec["msg"]["data"]
             if t0_ms <= d["time"] <= t1_ms:
@@ -285,17 +316,29 @@ def iter_books(hl_data, coin: str, t0_ms: int, t1_ms: int) -> Iterator[BookSnaps
         yield _snapshot(asset, seen[t])
 
 
-def nearest_book(hl_data, coin: str, at_ms: int) -> BookSnapshot:
-    """The L2 snapshot whose time is nearest `at_ms` (ties: the earlier one)."""
-    asset = COIN_TO_ASSET[coin]
-    spec = ASSETS[asset]
+def _nearest(paths, at_ms: int):
     best = None
-    for path in _hour_files(Path(hl_data), f"book_{coin}"):
+    for path in paths:
         for rec in _lines(path):
             d = rec["msg"]["data"]
             key = (abs(d["time"] - at_ms), d["time"])
             if best is None or key < best[0]:
                 best = (key, d)
+    return best
+
+
+def nearest_book(hl_data, coin: str, at_ms: int) -> BookSnapshot:
+    """The L2 snapshot whose time is nearest `at_ms` (ties: the earlier one).
+
+    Reads the hours around at_ms first; a snapshot found there within RECORD_SLACK_MS is the
+    nearest overall (anything in a skipped folder is farther, given RECORD_SLACK_MS). Otherwise
+    every hour is read."""
+    asset = COIN_TO_ASSET[coin]
+    stem = f"book_{coin}"
+    lo, hi = at_ms - RECORD_SLACK_MS, at_ms + RECORD_SLACK_MS
+    best = _nearest(_hour_files(Path(hl_data), stem, lo, hi), at_ms)
+    if best is None or best[0][0] > RECORD_SLACK_MS:
+        best = _nearest(_hour_files(Path(hl_data), stem), at_ms)
     if best is None:
         raise ValueError(f"no book_{coin} snapshots under {hl_data}")
     return _snapshot(asset, best[1])

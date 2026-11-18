@@ -39,8 +39,12 @@ def schedule_tx(user, h, height, at_ms):
 class Window:
     """window = Window(tmp_path); window.block([...txs]); window.book(...); window.trade(...); window.write()"""
 
-    def __init__(self, root: Path, warmup_blocks: int = 0):
-        self.dir = root / "windows" / "w"
+    def __init__(self, root: Path, warmup_blocks: int = 0, name: str = "w", h0: int = H0, t0: int = T0,
+                 kind: str | None = None, status: str = "complete"):
+        """Several windows (e.g. chunks) can share one root: give each its own name, h0 and t0;
+        their recorder lines are appended to the shared hl_data hour files."""
+        self.dir = root / "windows" / name
+        self.h0, self.t0, self.kind, self.status = h0, t0, kind, status
         self.hl = root / "hl_data"
         self.blocks: list[tuple[int, int, list]] = []
         self.books: list[tuple[str, int, list, list]] = []
@@ -50,8 +54,8 @@ class Window:
         self.warmup_blocks = warmup_blocks
 
     def block(self, txs, dt_ms=None) -> int:
-        h = H0 + len(self.blocks)
-        t = T0 + (dt_ms if dt_ms is not None else 100 * len(self.blocks))
+        h = self.h0 + len(self.blocks)
+        t = self.t0 + (dt_ms if dt_ms is not None else 100 * len(self.blocks))
         for x in txs:
             x["block"] = h
             x["time"] = t
@@ -81,32 +85,35 @@ class Window:
                                                              "proposer": "0xp", "numTxs": len(txs), "txs": txs}}
             with gzip.open(self.dir / f"{h}.json.gz", "wt") as f:
                 json.dump(body, f)
-        meta = {"start_height": H0, "end_height": H0 + len(self.blocks) - 1, "status": "complete",
-                "warmup_end_height": H0 + self.warmup_blocks}
+        meta = {"start_height": self.h0, "end_height": self.h0 + len(self.blocks) - 1, "status": self.status,
+                "warmup_end_height": self.h0 + self.warmup_blocks}
+        if self.kind is not None:
+            meta["kind"] = self.kind
         (self.dir / "window.json").write_text(json.dumps(meta))
         if self.anchors is not None:
             (self.dir / "anchors.json").write_text(json.dumps(self.anchors))
-        hour = self.hl / dt.datetime.fromtimestamp(T0 / 1000, dt.UTC).strftime("%Y-%m-%d/%H")
-        hour.mkdir(parents=True)
+        hour = self.hl / dt.datetime.fromtimestamp(self.t0 / 1000, dt.UTC).strftime("%Y-%m-%d/%H")
+        hour.mkdir(parents=True, exist_ok=True)
         for coin in ("BTC", "ETH"):
             if not any(c == coin for c, *_ in self.books):
-                self.books.append((coin, T0, [], []))      # every coin needs a seed snapshot
-            with open(hour / f"book_{coin}.jsonl", "w") as f:
+                self.books.append((coin, self.t0, [], []))      # every coin needs a seed snapshot
+            with open(hour / f"book_{coin}.jsonl", "a") as f:
                 for c, t, bids, asks in self.books:
                     if c == coin:
                         lv = lambda xs: [{"px": p, "sz": s, "n": 1} for p, s in xs]
                         f.write(json.dumps({"msg": {"data": {"coin": c, "time": t,
                                                              "levels": [lv(bids), lv(asks)]}}}) + "\n")
-            with open(hour / f"trades_{coin}.jsonl", "w") as f:
+            with open(hour / f"trades_{coin}.jsonl", "a") as f:
                 for x in self.trades:
                     if x["coin"] == coin:
                         f.write(json.dumps({"msg": {"data": [x]}}) + "\n")
         for coin in ("BTC", "ETH"):
             rows = [m for m in self.bbos if m["data"]["coin"] == coin]
             if rows:
-                (hour / f"bbo_{coin}.jsonl").write_text("".join(json.dumps({"msg": m}) + "\n" for m in rows))
+                with open(hour / f"bbo_{coin}.jsonl", "a") as f:
+                    f.write("".join(json.dumps({"msg": m}) + "\n" for m in rows))
         if alo_status is not None:
-            with open(hour / "alo_status.jsonl", "w") as f:
+            with open(hour / "alo_status.jsonl", "a") as f:
                 for x in alo_status:
                     f.write(json.dumps({"recv_ms": 0, "msg": x}) + "\n")
         return self.dir, self.hl
