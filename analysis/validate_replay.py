@@ -395,7 +395,8 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         touch_reconcile=False, touch_n_cap=False, keep_known=False, skip_lead_in=False,
         snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
         outside_other_txs=False, other_position="end", placeholder_ttl_ms=None,
-        placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False):
+        placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False,
+        trade_learn=None):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
@@ -405,7 +406,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
                 other_position=other_position, placeholder_ttl_ms=placeholder_ttl_ms,
                 placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap,
-                reseed_keep_known=reseed_keep_known, engine=engine if engine is not None else Engine(stp=stp))
+                reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, engine=engine if engine is not None else Engine(stp=stp))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -557,6 +558,9 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
         res.update({f"ph:{k}": v for k, v in sorted(rp.ph_stats.items())})
     if obs.wildcard_pre_reseed_known:
         res["wildcard_pre_reseed_known"] = True
+    if rp.trade_learn is not None:                  # trade-learning flag: only when set
+        res["trade_learn"] = rp.trade_learn
+        res.update({f"learn:{k}": v for k, v in sorted(rp.learn_stats.items())})
     res.update(scope_metrics(scored))
     post = [r for r in rows if not r["warmup"]]
     res["excluded_real_maker_prewindow"] = sum(r["status"].startswith("excluded") for r in post)
@@ -720,6 +724,10 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="H11, LOOK-AHEAD (measurement only): cap re-seeded levels by the next snapshot + real trades")
     ap.add_argument("--reseed-keep-known", action="store_true",
                     help="H11: alias of --keep-known")
+    ap.add_argument("--trade-learn", choices=["sweep", "name", "both"],
+                    help="correct the book from each tx's real trades after it is applied (later txs only): "
+                         "sweep = remove what the real taker must have consumed; name = front placeholder at the "
+                         "last real price becomes the last real maker's order")
     ap.add_argument("--wildcard-pre-reseed-known", action="store_true",
                     help="H11 scoring (NOT approved, default off): with --keep-known, known engine orders placed "
                          "before the last re-seed score as WILDCARD")
@@ -735,7 +743,7 @@ def replay_kwargs(a) -> dict:
                 outside_other_txs=a.outside_other_txs, other_position=a.other_position,
                 placeholder_ttl_ms=a.placeholder_ttl_ms, placeholder_queue=a.placeholder_queue,
                 placeholder_cap=a.placeholder_cap, reseed_keep_known=a.reseed_keep_known,
-                wildcard_pre_reseed_known=a.wildcard_pre_reseed_known)
+                wildcard_pre_reseed_known=a.wildcard_pre_reseed_known, trade_learn=a.trade_learn)
 
 
 def options_tag(a) -> str:
@@ -752,7 +760,8 @@ def options_tag(a) -> str:
                     f"-phttl{a.placeholder_ttl_ms}" if a.placeholder_ttl_ms is not None else "",
                     "-phbehind" if a.placeholder_queue == "behind" else "",
                     "-phcapnext" if a.placeholder_cap else "", "-keepknown" if a.reseed_keep_known else "",
-                    "-wcknown" if a.wildcard_pre_reseed_known else ""])
+                    "-wcknown" if a.wildcard_pre_reseed_known else "",
+                    f"-tl{a.trade_learn}" if a.trade_learn else ""])
 
 
 def main(argv=None):

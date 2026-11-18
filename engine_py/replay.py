@@ -153,7 +153,8 @@ class Replay:
                  snapshot_shift: int = 0, outside_position: str = "end", outside_other_txs: bool = False,
                  other_position: str = "end",
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
-                 placeholder_cap: str | None = None, reseed_keep_known: bool = False):
+                 placeholder_cap: str | None = None, reseed_keep_known: bool = False,
+                 trade_learn: str | None = None):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -195,7 +196,18 @@ class Replay:
         reseed_keep_known=True: alias of keep_known=True (the deep dive's own re-implementation was
         dropped at integration; the refill placeholders are registered in ph_meta like seeded ones).
         `ph_meta` maps every placeholder oid to (seed snapshot time ms, rank of its price in that
-        snapshot side (0 = best), seeded lots, asset) for analyses."""
+        snapshot side (0 = best), seeded lots, asset) for analyses.
+        trade_learn (measurement, default None = off): after each tx's last action, the tx's REAL
+        trades (recorder, linked by hash) correct the book for LATER actions only; the tx itself was
+        already applied and scored. Uses no information from the future.
+          "sweep": a real taker that traded down to price w on a maker side consumed everything better
+                   than w on that side (price-time priority), so any order (known or placeholder) the
+                   engine still holds better than w is stale and is removed.
+          "name":  at w, the last real maker M (highest tid at w) may still rest there; if the engine's
+                   front order at w is a placeholder and M has no order at w, that placeholder becomes
+                   M's order (same size, still at the front). Guess: M's order may have been used up.
+          "both":  sweep, then name. Counters in `learn_stats`.
+        Zero-hash trades (outside fills) are not used: they are applied as fills already."""
         keep_known = keep_known or reseed_keep_known
         if other_position not in ("end", "start", "index"):
             raise ValueError(f"unknown other_position {other_position!r}")
@@ -241,6 +253,15 @@ class Replay:
         self.placeholder_ttl_ms, self.placeholder_queue = placeholder_ttl_ms, placeholder_queue
         self.placeholder_cap, self.reseed_keep_known = placeholder_cap, reseed_keep_known   # alias, see keep_known
         self.ph_stats: Counter = Counter()          # placeholder flag effects (lots / counts)
+        if trade_learn not in (None, "sweep", "name", "both"):
+            raise ValueError(f"unknown trade_learn {trade_learn!r}")
+        self.trade_learn = trade_learn
+        self.learn_stats: Counter = Counter()
+        self._real_trades: dict[str, list] = {}
+        if trade_learn is not None:
+            for tr in iter_trades(self.hl_data, COINS, self.t0, self.t1):
+                if tr.hash != ZERO_HASH:
+                    self._real_trades.setdefault(tr.hash, []).append(tr)
         self._seed()
 
         self.resolver: OidResolver | None = None
@@ -374,6 +395,43 @@ class Replay:
             self.ph_meta[oid] = (s.time_ms, ranks[(nd.order.side, nd.order.px)], nd.remaining, s.asset)
             if self.placeholder_ttl_ms is not None:
                 heapq.heappush(self._ph_heap, (s.time_ms, oid))
+
+    def _learn(self, tx_hash: str) -> None:
+        """trade_learn: correct the book from this tx's real trades (see __init__)."""
+        trades = self._real_trades.get(tx_hash)
+        if not trades:
+            return
+        eng = self.engine
+        groups: dict[tuple[int, Side], list] = {}
+        for tr in trades:
+            groups.setdefault((tr.asset, tr.taker_side.opposite), []).append(tr)
+        for (asset, side), trs in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1].value)):
+            coin = ASSETS[asset].name
+            levels = eng.books[asset].side(side)
+            w = min(t.px for t in trs) if side is Side.BUY else max(t.px for t in trs)
+            if self.trade_learn in ("sweep", "both"):
+                better = [px for px in levels.keys() if (px > w if side is Side.BUY else px < w)]
+                for px in better:
+                    for nd in list(levels[px]):
+                        kind = "placeholder" if nd.order.user == PLACEHOLDER else "known"
+                        self.learn_stats[f"swept_{kind}_orders:{coin}"] += 1
+                        self.learn_stats[f"swept_{kind}_lots:{coin}"] += nd.remaining
+                        eng._remove(nd.order.oid)
+            if self.trade_learn in ("name", "both"):
+                level = levels.get(w)
+                if level is None:
+                    continue
+                maker = max((t for t in trs if t.px == w), key=lambda t: t.tid).maker
+                nodes = list(level)
+                if any(nd.order.user == maker for nd in nodes) or nodes[0].order.user != PLACEHOLDER:
+                    continue
+                ph, q = nodes[0].order, nodes[0].remaining
+                eng._remove(ph.oid)
+                order = eng._new_order(maker, asset, side, w, q, Tif.GTC, None)
+                eng.books[asset].add(order, q, front=True)
+                eng.by_user.setdefault(maker, {})[order.oid] = None
+                self.learn_stats[f"named_orders:{coin}"] += 1
+                self.learn_stats[f"named_lots:{coin}"] += q
 
     def minute(self, time_ms: int) -> int:
         """Minute of window time, 0-based from the first block."""
@@ -529,10 +587,14 @@ class Replay:
             ordered, outside = self._ordered(b)
             fills: list[Fill] = []
             rejects: list[Reject] = []
-            for a in self._sequence(ordered, outside):
+            seq = self._sequence(ordered, outside)
+            for i, a in enumerate(seq):
                 f, r = self._apply(b, a)
                 fills += f
                 rejects += r
+                if (self.trade_learn is not None and not isinstance(a, OutsideFill)
+                        and (i + 1 == len(seq) or seq[i + 1].hash != a.hash)):
+                    self._learn(a.hash)
             eng.end_block(b.height, b.time_ms)
             minute = self.minute(b.time_ms)
             self.observer.after_block(self, b, minute)
