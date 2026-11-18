@@ -22,6 +22,7 @@ Analyses that need more than the yielded tuple subclass `Observer`; every hook i
 
 from __future__ import annotations
 
+import bisect
 import json
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -143,7 +144,8 @@ class Replay:
                  observer: Observer | None = None, engine: Engine | None = None,
                  alo_gate: str | None = None, gate_max_age_ms: int | None = None,
                  reconcile_known: str | None = None, reseed: bool = False,
-                 touch_reconcile: bool = False, touch_n_cap: bool = False):
+                 touch_reconcile: bool = False, touch_n_cap: bool = False,
+                 snapshot_shift: int = 0, outside_position: str = "end", outside_other_txs: bool = False):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -156,7 +158,13 @@ class Replay:
         touch_reconcile=True (needs recorded bbo): before every block, rule 8 against the latest bbo
         as a one-level snapshot, evicting known orders oldest first: nothing rests better than the
         real touch, and the touch level holds at most its real size. touch_n_cap=True also evicts
-        known orders (oldest first) while our touch level has more orders than bbo's n."""
+        known orders (oldest first) while our touch level has more orders than bbo's n.
+        Measurement flags (G1 triage; defaults = the rules above):
+        snapshot_shift=k applies each snapshot k blocks later (k < 0: earlier) than rule 8's
+        block; snapshots pushed outside the window are dropped (counted in `shift_dropped`).
+        outside_position="start" applies outside fills before the block's policy-ordered actions.
+        outside_other_txs=True: trades linked to non-book txs (SetGlobalAction) become outside fills
+        (data/parse.iter_window)."""
         self.window_dir = Path(window_dir)
         self.hl_data = Path(hl_data)
         self.policy = policy
@@ -165,7 +173,8 @@ class Replay:
         self.observer = observer or Observer()
         self.engine = engine or Engine()
         self.parse_stats = Stats()
-        self.blocks: list[Block] = list(iter_window(self.window_dir, self.hl_data, self.parse_stats))
+        self.blocks: list[Block] = list(iter_window(self.window_dir, self.hl_data, self.parse_stats,
+                                                              outside_other_txs=outside_other_txs))
         self.t0, self.t1 = self.blocks[0].time_ms, self.blocks[-1].time_ms
         meta_path = self.window_dir / "window.json"
         self.window_meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
@@ -191,6 +200,11 @@ class Replay:
             raise ValueError(f"unknown alo_gate {alo_gate!r}")
         self.alo_gate, self.gate_max_age_ms, self.reconcile_known = alo_gate, gate_max_age_ms, reconcile_known
         self.reseed = reseed
+        if outside_position not in ("end", "start"):
+            raise ValueError(f"unknown outside_position {outside_position!r}")
+        self.snapshot_shift, self.outside_position = snapshot_shift, outside_position
+        self.outside_other_txs = outside_other_txs
+        self.shift_dropped = 0
         if reseed:
             self.warmup_end_height = self.blocks[0].height     # every horizon starts from a snapshot
         self.touch: RealTouch | None = None
@@ -326,8 +340,17 @@ class Replay:
     def __iter__(self) -> Iterator[tuple[int, list[Fill], list[Reject], bytes | None]]:
         eng = self.engine
         state_hash: bytes | None = None
-        si = 0
-        snaps = self.snapshots
+        times = [b.time_ms for b in self.blocks]
+        at_block: dict[int, list] = {}               # block index -> snapshots applied after it
+        for s in self.snapshots:                    # rule 8: the last block with time <= s.time
+            bi = bisect.bisect_right(times, s.time_ms) - 1
+            if bi < 0:
+                continue                            # before the first block: the seed covers it
+            bi += self.snapshot_shift
+            if not 0 <= bi < len(self.blocks):
+                self.shift_dropped += 1
+                continue
+            at_block.setdefault(bi, []).append(s)
         for bi, b in enumerate(self.blocks):
             self.block_index = bi
             if self.touch is not None:
@@ -337,30 +360,26 @@ class Replay:
             ordered, outside = self._ordered(b)
             fills: list[Fill] = []
             rejects: list[Reject] = []
-            for a in [*ordered, *outside]:
+            for a in ([*outside, *ordered] if self.outside_position == "start" else [*ordered, *outside]):
                 f, r = self._apply(b, a)
                 fills += f
                 rejects += r
             eng.end_block(b.height, b.time_ms)
             minute = self.minute(b.time_ms)
             self.observer.after_block(self, b, minute)
-            nxt = self.blocks[bi + 1].time_ms if bi + 1 < len(self.blocks) else self.t1 + 1
-            while si < len(snaps) and snaps[si].time_ms < nxt:
-                s = snaps[si]
-                if s.time_ms >= b.time_ms:
-                    if self.reseed:
-                        res = eng.reconcile(s.asset, s.bids, s.asks)     # measure drift, then rebuild
-                        res.update(eng.clear(s.asset), reseed=1)
-                        for px, sz in s.bids:
-                            eng.seed(s.asset, Side.BUY, px, sz)
-                        for px, sz in s.asks:
-                            eng.seed(s.asset, Side.SELL, px, sz)
-                    else:
-                        res = eng.reconcile(s.asset, s.bids, s.asks, known=self.reconcile_known)
-                    for k, v in res.items():
-                        self.reconciled[(ASSETS[s.asset].name, k)] += v
-                    self.observer.after_reconcile(self, b, s, res, minute)
-                si += 1
+            for s in at_block.get(bi, ()):
+                if self.reseed:
+                    res = eng.reconcile(s.asset, s.bids, s.asks)     # measure drift, then rebuild
+                    res.update(eng.clear(s.asset), reseed=1)
+                    for px, sz in s.bids:
+                        eng.seed(s.asset, Side.BUY, px, sz)
+                    for px, sz in s.asks:
+                        eng.seed(s.asset, Side.SELL, px, sz)
+                else:
+                    res = eng.reconcile(s.asset, s.bids, s.asks, known=self.reconcile_known)
+                for k, v in res.items():
+                    self.reconciled[(ASSETS[s.asset].name, k)] += v
+                self.observer.after_reconcile(self, b, s, res, minute)
             if self.hasher is not None:
                 state_hash = self.hasher(eng, state_hash, b.height)
             yield b.height, fills, rejects, state_hash
