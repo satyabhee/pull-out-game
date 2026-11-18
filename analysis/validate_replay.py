@@ -349,7 +349,10 @@ class ValidateObserver(Observer):
         side = rec.side.opposite
         real = [(px, sz, m if self.quoted_since(m, rec.asset, side, px, rec.reseed_seq, rec.seq) else WILDCARD)
                 for px, sz, m in rec.real]
-        engine = [(px, sz, WILDCARD if m == PLACEHOLDER else m, oid) for px, sz, m, oid in rec.engine]
+        # a known engine order placed before the last re-seed (only with reseed_keep_known: the plain
+        # re-seed clears them) is pre-re-seed liquidity too, scored like a placeholder
+        engine = [(px, sz, WILDCARD if m == PLACEHOLDER or self.placed_seq.get(oid, rec.reseed_seq + 1) <= rec.reseed_seq
+                   else m, oid) for px, sz, m, oid in rec.engine]
         return real, engine
 
     def real_makers_in_window(self, rec: TxRecord) -> bool:
@@ -377,13 +380,16 @@ def book_text(book, side, depth=BOOK_DEPTH) -> str:
 def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
         alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False,
         touch_reconcile=False, touch_n_cap=False, snapshot_shift=0, outside_position="end", stp="cancel_taker",
-        observer_cls=None, engine=None, outside_other_txs=False):
+        observer_cls=None, engine=None, outside_other_txs=False, placeholder_ttl_ms=None,
+        placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
                 gate_max_age_ms=gate_max_age_ms, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
                 reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap,
                 snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
+                placeholder_ttl_ms=placeholder_ttl_ms, placeholder_queue=placeholder_queue,
+                placeholder_cap=placeholder_cap, reseed_keep_known=reseed_keep_known,
                 engine=engine if engine is not None else Engine(stp=stp))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
@@ -463,6 +469,11 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
               "outside_fill_other_tx": rp.parse_stats["outside_fill_other_tx"]}
     if (rp.snapshot_shift, rp.outside_position, rp.engine.stp, rp.outside_other_txs) != (0, "end", "cancel_taker", False):
         res.update(triage)                          # G1 triage flags: only when not the default
+    ph = {"placeholder_ttl_ms": rp.placeholder_ttl_ms, "placeholder_queue": rp.placeholder_queue,
+          "placeholder_cap": rp.placeholder_cap, "reseed_keep_known": rp.reseed_keep_known}
+    if tuple(ph.values()) != (None, "ahead", None, False):
+        res.update(ph)                              # H11 placeholder flags: only when not the default
+        res.update({f"ph:{k}": v for k, v in sorted(rp.ph_stats.items())})
     for scope, rs in [("all", scored)] + [(c, [r for r in scored if r["coin"] == c]) for c in COINS]:
         n = len(rs)
         m = sum(r["status"] == "match" for r in rs)
@@ -651,6 +662,13 @@ def main(argv=None):
     ap.add_argument("--outside-other-txs", action="store_true",
                     help="triage H9: trades linked to non-book txs (SetGlobalAction) become outside fills")
     ap.add_argument("--stp", choices=["cancel_taker", "expire_maker"], default="cancel_taker", help="triage H8")
+    ap.add_argument("--placeholder-ttl-ms", type=int, help="H11: placeholders expire this long after their snapshot")
+    ap.add_argument("--placeholder-queue", choices=["ahead", "behind"], default="ahead",
+                    help="H11: behind = known orders get priority over placeholders at a level")
+    ap.add_argument("--placeholder-cap", choices=["next"],
+                    help="H11, LOOK-AHEAD (measurement only): cap re-seeded levels by the next snapshot + real trades")
+    ap.add_argument("--reseed-keep-known", action="store_true",
+                    help="H11: with --reseed, keep known orders at each snapshot; seed only missing size, ahead")
     a = ap.parse_args(argv)
     tag = "".join([f"-gate{a.gate_max_age_ms if a.gate_max_age_ms is not None else ''}" if a.alo_gate else "",
                    f"-evict{a.evict_known}" if a.evict_known else "",
@@ -658,13 +676,18 @@ def main(argv=None):
                    "-touch" if a.touch_reconcile else "", "-ncap" if a.touch_n_cap else "",
                    f"-shift{a.snapshot_shift}" if a.snapshot_shift else "",
                    "-ofstart" if a.outside_position == "start" else "", "-stpexpire" if a.stp == "expire_maker" else "",
-                   "-ofother" if a.outside_other_txs else ""])
+                   "-ofother" if a.outside_other_txs else "",
+                   f"-phttl{a.placeholder_ttl_ms}" if a.placeholder_ttl_ms is not None else "",
+                   "-phbehind" if a.placeholder_queue == "behind" else "",
+                   "-phcapnext" if a.placeholder_cap else "", "-keepknown" if a.reseed_keep_known else ""])
     out = a.out or f"report/validate/{Path(a.window).name}-{a.policy}{tag}"
     run(a.window, a.hl_data, a.policy, out, a.anchors, not a.no_resolver, alo_gate=a.alo_gate,
         gate_max_age_ms=a.gate_max_age_ms, evict_known=a.evict_known, nearest_ratio=a.nearest_ratio,
         reseed=a.reseed, touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap,
         snapshot_shift=a.snapshot_shift, outside_position=a.outside_position, stp=a.stp,
-        outside_other_txs=a.outside_other_txs)
+        outside_other_txs=a.outside_other_txs, placeholder_ttl_ms=a.placeholder_ttl_ms,
+        placeholder_queue=a.placeholder_queue, placeholder_cap=a.placeholder_cap,
+        reseed_keep_known=a.reseed_keep_known)
     print(f"\nCSVs in {out}")
 
 

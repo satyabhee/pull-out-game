@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import heapq
 from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -137,6 +138,9 @@ class Observer:
     def after_reconcile(self, replay: "Replay", block: Block, snapshot, result: dict[str, int],
                         minute: int) -> None: ...
 
+    def before_reseed(self, replay: "Replay", block: Block, snapshot) -> None:
+        """reseed=True only: called before the asset's book is reconciled and rebuilt from `snapshot`."""
+
 
 class Replay:
     def __init__(self, window_dir, hl_data, policy: Policy, *, anchors=None, use_resolver: bool = True,
@@ -145,7 +149,9 @@ class Replay:
                  alo_gate: str | None = None, gate_max_age_ms: int | None = None,
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False,
-                 snapshot_shift: int = 0, outside_position: str = "end", outside_other_txs: bool = False):
+                 snapshot_shift: int = 0, outside_position: str = "end", outside_other_txs: bool = False,
+                 placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
+                 placeholder_cap: str | None = None, reseed_keep_known: bool = False):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -164,7 +170,20 @@ class Replay:
         block; snapshots pushed outside the window are dropped (counted in `shift_dropped`).
         outside_position="start" applies outside fills before the block's policy-ordered actions.
         outside_other_txs=True: trades linked to non-book txs (SetGlobalAction) become outside fills
-        (data/parse.iter_window)."""
+        (data/parse.iter_window).
+        Placeholder measurement flags (H11 deep dive; defaults = the rules above, outputs unchanged):
+        placeholder_ttl_ms=N: before each block, placeholders seeded more than N ms before the block
+        time are removed (anonymous liquidity is trusted for N ms only).
+        placeholder_queue="behind": whenever a known order rests at a level holding placeholders, the
+        placeholders move behind it (known orders get time priority over snapshot liquidity).
+        placeholder_cap="next" (LOOK-AHEAD, measurement only): each re-seeded level holds at most the
+        NEXT snapshot's size at that price plus the real lots traded there (maker side) until it;
+        prices outside the next snapshot's range keep the snapshot size.
+        reseed_keep_known=True (needs reseed): at each snapshot, rule 8 with oldest-first eviction
+        replaces the clear; only the size we lack is seeded, as placeholders AHEAD of the level's
+        known orders, so owners' cancels of pre-snapshot orders still reach them.
+        `ph_meta` maps every placeholder oid to (seed snapshot time ms, rank of its price in that
+        snapshot side (0 = best), seeded lots, asset) for analyses."""
         self.window_dir = Path(window_dir)
         self.hl_data = Path(hl_data)
         self.policy = policy
@@ -184,6 +203,17 @@ class Replay:
         self.placed_by: dict[int, Action] = {}     # engine oid -> the Place or Modify action itself
         self.block_index = -1                      # index of the block being applied
         self.seed_offsets: dict[str, int] = {}     # coin -> seed snapshot time - first block time (ms)
+        self.ph_meta: dict[int, tuple[int, int, int, int]] = {}   # placeholder oid -> (time, rank, lots, asset)
+        self._ph_heap: list[tuple[int, int]] = []                # (seed time, oid) min-heap (ttl)
+        if placeholder_queue not in ("ahead", "behind"):
+            raise ValueError(f"unknown placeholder_queue {placeholder_queue!r}")
+        if placeholder_cap not in (None, "next"):
+            raise ValueError(f"unknown placeholder_cap {placeholder_cap!r}")
+        if reseed_keep_known and not reseed:
+            raise ValueError("reseed_keep_known needs reseed=True")
+        self.placeholder_ttl_ms, self.placeholder_queue = placeholder_ttl_ms, placeholder_queue
+        self.placeholder_cap, self.reseed_keep_known = placeholder_cap, reseed_keep_known
+        self.ph_stats: Counter = Counter()          # placeholder flag effects (lots / counts)
         self._seed()
 
         self.resolver: OidResolver | None = None
@@ -210,6 +240,16 @@ class Replay:
         self.touch: RealTouch | None = None
         self.touch_reconcile, self.touch_n_cap = touch_reconcile, touch_n_cap
         self.touch_reconciled: Counter = Counter()  # (coin, trimmed|drift|evicted|...|n_capped) -> lots/orders
+        self._next_snap: dict[tuple[int, int], object] = {}
+        self._trades_by: dict[tuple, list] = {}
+        if placeholder_cap == "next":
+            last: dict[int, object] = {}
+            for s in self.snapshots:
+                if s.asset in last:
+                    self._next_snap[(last[s.asset].time_ms, s.asset)] = s
+                last[s.asset] = s
+            for tr in iter_trades(self.hl_data, COINS, self.t0 - TOUCH_LOOKBACK_MS, self.t1 + TOUCH_LOOKBACK_MS):
+                self._trades_by.setdefault((tr.asset, tr.taker_side.opposite, tr.px), []).append((tr.time_ms, tr.sz))
         if alo_gate == "touch" or touch_reconcile:
             lo = self.t0 - TOUCH_LOOKBACK_MS
             self.touch = RealTouch(
@@ -224,11 +264,101 @@ class Replay:
     def _seed(self) -> None:
         for coin in COINS:
             snap = nearest_book(self.hl_data, coin, self.t0)
-            for px, sz in snap.bids:
-                self.engine.seed(snap.asset, Side.BUY, px, sz)
-            for px, sz in snap.asks:
-                self.engine.seed(snap.asset, Side.SELL, px, sz)
+            self._seed_levels(snap.asset, snap.bids, snap.asks, snap.time_ms)
             self.seed_offsets[coin] = snap.time_ms - self.t0
+
+    def _seed_one(self, asset: int, side: Side, px: int, sz: int, time_ms: int, rank: int) -> int:
+        oid = self.engine.seed(asset, side, px, sz)
+        self.ph_meta[oid] = (time_ms, rank, sz, asset)
+        if self.placeholder_ttl_ms is not None:
+            heapq.heappush(self._ph_heap, (time_ms, oid))
+        return oid
+
+    def _seed_levels(self, asset: int, bids, asks, time_ms: int, sizes=None) -> None:
+        """One placeholder per snapshot level (tail of the level). sizes: {(side, px): lots} overrides."""
+        for side, levels in ((Side.BUY, bids), (Side.SELL, asks)):
+            for rank, (px, sz) in enumerate(levels):
+                q = sz if sizes is None else sizes.get((side, px), sz)
+                if q > 0:
+                    self._seed_one(asset, side, px, q, time_ms, rank)
+
+    def _seed_front(self, asset: int, side: Side, px: int, sz: int, time_ms: int, rank: int) -> None:
+        """A placeholder AHEAD of everything at that level (reseed_keep_known): the level's nodes are
+        taken out and put back, in their order, behind it. Orders keep their oid and remaining size."""
+        eng = self.engine
+        level = eng.books[asset].side(side).get(px)
+        nodes = [(nd.order, nd.remaining) for nd in level] if level is not None else []
+        for o, _ in nodes:
+            eng._remove(o.oid)
+        self._seed_one(asset, side, px, sz, time_ms, rank)
+        for o, q in nodes:
+            eng._rest(o, q)
+
+    def _expire_placeholders(self, now_ms: int) -> None:
+        eng = self.engine
+        while self._ph_heap and self._ph_heap[0][0] < now_ms - self.placeholder_ttl_ms:
+            _, oid = heapq.heappop(self._ph_heap)
+            asset = self.ph_meta[oid][3]
+            if oid in eng.books[asset]:
+                q = eng.books[asset].node(oid).remaining
+                eng._remove(oid)
+                self.ph_stats[f"ttl_expired_lots:{ASSETS[asset].name}"] += q
+                self.ph_stats["ttl_expired_orders"] += 1
+
+    def _placeholders_behind(self, oid: int, asset: int) -> None:
+        """placeholder_queue="behind": move the level's placeholders behind the order just rested."""
+        eng = self.engine
+        book = eng.books[asset]
+        if oid not in book:
+            return
+        o = book.node(oid).order
+        level = book.side(o.side)[o.px]
+        phs = [(nd.order.oid, nd.remaining) for nd in level if nd.order.user == PLACEHOLDER]
+        for ph, q in phs:
+            t, rank, lots, a = self.ph_meta[ph]
+            eng._remove(ph)
+            new = self._seed_one(asset, o.side, o.px, q, t, rank)
+            self.ph_meta[new] = (t, rank, lots, a)
+            self.ph_stats["moved_behind"] += 1
+
+    def _cap_sizes(self, s) -> dict:
+        """placeholder_cap="next" (look-ahead): {(side, px): lots} for snapshot s."""
+        nxt = self._next_snap.get((s.time_ms, s.asset))
+        if nxt is None:
+            return {}
+        out = {}
+        for side, levels, nlevels in ((Side.BUY, s.bids, nxt.bids), (Side.SELL, s.asks, nxt.asks)):
+            if not nlevels:
+                continue
+            nmap = dict(nlevels)
+            edge = min(nmap) if side is Side.BUY else max(nmap)
+            for px, sz in levels:
+                if (px >= edge) if side is Side.BUY else (px <= edge):
+                    traded = self._traded(s.asset, side, px, s.time_ms, nxt.time_ms)
+                    q = min(sz, nmap.get(px, 0) + traded)
+                    out[(side, px)] = q
+                    self.ph_stats[f"cap_removed_lots:{ASSETS[s.asset].name}"] += sz - q
+        return out
+
+    def _traded(self, asset, maker_side, px, t0, t1) -> int:
+        trs = self._trades_by.get((asset, maker_side, px), ())
+        i = bisect.bisect_left(trs, (t0, -1))
+        j = bisect.bisect_left(trs, (t1, -1))
+        return sum(q for _, q in trs[i:j])
+
+    def _reseed_keep_known(self, s) -> dict[str, int]:
+        eng = self.engine
+        res = eng.reconcile(s.asset, s.bids, s.asks, known="oldest")
+        added = 0
+        for side, levels in ((Side.BUY, s.bids), (Side.SELL, s.asks)):
+            for rank, (px, sz) in enumerate(levels):
+                level = eng.books[s.asset].side(side).get(px)
+                have = level.total if level is not None else 0
+                if sz > have:
+                    self._seed_front(s.asset, side, px, sz - have, s.time_ms, rank)
+                    added += sz - have
+        res.update(reseed=1, keep_known_added=added)
+        return res
 
     def minute(self, time_ms: int) -> int:
         """Minute of window time, 0-based from the first block."""
@@ -332,6 +462,8 @@ class Replay:
             self.placed_by[created] = action
             if self.resolver is not None:
                 self.resolver.note(action, created)
+            if self.placeholder_queue == "behind":
+                self._placeholders_behind(created, action.asset)
         if isinstance(action, OutsideFill):
             self.outside_fill_log.append((block.height, action.tid, action.sz - sum(f.sz for f in fills)))
         self.observer.after_action(self, block, action, fills, rejects, created)
@@ -357,6 +489,8 @@ class Replay:
                 self.touch.advance(b.time_ms)
             if self.touch_reconcile:
                 self._reconcile_touch()
+            if self.placeholder_ttl_ms is not None:
+                self._expire_placeholders(b.time_ms)
             ordered, outside = self._ordered(b)
             fills: list[Fill] = []
             rejects: list[Reject] = []
@@ -369,12 +503,14 @@ class Replay:
             self.observer.after_block(self, b, minute)
             for s in at_block.get(bi, ()):
                 if self.reseed:
+                    self.observer.before_reseed(self, b, s)
+                if self.reseed and self.reseed_keep_known:
+                    res = self._reseed_keep_known(s)
+                elif self.reseed:
                     res = eng.reconcile(s.asset, s.bids, s.asks)     # measure drift, then rebuild
                     res.update(eng.clear(s.asset), reseed=1)
-                    for px, sz in s.bids:
-                        eng.seed(s.asset, Side.BUY, px, sz)
-                    for px, sz in s.asks:
-                        eng.seed(s.asset, Side.SELL, px, sz)
+                    self._seed_levels(s.asset, s.bids, s.asks, s.time_ms,
+                                      self._cap_sizes(s) if self.placeholder_cap == "next" else None)
                 else:
                     res = eng.reconcile(s.asset, s.bids, s.asks, known=self.reconcile_known)
                 for k, v in res.items():
