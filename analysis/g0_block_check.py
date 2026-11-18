@@ -2,10 +2,9 @@
 
     python -m analysis.g0_block_check <window_dir> --hl-data <dir> [--height H] [--reconcile] [--all]
 
-Seeds placeholders from the L2 snapshot nearest the first block, applies blocks in
-listing order (the "actual" policy is decided at G1), applies outside fills at the end
-of each block, optionally reconciles placeholders against later snapshots (rule 8),
-and compares, per taker tx, the engine's fills with the real ones on price and size.
+Runs engine_py/replay.Replay in listing order (the "actual" policy is decided at G1),
+without the int-oid resolver (the G0 setup); rule 8 reconciliation only with
+--reconcile. Compares, per taker tx, the engine's fills with the real ones on price and size.
 
 Prints a detailed table for one block (default: the first BTC block with a linked
 trade). With --all, also scores every linked taker tx in the window.
@@ -16,11 +15,10 @@ from __future__ import annotations
 import argparse
 from collections import Counter, defaultdict
 
-from data.parse import iter_books, iter_trades, iter_window, nearest_book
-from engine_py.matching import PLACEHOLDER, Engine
-from engine_py.types import ASSETS, Modify, OutsideFill, Place, Side, ZERO_HASH
-
-COINS = ("BTC", "ETH")
+from data.parse import iter_trades, nearest_book
+from engine_py.matching import PLACEHOLDER
+from engine_py.replay import COINS, Observer, Replay, listing
+from engine_py.types import ASSETS, Modify, OutsideFill, Place, ZERO_HASH
 
 
 def by_px(fills):
@@ -53,22 +51,36 @@ def top(book, side, n=4):
     return out
 
 
-def run(window, hl_data, height=None, reconcile=False, score_all=False):
-    blocks = list(iter_window(window, hl_data))
-    t0, t1 = blocks[0].time_ms, blocks[-1].time_ms
+class _G0Observer(Observer):
+    """Collect engine taker fills by hash and the opposite book before the chosen block's takers."""
 
-    eng = Engine()
+    def __init__(self, real, height):
+        self.real, self.height = real, height
+        self.engine_fills = defaultdict(list)          # taker hash -> [(px, sz, maker)]
+        self.before = {}                               # taker hash -> opposite top levels before it ran
+
+    def before_action(self, rp, block, a):
+        if block.height == self.height and isinstance(a, (Place, Modify)) and a.hash in self.real \
+                and a.hash not in self.before:
+            p = a if isinstance(a, Place) else a.new
+            self.before[a.hash] = top(rp.engine.books[p.asset], p.side.opposite)
+
+    def after_action(self, rp, block, a, fills, rejects, created):
+        if not isinstance(a, OutsideFill):
+            for f in fills:
+                self.engine_fills[f.taker_hash].append((f.px, f.sz, f.maker_user))
+
+
+def run(window, hl_data, height=None, reconcile=False, score_all=False):
+    rp = Replay(window, hl_data, listing, use_resolver=False)
+    if not reconcile:
+        rp.snapshots = []
+    blocks, t0, t1 = rp.blocks, rp.t0, rp.t1
     for coin in COINS:
         snap = nearest_book(hl_data, coin, t0)
-        for px, sz in snap.bids:
-            eng.seed(snap.asset, Side.BUY, px, sz)
-        for px, sz in snap.asks:
-            eng.seed(snap.asset, Side.SELL, px, sz)
-        print(f"seeded {coin} from snapshot {snap.time_ms - t0:+d} ms vs first block: "
+        print(f"seeded {coin} from snapshot {rp.seed_offsets[coin]:+d} ms vs first block: "
               f"{len(snap.bids)} bid / {len(snap.asks)} ask levels")
-
-    snaps = sorted((s for coin in COINS for s in iter_books(hl_data, coin, t0, t1)),
-                   key=lambda s: (s.time_ms, s.asset)) if reconcile else []
+    snaps = rp.snapshots
 
     real = defaultdict(list)          # taker hash -> [(px, sz, maker)]
     real_meta = {}
@@ -88,26 +100,12 @@ def run(window, hl_data, height=None, reconcile=False, score_all=False):
             raise SystemExit("no linked BTC trade in this window")
         height = btc[0]
 
-    engine_fills = defaultdict(list)
-    before = {}                        # taker hash -> opposite top levels before it ran
-    recon = Counter()
-    si = 0
-    for i, b in enumerate(blocks):
-        for a in b.actions:
-            if b.height == height and isinstance(a, (Place, Modify)) and a.hash in real and a.hash not in before:
-                p = a if isinstance(a, Place) else a.new
-                before[a.hash] = top(eng.books[p.asset], p.side.opposite)
-            fills, _ = eng.apply(a)
-            if not isinstance(a, OutsideFill):
-                for f in fills:
-                    engine_fills[f.taker_hash].append((f.px, f.sz, f.maker_user))
-        eng.end_block(b.height, b.time_ms)
-        nxt = blocks[i + 1].time_ms if i + 1 < len(blocks) else t1 + 1
-        while si < len(snaps) and snaps[si].time_ms < nxt:
-            s = snaps[si]
-            if s.time_ms >= b.time_ms:
-                recon.update({(ASSETS[s.asset].name, k): v for k, v in eng.reconcile(s.asset, s.bids, s.asks).items()})
-            si += 1
+    obs = _G0Observer(real, height)
+    rp.observer = obs
+    for _ in rp:
+        pass
+    engine_fills, before = obs.engine_fills, obs.before
+    recon = Counter({(coin, k): v for (coin, k), v in rp.reconciled.items()})
 
     # ---- the one block
     print(f"\nblock {height}  (policy: listing order, reconcile={'on' if reconcile else 'off'})")

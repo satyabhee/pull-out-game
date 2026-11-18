@@ -32,3 +32,6 @@ g0_anchors.json
 AGENT_PLAN.md
 CLAUDE.local.md
 collect/explorer.lock
+
+# derived validation outputs (regenerate with analysis.validate_replay)
+report/validate/

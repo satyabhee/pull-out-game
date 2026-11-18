@@ -1,4 +1,594 @@
-"""Replayed fills vs real fills: match rate + mismatch triage table.
+"""Replayed vs real fills: match rate overall / per asset / per minute, and the mismatch table.
 
-TODO
+    python -m analysis.validate_replay <window_dir> --hl-data <dir> [--policy listing] [--out DIR]
+                                       [--anchors FILE] [--no-resolver]
+                                       [--alo-gate touch [--gate-max-age-ms MS]] [--evict-known oldest|newest]
+
+Unit of scoring: one taker tx (hash). Real fills = recorded trades with that hash; engine
+fills = the engine's taker fills for that hash's actions (outside fills never count).
+
+Scored population (section 4 / ENGINE_WINDOW_RULES rule 4), decided from the chain side only
+so it cannot depend on engine behavior:
+  - the tx is in the window and its block is at or after warmup_end_height (per-minute rows
+    also show the warm-up minutes, flagged);
+  - it has real fills or engine fills (txs with neither are not trades);
+  - every real maker placed an order in the window on that side and price before the tx
+    ("maker order placed after window start"; HL maker oids are not public, so this is the
+    observable proxy). Txs failing this are reported as excluded: real maker pre-window.
+
+Match: same fills per (price, maker address), size summed: exact. `match_px_sz` relaxes to
+per-price size only (the G0 criterion).
+
+Mismatch category, first that applies (every flag is also written per tx):
+  outside-fill timing    an outside fill hit this asset in the same block, or one found no maker
+  wrong ALO decision     an ALO in play (an engine maker order, or a real maker's ALO at that
+                         price) whose engine decision contradicts alo_status.jsonl, joined by
+                         (block, hash, item)
+  unknown pre-window order  the engine filled against placeholder liquidity
+  unresolved cancel      an engine maker order that an unresolved int-oid cancel/modify by its owner
+                         (sent after it was placed) may have targeted: the cancel's oid is within
+                         the resolver's tolerance of the order's estimated oid. Missed cloid cancels
+                         name a cloid we don't hold, so they can't be pinned to an order.
+  ordering               same size at every price as the chain, different makers (queue position)
+  margin rejection (unobservable)  an engine maker order whose owner is not among the real makers:
+                         the order likely never rested on chain (silent reject)
+  real bug (unexplained) none of the above; the first 20 come with the book before the tx
+
+Informational flag (not a category): "info: engine rejected a real maker's ALO at that price",
+set without needing alo_status truth, to size the unverified share of lead (b).
+
+Outputs (CSV, in --out): summary.csv, per_minute.csv, mismatches.csv, txs.csv, alo_truth.csv,
+first_mismatches.csv.
 """
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import csv
+import gzip
+import json
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from data.parse import iter_trades
+from engine_py.matching import PLACEHOLDER
+from engine_py.replay import COINS, OUTSIDE_FILL_POSITION, Observer, Replay, listing
+from engine_py.types import (ASSETS, Cancel, CancelByCloid, Modify, OutsideFill, Place, RejectReason, Side,
+                             Tif, ZERO_HASH)
+
+POLICIES = {"listing": listing}
+
+CATEGORIES = ("outside-fill timing", "wrong ALO decision", "unknown pre-window order", "unresolved cancel",
+              "ordering", "margin rejection (unobservable)", "real bug (unexplained)")
+INFO_ALO_REJECTED = "info: engine rejected a real maker's ALO at that price"   # a flag, not a category
+FIRST_N = 20
+BOOK_DEPTH = 5
+WILDCARD = "*"                       # horizon mode: a maker whose order predates the last re-seed
+HORIZON_BUCKETS_MS = (2000, 4000, 6000, 8000, 10000, 12000)
+
+
+# ------------------------------------------------------------------ ALO ground truth
+
+def alo_truth_class(answer: dict) -> str:
+    """orderStatus answer -> 'rejected_alo' | 'rejected_other' | 'accepted' | 'unknown'."""
+    if not isinstance(answer, dict) or answer.get("status") != "order":
+        return "unknown"
+    st = answer.get("order", {}).get("status", "")
+    if st == "badAloPxRejected":
+        return "rejected_alo"
+    if st.endswith("Rejected"):
+        return "rejected_other"
+    return "accepted" if st else "unknown"
+
+
+def load_alo_status(hl_data, heights: range | None = None) -> dict[tuple[int, str, int], dict]:
+    """(block, hash, item) -> {"truth": class, "status": raw status} from every alo_status file."""
+    out = {}
+    for path in sorted(Path(hl_data).glob("*/*/alo_status.jsonl*")):
+        opener = gzip.open if path.suffix == ".gz" else open
+        with opener(path, "rt") as f:
+            for line in f:
+                try:
+                    m = json.loads(line)["msg"]
+                except (json.JSONDecodeError, KeyError):
+                    continue                        # the open hour's last line can be cut mid-write
+                if heights is not None and m.get("block") not in heights:
+                    continue
+                ans = m.get("answer", {})
+                out[(m["block"], m["hash"], m["item"])] = {
+                    "truth": alo_truth_class(ans),
+                    "status": ans.get("order", {}).get("status", ans.get("status")) if isinstance(ans, dict) else None}
+    return out
+
+
+# ------------------------------------------------------------------ per-tx record + rules
+
+@dataclass
+class TxRecord:
+    hash: str
+    asset: int
+    block: int
+    minute: int
+    seq: int                                   # replay position of the tx's first action
+    side: Side                                 # taker side (of its first order item)
+    real: list = field(default_factory=list)   # [(px, sz, maker)]
+    engine: list = field(default_factory=list) # [(px, sz, maker, engine maker oid)]
+    flags: set = field(default_factory=set)
+    book_before: str = ""
+    reseed_seq: int = 0                        # horizon mode: seq of the asset's last re-seed before the tx
+    horizon_ms: int | None = None              # horizon mode: time since that re-seed
+
+
+def notional(fills) -> int:
+    """Sum of px * sz. Ticks x lots is micro-USD for both BTC (0.1 x 1e-5) and ETH (0.01 x 1e-4),
+    so BTC and ETH add up. Integers only."""
+    return sum(f[0] * f[1] for f in fills)
+
+
+def matched_notional(real, engine, key) -> int:
+    """Notional both sides agree on, per `key` group (min of the two sizes)."""
+    r, e = dict(agg(real, key)), dict(agg(engine, key))
+    return sum(min(q, e.get(k, 0)) * k_px(k) for k, q in r.items())
+
+
+def k_px(k):
+    return k[0] if isinstance(k, tuple) else k
+
+
+def agg(fills, key) -> list:
+    c = Counter()
+    for f in fills:
+        c[key(f)] += f[1]
+    return sorted(c.items())
+
+
+def is_match(real, engine) -> bool:
+    return agg(real, lambda f: (f[0], f[2])) == agg(engine, lambda f: (f[0], f[2]))
+
+
+def is_match_px_sz(real, engine) -> bool:
+    return agg(real, lambda f: f[0]) == agg(engine, lambda f: f[0])
+
+
+def categorize(flags: set) -> str:
+    """The first category (in CATEGORIES precedence) among the tx's flags."""
+    for c in CATEGORIES[:-1]:
+        if c in flags:
+            return c
+    return CATEGORIES[-1]
+
+
+class ValidateObserver(Observer):
+    def __init__(self, real_by_hash: dict, alo_truth: dict):
+        self.real_by_hash = real_by_hash
+        self.alo_truth = alo_truth
+        self.seq = 0
+        self.txs: dict[str, TxRecord] = {}
+        self.first_quote: dict[tuple, int] = {}        # (user, asset, maker side, px) -> first seq
+        self.quote_seqs: dict[tuple, list] = defaultdict(list)   # same key -> every placement seq (ascending)
+        self.reseed_seq: dict[int, int] = {}            # asset -> seq of its last re-seed
+        self.reseed_time: dict[int, int] = {}           # asset -> snapshot time of its last re-seed
+        self.alo_ids: dict[tuple, list] = defaultdict(list)   # (user, asset, side, px) -> [(seq, key, accepted)]
+        self.placed_seq: dict[int, int] = {}            # engine oid -> seq
+        self.unresolved: dict[tuple, list] = defaultdict(list)   # (user, asset) -> [(seq, hl oid)] int-oid misses
+        self.outside_blocks: dict[tuple, int] = Counter()   # (block, asset) -> outside fills
+        self.no_maker_blocks: set = set()
+        self.alo_confusion: Counter = Counter()         # (engine decision, truth) -> n
+        self.minute_stats: dict[tuple, Counter] = defaultdict(Counter)   # (minute, coin) -> counters
+        self.resting: dict[tuple, int] = {}             # (minute, coin) -> known orders resting at its end
+
+    # ---------------------------------------------------------- hooks
+    def before_action(self, rp, block, a):
+        self.seq += 1
+        p = a.new if isinstance(a, Modify) else a
+        if isinstance(p, Place):
+            self.first_quote.setdefault((a.user, p.asset, p.side, p.px), self.seq)
+            self.quote_seqs[(a.user, p.asset, p.side, p.px)].append(self.seq)
+            if p.tif is not Tif.ALO:
+                self._open_tx(rp, block, a, p)
+
+    def _open_tx(self, rp, block, a, p):
+        if a.hash in self.txs:
+            return
+        rec = TxRecord(hash=a.hash, asset=p.asset, block=block.height, minute=rp.minute(block.time_ms),
+                       seq=self.seq, side=p.side, reseed_seq=self.reseed_seq.get(p.asset, 0))
+        if rp.reseed:
+            rec.horizon_ms = block.time_ms - self.reseed_time.get(p.asset, rp.t0)
+        rec.book_before = book_text(rp.engine.books[p.asset], p.side.opposite)
+        self.txs[a.hash] = rec
+
+    def after_action(self, rp, block, a, fills, rejects, created):
+        coin = ASSETS[a.asset].name if hasattr(a, "asset") else None
+        ms = self.minute_stats[(rp.minute(block.time_ms), coin)] if coin else Counter()
+        reasons = {r.reason for r in rejects}
+        p = a.new if isinstance(a, Modify) else a
+        if created is not None:
+            self.placed_seq[created] = self.seq
+        if isinstance(p, Place) and p.tif is Tif.ALO:
+            accepted = RejectReason.ALO_WOULD_CROSS not in reasons
+            ms["alo_total"] += 1
+            ms["alo_rejected"] += not accepted
+            key = (a.block, a.hash, a.item_index)
+            self.alo_ids[(a.user, p.asset, p.side, p.px)].append((self.seq, key, accepted))
+            t = self.alo_truth.get(key)
+            if t is not None:
+                self.alo_confusion[("accepted" if accepted else "rejected", t["truth"])] += 1
+        if isinstance(a, (Cancel, CancelByCloid)):
+            kind = "oid" if isinstance(a, Cancel) else "cloid"
+            ms[f"{kind}_cancels"] += 1
+            ms[f"{kind}_unknown"] += RejectReason.UNKNOWN_ORDER in reasons
+        if RejectReason.UNKNOWN_ORDER in reasons:
+            hl_oid = a.oid if isinstance(a, Cancel) else a.target if isinstance(a, Modify) else None
+            if isinstance(hl_oid, int):                 # a missed cloid names no order we hold: not linkable
+                self.unresolved[(a.user, a.asset)].append((self.seq, hl_oid))
+        if isinstance(a, OutsideFill):
+            self.outside_blocks[(block.height, a.asset)] += 1
+            if RejectReason.NO_MAKER in reasons:
+                self.no_maker_blocks.add((block.height, a.asset))
+            return
+        if fills:
+            if a.hash not in self.txs:
+                self._open_tx(rp, block, a, p)          # unreachable for ALOs; GTC/IOC opened before
+            rec = self.txs[a.hash]
+            rec.engine += [(f.px, f.sz, f.maker_user, f.maker_order) for f in fills]
+
+    def after_block(self, rp, block, minute):
+        """Known orders resting at the end of each minute's last block (O(book), so once a minute)."""
+        nxt = rp.block_index + 1
+        if nxt < len(rp.blocks) and rp.minute(rp.blocks[nxt].time_ms) == minute:
+            return
+        for asset in sorted(ASSETS):
+            book = rp.engine.books[asset]
+            n = sum(1 for side in (Side.BUY, Side.SELL) for lv in book.levels(side) for nd in lv
+                    if nd.order.user != PLACEHOLDER)
+            self.resting[(minute, ASSETS[asset].name)] = n
+
+    def after_reconcile(self, rp, block, s, result, minute):
+        ms = self.minute_stats[(minute, ASSETS[s.asset].name)]
+        ms["snapshots"] += 1
+        for k, v in result.items():
+            ms[k] += v
+        if result.get("reseed"):
+            self.reseed_seq[s.asset] = self.seq
+            self.reseed_time[s.asset] = s.time_ms
+
+    # ---------------------------------------------------------- scoring
+    def flags_for(self, rec: TxRecord, rp) -> set:
+        flags = set()
+        if self.outside_blocks.get((rec.block, rec.asset)) or (rec.block, rec.asset) in self.no_maker_blocks:
+            flags.add("outside-fill timing")
+        real_makers = {m for _, _, m in rec.real}
+        for px, sz, maker, oid in rec.engine:
+            if maker == PLACEHOLDER:
+                flags.add("unknown pre-window order")
+                continue
+            key_action = rp.placed_by.get(oid)
+            if key_action is not None:
+                t = self.alo_truth.get((key_action.block, key_action.hash, key_action.item_index))
+                if t is not None and t["truth"] in ("rejected_alo", "rejected_other"):
+                    flags.add("wrong ALO decision")     # engine rested an ALO the chain rejected
+            if self._missed_cancel_could_target(rp, oid, maker, rec):
+                flags.add("unresolved cancel")
+            if maker not in real_makers:
+                flags.add("margin rejection (unobservable)")
+        maker_side = rec.side.opposite
+        for px, sz, maker in rec.real:
+            for seq, key, accepted in self.alo_ids.get((maker, rec.asset, maker_side, px), ()):
+                if seq >= rec.seq or accepted:
+                    continue
+                flags.add(INFO_ALO_REJECTED)            # informational: no truth needed
+                t = self.alo_truth.get(key)
+                if t is not None and t["truth"] == "accepted":
+                    flags.add("wrong ALO decision")     # engine rejected an ALO the chain rested
+        if is_match_px_sz(rec.real, rec.engine) and not is_match(rec.real, rec.engine):
+            flags.add("ordering")
+        return flags
+
+    def _missed_cancel_could_target(self, rp, oid, maker, rec) -> bool:
+        """An int-oid cancel/modify by the maker, after the order was placed and before this tx, that
+        the engine could not resolve, and whose oid is within the resolver's tolerance of this order's
+        estimated oid (so it may have been meant for it)."""
+        est = rp.resolver.hl.get(oid) if rp.resolver is not None else None
+        if est is None:
+            return False
+        e, tol = est
+        placed = self.placed_seq.get(oid, 0)
+        return any(placed < s < rec.seq and abs(e - hl) <= tol for s, hl in self.unresolved.get((maker, rec.asset), ()))
+
+    def quoted_since(self, user, asset, side, px, after_seq, before_seq) -> bool:
+        seqs = self.quote_seqs.get((user, asset, side, px), [])
+        i = bisect.bisect_right(seqs, after_seq)
+        return i < len(seqs) and seqs[i] < before_seq
+
+    def effective(self, rec: TxRecord) -> tuple[list, list]:
+        """Horizon mode: real makers that placed nothing at that side/price since the last re-seed,
+        and engine placeholder fills, both become WILDCARD (price/size scoring for pre-re-seed
+        liquidity, strict maker scoring for orders placed after it)."""
+        side = rec.side.opposite
+        real = [(px, sz, m if self.quoted_since(m, rec.asset, side, px, rec.reseed_seq, rec.seq) else WILDCARD)
+                for px, sz, m in rec.real]
+        engine = [(px, sz, WILDCARD if m == PLACEHOLDER else m, oid) for px, sz, m, oid in rec.engine]
+        return real, engine
+
+    def real_makers_in_window(self, rec: TxRecord) -> bool:
+        """Every real maker placed an order (accepted by the engine or not) on that side and price
+        in the window before this tx."""
+        return all(self.first_quote.get((m, rec.asset, rec.side.opposite, px), rec.seq) < rec.seq
+                   for px, _, m in rec.real)
+
+
+def book_text(book, side, depth=BOOK_DEPTH) -> str:
+    spec = ASSETS[book.asset]
+    parts = []
+    for lv in book.levels(side):
+        ph = sum(nd.remaining for nd in lv if nd.order.user == PLACEHOLDER)
+        known = len([nd for nd in lv if nd.order.user != PLACEHOLDER])
+        parts.append(f"{spec.ticks_to_px(lv.px)} {spec.lots_to_sz(lv.total)} "
+                     f"(placeholder {spec.lots_to_sz(ph)}, {known} known)")
+        if len(parts) == depth:
+            break
+    return f"{side.name} side: " + "; ".join(parts)
+
+
+# ------------------------------------------------------------------ run
+
+def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
+        alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False):
+    policy = POLICIES[policy_name]
+    rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
+                gate_max_age_ms=gate_max_age_ms, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
+                reseed=reseed)
+    heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
+    real_by_hash: dict[str, list] = defaultdict(list)
+    for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
+        if tr.hash != ZERO_HASH:
+            real_by_hash[tr.hash].append(tr)
+    alo_truth = load_alo_status(hl_data, heights)
+    obs = ValidateObserver(real_by_hash, alo_truth)
+    rp.observer = obs
+    for _ in rp:
+        pass
+
+    window_hashes = {a.hash for b in rp.blocks for a in b.actions if not isinstance(a, OutsideFill)}
+    for h, trs in real_by_hash.items():
+        rec = obs.txs.get(h)
+        if rec is None:
+            continue                                    # ALO-only tx or not in window
+        rec.real = [(t.px, t.sz, t.maker) for t in trs]
+    unlinked = sum(1 for h in real_by_hash if h not in window_hashes)
+
+    rows = []
+    for rec in sorted(obs.txs.values(), key=lambda r: r.seq):
+        if not rec.real and not rec.engine:
+            continue
+        warm = rec.block < rp.warmup_end_height
+        real, engine = obs.effective(rec) if rp.reseed else (rec.real, rec.engine)
+        if not rp.reseed and rec.real and not obs.real_makers_in_window(rec):
+            status, cat, flags = "excluded: real maker pre-window", "", set()
+        else:
+            m = is_match(real, engine)
+            flags = set() if m else obs.flags_for(rec, rp)
+            status, cat = ("match", "") if m else ("mismatch", categorize(flags))
+        rows.append(dict(hash=rec.hash, block=rec.block, minute=rec.minute, coin=ASSETS[rec.asset].name,
+                         warmup=int(warm), status=status, category=cat,
+                         horizon_ms="" if rec.horizon_ms is None else rec.horizon_ms,
+                         match_px_sz=int(is_match_px_sz(real, engine)),
+                         real_notional=notional(real), engine_notional=notional(engine),
+                         matched_notional=matched_notional(real, engine, lambda f: (f[0], f[2])),
+                         matched_notional_px=matched_notional(real, engine, lambda f: f[0]),
+                         real_only=int(bool(rec.real) and not rec.engine),
+                         engine_only=int(bool(rec.engine) and not rec.real),
+                         flags="|".join(sorted(flags)),
+                         real=fmt_fills(rec.asset, rec.real), engine=fmt_fills(rec.asset, [f[:3] for f in rec.engine]),
+                         book_before=rec.book_before))
+
+    result = summarize(rp, obs, rows, unlinked, policy_name)
+    if out_dir is not None:
+        write_csvs(Path(out_dir), result, rows, obs)
+    if not quiet:
+        print_report(result)
+    return result, rows
+
+
+def fmt_fills(asset, fills) -> str:
+    spec = ASSETS[asset]
+    return "; ".join(f"{spec.lots_to_sz(sz)}@{spec.ticks_to_px(px)} {m[:10]}"
+                     for (px, m), sz in agg(fills, lambda f: (f[0], f[2])))
+
+
+def rate(n, d):
+    return f"{n / d:.4f}" if d else ""
+
+
+def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
+    scored = [r for r in rows if not r["warmup"] and r["status"] in ("match", "mismatch")]
+    res = {"window": rp.window_dir.name, "policy": policy_name, "outside_fill_position": OUTSIDE_FILL_POSITION,
+           "blocks": len(rp.blocks), "warmup_end_height": rp.warmup_end_height,
+           "resolver": "on" if rp.resolver is not None else "off",
+           "alo_gate": rp.alo_gate or "off", "gate_max_age_ms": rp.gate_max_age_ms if rp.gate_max_age_ms is not None else "",
+           "evict_known": rp.reconcile_known or "off",
+           "nearest_ratio": rp.resolver.nearest_ratio if rp.resolver is not None else "",
+           "reseed": "every snapshot" if rp.reseed else "off",
+           "real_linked_txs_not_in_window": unlinked}
+    for scope, rs in [("all", scored)] + [(c, [r for r in scored if r["coin"] == c]) for c in COINS]:
+        n = len(rs)
+        m = sum(r["status"] == "match" for r in rs)
+        res[f"{scope}:scored"] = n
+        res[f"{scope}:matched"] = m
+        res[f"{scope}:match_rate"] = rate(m, n)
+        res[f"{scope}:match_rate_px_sz"] = rate(sum(r["match_px_sz"] for r in rs), n)
+        realrs = [r for r in rs if not r["engine_only"]]
+        res[f"{scope}:match_rate_real_linked_only"] = rate(sum(r["status"] == "match" for r in realrs), len(realrs))
+        res[f"{scope}:engine_only_txs"] = sum(r["engine_only"] for r in rs)
+        rn, en = sum(r["real_notional"] for r in rs), sum(r["engine_notional"] for r in rs)
+        res[f"{scope}:fill_recall"] = rate(sum(r["matched_notional"] for r in rs), rn)
+        res[f"{scope}:fill_precision"] = rate(sum(r["matched_notional"] for r in rs), en)
+        res[f"{scope}:fill_recall_px_sz"] = rate(sum(r["matched_notional_px"] for r in rs), rn)
+        res[f"{scope}:fill_precision_px_sz"] = rate(sum(r["matched_notional_px"] for r in rs), en)
+    post = [r for r in rows if not r["warmup"]]
+    res["excluded_real_maker_prewindow"] = sum(r["status"].startswith("excluded") for r in post)
+    res["warmup_txs"] = sum(r["warmup"] for r in rows)
+    mism = [r for r in scored if r["status"] == "mismatch"]
+    res["mismatch_table"] = {(cat, coin): sum(1 for r in mism if r["category"] == cat and r["coin"] == coin)
+                             for cat in CATEGORIES for coin in COINS}
+    res["flag_table"] = {cat: sum(1 for r in mism if cat in r["flags"].split("|")) for cat in CATEGORIES[:-1]}
+    res["alo_truth_rows"] = len(obs.alo_truth)
+    res["alo_confusion"] = dict(obs.alo_confusion)
+    res["resolver_stats"] = dict(rp.resolver.stats) if rp.resolver is not None else {}
+    res["gate_stats"] = dict(rp.gate_stats)
+    res["touch_errors"] = {}
+    if rp.touch is not None:
+        for asset, errs in rp.touch.errors.items():
+            name = ASSETS[asset].name
+            if errs:
+                both = sorted(max(abs(b), abs(k)) for b, k in errs)
+                res["touch_errors"][name] = {"n": len(errs), "exact": sum(1 for x in both if x == 0),
+                                             "median_ticks": both[len(both) // 2], "p90_ticks": both[9 * len(both) // 10]}
+    res["reconciled"] = {f"{c}:{k}": ASSETS[COINS.index(c)].lots_to_sz(v) for (c, k), v in sorted(rp.reconciled.items())}
+    pm = defaultdict(lambda: Counter())
+    for r in rows:
+        if r["status"] in ("match", "mismatch"):
+            c = pm[(r["minute"], r["coin"])]
+            c["scored"] += 1
+            c["matched"] += r["status"] == "match"
+            c["matched_px_sz"] += r["match_px_sz"]
+            c["warmup_txs"] += r["warmup"]
+    keys = sorted(set(pm) | set(obs.minute_stats) | set(obs.resting))
+    per_min = []
+    for minute, coin in keys:
+        if coin is None:
+            continue
+        c, ms = pm[(minute, coin)], obs.minute_stats[(minute, coin)]
+        spec = ASSETS[COINS.index(coin)]
+        per_min.append(dict(
+            minute=minute, coin=coin, scored=c["scored"], matched=c["matched"], match_rate=rate(c["matched"], c["scored"]),
+            match_rate_px_sz=rate(c["matched_px_sz"], c["scored"]), warmup_txs=c["warmup_txs"],
+            snapshots=ms["snapshots"], trimmed=spec.lots_to_sz(ms["trimmed"]), drift=spec.lots_to_sz(ms["drift"]),
+            missing=spec.lots_to_sz(ms["missing"]), evicted=spec.lots_to_sz(ms["evicted"]),
+            evicted_orders=ms["evicted_orders"], alo_total=ms["alo_total"], alo_rejected=ms["alo_rejected"],
+            alo_reject_rate=rate(ms["alo_rejected"], ms["alo_total"]),
+            cloid_cancels=ms["cloid_cancels"], cloid_unknown=ms["cloid_unknown"],
+            oid_cancels=ms["oid_cancels"], oid_unknown=ms["oid_unknown"],
+            resting_known_orders=obs.resting.get((minute, coin), "")))
+    res["per_minute"] = per_min
+    hz = []
+    if rp.reseed:
+        edges = (0, *HORIZON_BUCKETS_MS, None)
+        for lo, hi in zip(edges, edges[1:]):
+            rs = [r for r in scored if r["horizon_ms"] != "" and r["horizon_ms"] >= lo
+                  and (hi is None or r["horizon_ms"] < hi)]
+            rn = sum(r["real_notional"] for r in rs)
+            hz.append(dict(horizon=f"{lo // 1000}-{hi // 1000}s" if hi else f"{lo // 1000}s+", scored=len(rs),
+                           matched=sum(r["status"] == "match" for r in rs),
+                           match_rate=rate(sum(r["status"] == "match" for r in rs), len(rs)),
+                           fill_recall=rate(sum(r["matched_notional"] for r in rs), rn),
+                           fill_recall_px_sz=rate(sum(r["matched_notional_px"] for r in rs), rn)))
+    res["horizons"] = hz
+    return res
+
+
+def write_csvs(out: Path, res: dict, rows: list, obs) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+
+    def write(name, header, data):
+        with open(out / name, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            w.writerows(data)
+
+    scalars = [(k, v) for k, v in res.items() if not isinstance(v, (dict, list))]
+    scalars += [(f"resolver:{k}", v) for k, v in sorted(res["resolver_stats"].items())]
+    scalars += [(f"reconciled:{k}", v) for k, v in res["reconciled"].items()]
+    scalars += [(f"gate:{k}", v) for k, v in sorted(res["gate_stats"].items())]
+    scalars += [(f"touch:{c}:{k}", v) for c, d in sorted(res["touch_errors"].items()) for k, v in d.items()]
+    write("summary.csv", ["metric", "value"], scalars)
+    pm = res["per_minute"]
+    write("per_minute.csv", list(pm[0]) if pm else ["minute"], [list(r.values()) for r in pm])
+    total = sum(res["mismatch_table"].values())
+    write("mismatches.csv", ["category", *COINS, "total", "share", "flagged (any precedence)"],
+          [[cat, *(res["mismatch_table"][(cat, c)] for c in COINS),
+            sum(res["mismatch_table"][(cat, c)] for c in COINS),
+            rate(sum(res["mismatch_table"][(cat, c)] for c in COINS), total),
+            res["flag_table"].get(cat, "")] for cat in CATEGORIES])
+    write("txs.csv", list(rows[0]) if rows else ["hash"], [list(r.values()) for r in rows])
+    if res["horizons"]:
+        write("horizon.csv", list(res["horizons"][0]), [list(r.values()) for r in res["horizons"]])
+    write("alo_truth.csv", ["engine_decision", "truth", "n"],
+          [[e, t, n] for (e, t), n in sorted(res["alo_confusion"].items())])
+    first = [r for r in rows if r["status"] == "mismatch" and not r["warmup"]][:FIRST_N]
+    write("first_mismatches.csv", ["hash", "block", "coin", "category", "flags", "real", "engine", "book_before"],
+          [[r["hash"], r["block"], r["coin"], r["category"], r["flags"], r["real"], r["engine"], r["book_before"]]
+           for r in first])
+
+
+def print_report(res: dict) -> None:
+    print(f"window {res['window']}  policy {res['policy']}  resolver {res['resolver']}  "
+          f"warm-up ends at {res['warmup_end_height']}")
+    print(f"outside fills: {res['outside_fill_position']}")
+    print(f"ALO gate: {res['alo_gate']} (max age {res['gate_max_age_ms'] or 'none'} ms)  known-order eviction: "
+          f"{res['evict_known']}  resolver nearest_ratio: {res['nearest_ratio'] or 0}  re-seed: {res['reseed']}")
+    if res["gate_stats"]:
+        print("  gate: " + ", ".join(f"{k} {v}" for k, v in sorted(res["gate_stats"].items())))
+    for c, d in sorted(res["touch_errors"].items()):
+        print(f"  touch estimate vs snapshots, {c}: exact {d['exact']}/{d['n']}, |error| median {d['median_ticks']} "
+              f"p90 {d['p90_ticks']} ticks")
+    for scope in ("all", *COINS):
+        print(f"  {scope:<4} scored {res[f'{scope}:scored']:>5}  matched {res[f'{scope}:matched']:>5}  "
+              f"match rate {res[f'{scope}:match_rate'] or 'n/a'}  (px/size only {res[f'{scope}:match_rate_px_sz'] or 'n/a'}; "
+              f"real-linked only {res[f'{scope}:match_rate_real_linked_only'] or 'n/a'}; "
+              f"engine-only txs {res[f'{scope}:engine_only_txs']})")
+        print(f"       per fill (notional): recall {res[f'{scope}:fill_recall'] or 'n/a'} "
+              f"precision {res[f'{scope}:fill_precision'] or 'n/a'}  (px/size: recall "
+              f"{res[f'{scope}:fill_recall_px_sz'] or 'n/a'} precision {res[f'{scope}:fill_precision_px_sz'] or 'n/a'})")
+    print(f"  excluded after warm-up (real maker pre-window): {res['excluded_real_maker_prewindow']}; "
+          f"warm-up txs: {res['warmup_txs']}")
+    print("\nmismatch table (first category by precedence; 'flagged' counts every tx with that flag)")
+    total = sum(res["mismatch_table"].values())
+    for cat in CATEGORIES:
+        n = sum(res["mismatch_table"][(cat, c)] for c in COINS)
+        print(f"  {cat:<34}" + "".join(f"{c} {res['mismatch_table'][(cat, c)]:>5}  " for c in COINS)
+              + f"total {n:>5} ({rate(n, total) or 'n/a'})  flagged {res['flag_table'].get(cat, '-')}")
+    print(f"\nALO ground truth rows in window: {res['alo_truth_rows']}; engine vs truth: {res['alo_confusion'] or 'none'}")
+    if res["horizons"]:
+        print("\nby time since re-seed:")
+        for h in res["horizons"]:
+            print(f"  {h['horizon']:>6}  match {h['matched']:>4}/{h['scored']:<5} ({h['match_rate'] or 'n/a'})  "
+                  f"fill recall {h['fill_recall'] or 'n/a'} (px/size {h['fill_recall_px_sz'] or 'n/a'})")
+    print("\nper minute:")
+    for r in res["per_minute"]:
+        print(f"  min {r['minute']:>2} {r['coin']}  match {r['matched']:>4}/{r['scored']:<4} "
+              f"({r['match_rate'] or '  n/a '})  warmup {r['warmup_txs']:>4}  ALO rej {r['alo_reject_rate'] or 'n/a'}  "
+              f"drift {r['drift']}  evicted {r['evicted']}  trimmed {r['trimmed']}  missing {r['missing']}  "
+              f"unknown cancels cloid {r['cloid_unknown']}/{r['cloid_cancels']} oid {r['oid_unknown']}/{r['oid_cancels']}  "
+              f"resting {r['resting_known_orders']}")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("window")
+    ap.add_argument("--hl-data", required=True)
+    ap.add_argument("--policy", default="listing", choices=sorted(POLICIES))
+    ap.add_argument("--out", help="directory for the CSVs (default: report/validate/<window>-<policy>)")
+    ap.add_argument("--anchors", help="anchors file (default: the window's anchors.json)")
+    ap.add_argument("--no-resolver", action="store_true")
+    ap.add_argument("--alo-gate", choices=["touch"], help="G1 fix #1: admit ALOs against the real touch")
+    ap.add_argument("--gate-max-age-ms", type=int, help="gate abstains when the touch is older than this")
+    ap.add_argument("--evict-known", choices=["oldest", "newest"], help="G1 fix #2: rule 8 evicts known orders")
+    ap.add_argument("--nearest-ratio", type=int, default=0,
+                    help="resolver: accept the nearest of several candidates if all others are this many times farther")
+    ap.add_argument("--reseed", action="store_true", help="G1 #3: rebuild each book from every snapshot")
+    a = ap.parse_args(argv)
+    tag = "".join([f"-gate{a.gate_max_age_ms if a.gate_max_age_ms is not None else ''}" if a.alo_gate else "",
+                   f"-evict{a.evict_known}" if a.evict_known else "",
+                   f"-nr{a.nearest_ratio}" if a.nearest_ratio else "", "-reseed" if a.reseed else ""])
+    out = a.out or f"report/validate/{Path(a.window).name}-{a.policy}{tag}"
+    run(a.window, a.hl_data, a.policy, out, a.anchors, not a.no_resolver, alo_gate=a.alo_gate,
+        gate_max_age_ms=a.gate_max_age_ms, evict_known=a.evict_known, nearest_ratio=a.nearest_ratio,
+        reseed=a.reseed)
+    print(f"\nCSVs in {out}")
+
+
+if __name__ == "__main__":
+    main()

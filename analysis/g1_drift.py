@@ -2,8 +2,8 @@
 
     python -m analysis.g1_drift <window_dir> --hl-data <dir> [--anchors FILE] [--cache FILE] [--no-resolver]
 
-Replays the window in listing order, seeded from the nearest L2 snapshot, with rule 8
-reconciliation at every later snapshot (as g0_block_check --reconcile), and reports:
+Replays the window with engine_py/replay.Replay in listing order (placeholders, outside
+fills at end of block, rule 8 reconciliation at every later snapshot), and reports:
   (a) reduce-only orders: share of the known orders left resting, and of the drift lots
   (b) ALO would-cross rejects by what they cross: only placeholders, or known orders
       (and of those, reduce-only), plus the first-blocks rate
@@ -21,10 +21,11 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from analysis.g0_block_check import COINS, classify
+from analysis.g0_block_check import classify
 from data.oids import OidEstimator, OidResolver
-from data.parse import iter_books, iter_trades, iter_window, nearest_book
+from data.parse import iter_trades
 from engine_py.matching import PLACEHOLDER, Engine
+from engine_py.replay import COINS, Observer, Replay, listing
 from engine_py.types import (ASSETS, Cancel, CancelByCloid, Modify, OutsideFill, Place, RejectReason,
                              Side, Tif, ZERO_HASH)
 
@@ -49,27 +50,108 @@ def crossing_liquidity(eng, p: Place, placed: dict) -> Counter:
     return out
 
 
+def drop_reduce_only_policy(counter: Counter):
+    """MEASUREMENT policy (listing order): resting reduce-only placements never happen;
+    a modify keeps only its cancel half. Not a permutation: run with check_permutation=False."""
+    def policy(actions):
+        out = []
+        for a in actions:
+            p = a.new if isinstance(a, Modify) else a
+            if isinstance(p, Place) and p.reduce_only and p.tif is not Tif.IOC:
+                counter["dropped_reduce_only"] += 1
+                if not isinstance(a, Modify):
+                    continue
+                meta = dict(user=a.user, block=a.block, tx_index=a.tx_index, item_index=a.item_index,
+                            hash=a.hash, priority=a.priority, asset=a.asset)
+                a = (CancelByCloid(**meta, cloid=a.target) if isinstance(a.target, str)
+                     else Cancel(**meta, oid=a.target))
+            out.append(a)
+        return out
+    return policy
+
+
+class _DriftObserver(Observer):
+    def __init__(self, real, truth, t0, holdout_held, early_blocks):
+        self.real, self.truth, self.t0, self.held, self.early_blocks = real, truth, t0, holdout_held, early_blocks
+        self.alo, self.cancels, self.check, self.drift = Counter(), Counter(), Counter(), Counter()
+        self.engine_fills = defaultdict(list)
+        self.taker_hashes = set()
+        self._pre = None
+
+    def before_action(self, rp, block, a):
+        p = a.new if isinstance(a, Modify) else a
+        self._pre = crossing_liquidity(rp.engine, p, rp.placed) if isinstance(p, Place) and p.tif is Tif.ALO else None
+
+    def after_action(self, rp, block, a, fills, rejects, created):
+        alo, cancels, check, res = self.alo, self.cancels, self.check, rp.resolver
+        p = a.new if isinstance(a, Modify) else a
+        reasons = {r.reason for r in rejects}
+        if isinstance(p, Place) and p.tif is Tif.ALO:
+            alo["total"] += 1
+            early = rp.block_index < self.early_blocks
+            alo["early_total"] += early
+            if RejectReason.ALO_WOULD_CROSS in reasons:
+                pre = self._pre
+                alo["rejected"] += 1
+                alo["early_rejected"] += early
+                kind = ("crosses known reduce-only" if pre["known_reduce_only"] else
+                        "crosses known orders" if pre["known"] else "crosses placeholders only")
+                alo[kind] += 1
+        if isinstance(a, Cancel):
+            cancels["oid_total"] += 1
+            hit = RejectReason.UNKNOWN_ORDER not in reasons
+            cancels["oid_resolved_and_removed"] += hit
+            t = self.truth.get((a.user, a.oid))
+            if t is not None and res is not None:
+                where = ("in-window" if t["timestamp"] >= self.t0 else "pre-window")
+                if self.held is not None and where == "in-window" and a.oid not in self.held:
+                    t = None                         # an anchor the estimator was given: too easy
+            if t is not None and res is not None:
+                check["with_truth"] += 1
+                check[f"truth {where}: {res_outcome(res)}"] += 1
+                if hit:
+                    check["resolved"] += 1
+                    o = rp.placed.get(res.last)
+                    spec = ASSETS[a.asset]
+                    ok = (o is not None and o.px == spec.px_to_ticks(t["limitPx"])
+                          and o.sz == spec.sz_to_lots(t["origSz"]) and o.side.value == t["side"])
+                    check["resolved_correct" if ok else "resolved_WRONG"] += 1
+        elif isinstance(a, CancelByCloid):
+            cancels["cloid_total"] += 1
+            if RejectReason.UNKNOWN_ORDER in reasons:
+                cancels["cloid_missed"] += 1
+                eng = rp.engine
+                mine = [o for o in eng.by_user.get(a.user, {}) if o in eng.books[a.asset]]
+                cancels["cloid_missed_user_has_no_resting_order"] += not mine
+        if not isinstance(a, OutsideFill):
+            if isinstance(p, Place) and p.hash in self.real:
+                self.taker_hashes.add(p.hash)
+            for f in fills:
+                self.engine_fills[f.taker_hash].append((f.px, f.sz))
+
+    def after_reconcile(self, rp, block, s, result, minute):
+        name = ASSETS[s.asset].name
+        for k, v in result.items():
+            self.drift[(name, k)] += v
+        attribute_drift(rp.engine, s, rp.placed, self.drift)
+
+
 def run(window, hl_data, anchors_path=None, cache_path=None, use_resolver=True, early_blocks=3,
         holdout=False, nearest_ratio=0, drop_reduce_only=False):
-    blocks = list(iter_window(window, hl_data))
-    t0, t1 = blocks[0].time_ms, blocks[-1].time_ms
-    eng = Engine()
-    for coin in COINS:
-        snap = nearest_book(hl_data, coin, t0)
-        for px, sz in snap.bids:
-            eng.seed(snap.asset, Side.BUY, px, sz)
-        for px, sz in snap.asks:
-            eng.seed(snap.asset, Side.SELL, px, sz)
-    snaps = sorted((s for coin in COINS for s in iter_books(hl_data, coin, t0, t1)), key=lambda s: (s.time_ms, s.asset))
+    dropped = Counter()
+    policy = drop_reduce_only_policy(dropped) if drop_reduce_only else listing
+    rp = Replay(window, hl_data, policy, anchors=anchors_path, use_resolver=use_resolver and bool(anchors_path),
+                nearest_ratio=nearest_ratio, check_permutation=not drop_reduce_only)
+    blocks, t0, t1, eng, snaps = rp.blocks, rp.t0, rp.t1, rp.engine, rp.snapshots
 
-    res = None
-    if use_resolver and anchors_path:
-        est = OidEstimator.from_files(window, anchors_path)
+    res, held = rp.resolver, None
+    if res is not None:
+        est = res.est
         if holdout:                                      # estimate from even anchors, judge on the odd ones
             held = {o for _, o in est.anchors[1::2]}
             est = OidEstimator(est.counts, est.anchors[::2])
-        res = OidResolver(eng, est, nearest_ratio=nearest_ratio)
-        eng.resolve_oid = res
+            res = OidResolver(eng, est, nearest_ratio=nearest_ratio)
+            rp.resolver = eng.resolve_oid = res
         loo = sorted(abs(e) for e in est.leave_one_out())
         print(f"oid anchors: {len(est.anchors)}; leave-one-out |error| in ids: "
               + (f"median {loo[len(loo) // 2]}, p90 {loo[9 * len(loo) // 10]}, max {loo[-1]}" if loo else "n/a"))
@@ -86,88 +168,13 @@ def run(window, hl_data, anchors_path=None, cache_path=None, use_resolver=True, 
         if tr.hash != ZERO_HASH:
             real[tr.hash].append((tr.px, tr.sz))
 
-    placed: dict[int, Place] = {}                        # engine oid -> the Place that created it
-    alo = Counter()
-    cancels = Counter()
-    check = Counter()
-    engine_fills = defaultdict(list)
-    taker_hashes = set()
-    drift = Counter()
-    si = 0
-    held = held if res is not None and holdout else None
-    for bi, b in enumerate(blocks):
-        for a in b.actions:
-            p = a.new if isinstance(a, Modify) else a
-            if drop_reduce_only and isinstance(p, Place) and p.reduce_only and p.tif is not Tif.IOC:
-                check["dropped_reduce_only"] += 1        # measurement only: what if these never rested
-                if not isinstance(a, Modify):
-                    continue
-                meta = dict(user=a.user, block=a.block, tx_index=a.tx_index, item_index=a.item_index,
-                            hash=a.hash, priority=a.priority, asset=a.asset)
-                a = (CancelByCloid(**meta, cloid=a.target) if isinstance(a.target, str)
-                     else Cancel(**meta, oid=a.target))   # keep the modify's cancel half
-                p = a
-            pre = None
-            if isinstance(p, Place) and p.tif is Tif.ALO:
-                pre = crossing_liquidity(eng, p, placed)
-            before = eng.next_oid
-            fills, rejects = eng.apply(a)
-            if eng.next_oid > before and isinstance(p, Place):
-                placed[before] = p
-                if res is not None:
-                    res.note(a, before)
-            reasons = {r.reason for r in rejects}
-            if isinstance(p, Place) and p.tif is Tif.ALO:
-                alo["total"] += 1
-                early = bi < early_blocks
-                alo["early_total"] += early
-                if RejectReason.ALO_WOULD_CROSS in reasons:
-                    alo["rejected"] += 1
-                    alo["early_rejected"] += early
-                    kind = ("crosses known reduce-only" if pre["known_reduce_only"] else
-                            "crosses known orders" if pre["known"] else "crosses placeholders only")
-                    alo[kind] += 1
-            if isinstance(a, Cancel):
-                cancels["oid_total"] += 1
-                hit = RejectReason.UNKNOWN_ORDER not in reasons
-                cancels["oid_resolved_and_removed"] += hit
-                t = truth.get((a.user, a.oid))
-                if t is not None and res is not None:
-                    where = ("in-window" if t["timestamp"] >= t0 else "pre-window")
-                    if held is not None and where == "in-window" and a.oid not in held:
-                        t = None                         # an anchor the estimator was given: too easy
-                if t is not None and res is not None:
-                    check["with_truth"] += 1
-                    check[f"truth {where}: {res_outcome(res)}"] += 1
-                    if hit:
-                        check["resolved"] += 1
-                        o = placed.get(res.last)
-                        spec = ASSETS[a.asset]
-                        ok = (o is not None and o.px == spec.px_to_ticks(t["limitPx"])
-                              and o.sz == spec.sz_to_lots(t["origSz"]) and o.side.value == t["side"])
-                        check["resolved_correct" if ok else "resolved_WRONG"] += 1
-            elif isinstance(a, CancelByCloid):
-                cancels["cloid_total"] += 1
-                if RejectReason.UNKNOWN_ORDER in reasons:
-                    cancels["cloid_missed"] += 1
-                    mine = [o for o in eng.by_user.get(a.user, {}) if o in eng.books[a.asset]]
-                    cancels["cloid_missed_user_has_no_resting_order"] += not mine
-            if not isinstance(a, OutsideFill):
-                if isinstance(p, Place) and p.hash in real:
-                    taker_hashes.add(p.hash)
-                for f in fills:
-                    engine_fills[f.taker_hash].append((f.px, f.sz))
-        eng.end_block(b.height, b.time_ms)
-        nxt = blocks[bi + 1].time_ms if bi + 1 < len(blocks) else t1 + 1
-        while si < len(snaps) and snaps[si].time_ms < nxt:
-            s = snaps[si]
-            if s.time_ms >= b.time_ms:
-                r = eng.reconcile(s.asset, s.bids, s.asks)
-                name = ASSETS[s.asset].name
-                for k, v in r.items():
-                    drift[(name, k)] += v
-                attribute_drift(eng, s, placed, drift)
-            si += 1
+    obs = _DriftObserver(real, truth, t0, held, early_blocks)
+    rp.observer = obs
+    for _ in rp:
+        pass
+    placed, alo, cancels, check, drift = rp.placed, obs.alo, obs.cancels, obs.check, obs.drift
+    engine_fills, taker_hashes = obs.engine_fills, obs.taker_hashes
+    check["dropped_reduce_only"] = dropped["dropped_reduce_only"]
 
     # ---------------------------------------------------------------- report
     print(f"\nwindow {Path(window).name}: {len(blocks)} blocks, {len(snaps)} later snapshots, "

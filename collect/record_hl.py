@@ -4,6 +4,7 @@ record_hl.py v2: free Hyperliquid recorder (no AWS).
 Records, for the coins you pass:
   trades_<COIN>.jsonl  every public trade (px, sz, time, hash, users)  -> real fills to score your replay
   book_<COIN>.jsonl    L2 book snapshots                                -> sanity checks
+  bbo_<COIN>.jsonl     best bid/offer on every block where it changes   -> the real touch (replay ALO gate)
 and network-wide:
   blocks.jsonl         every block header (height, blockTime, numTxs)   -> maps clock time to block height
 
@@ -14,7 +15,6 @@ Files roll over every hour into hl_data/YYYY-MM-DD/HH/ and are gzipped when clos
 Usage:  python3 record_hl.py BTC ETH      (Mac: caffeinate -i python3 record_hl.py BTC ETH)
 """
 import asyncio, gzip, json, os, shutil, sys, time
-import websockets
 
 COINS = sys.argv[1:] or ["BTC"]
 ROOT = "hl_data"
@@ -47,6 +47,7 @@ class Sink:
 
 
 async def stream(url, subs, route):
+    import websockets   # imported here so tests can import this module without it
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, max_size=None) as ws:
@@ -60,21 +61,32 @@ async def stream(url, subs, route):
             await asyncio.sleep(3)
 
 
+def api_subscriptions(coins):
+    return [s for c in coins for s in ({"type": "trades", "coin": c}, {"type": "l2Book", "coin": c},
+                                       {"type": "bbo", "coin": c})]
+
+
+def route_api(m, trades, books, bbos, other):
+    """Send one api-ws message to its sink (dicts keyed by coin); anything unexpected goes to `other`."""
+    if not isinstance(m, dict) or m.get("channel") == "subscriptionResponse":
+        return
+    d = m.get("data")
+    ch = m.get("channel")
+    if ch == "trades" and d:
+        trades.get(d[0].get("coin"), other).write(m)
+    elif ch == "l2Book" and isinstance(d, dict):
+        books.get(d.get("coin"), other).write(m)
+    elif ch == "bbo" and isinstance(d, dict):
+        bbos.get(d.get("coin"), other).write(m)
+    else:
+        other.write(m)
+
+
 async def main():
     trades = {c: Sink(f"trades_{c}") for c in COINS}
     books = {c: Sink(f"book_{c}") for c in COINS}
+    bbos = {c: Sink(f"bbo_{c}") for c in COINS}
     blocks, other = Sink("blocks"), Sink("other")
-
-    def route_api(m):
-        if not isinstance(m, dict) or m.get("channel") == "subscriptionResponse":
-            return
-        d = m.get("data")
-        if m.get("channel") == "trades" and d:
-            trades.get(d[0].get("coin"), other).write(m)
-        elif m.get("channel") == "l2Book" and isinstance(d, dict):
-            books.get(d.get("coin"), other).write(m)
-        else:
-            other.write(m)
 
     def route_rpc(m):
         # explorer messages arrive as bare lists; keep only block headers
@@ -83,12 +95,12 @@ async def main():
                 if isinstance(it, dict) and "numTxs" in it:
                     blocks.write(it)
 
-    api_subs = [s for c in COINS for s in ({"type": "trades", "coin": c}, {"type": "l2Book", "coin": c})]
     try:
-        await asyncio.gather(stream(API_WS, api_subs, route_api),
+        await asyncio.gather(stream(API_WS, api_subscriptions(COINS),
+                                    lambda m: route_api(m, trades, books, bbos, other)),
                              stream(RPC_WS, [{"type": "explorerBlock"}], route_rpc))
     finally:
-        for s in [*trades.values(), *books.values(), blocks, other]:
+        for s in [*trades.values(), *books.values(), *bbos.values(), blocks, other]:
             s.close()
 
 

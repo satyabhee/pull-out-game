@@ -100,16 +100,25 @@ class Engine:
             self._assert_not_crossed(action.asset)
         return out
 
-    def reconcile(self, asset: int, bids, asks) -> dict[str, int]:
+    def reconcile(self, asset: int, bids, asks, known: str | None = None) -> dict[str, int]:
         """ENGINE_WINDOW_RULES rule 8: trim placeholders toward an L2 snapshot.
 
         `bids`/`asks` are (px, sz) levels from the snapshot. Inside the snapshot's
         price range, where we hold more than the snapshot shows, placeholders at that
-        price are reduced newest first. Known orders are never touched: any gap left
-        is returned as drift, and snapshot size we lack is returned as missing.
+        price are reduced newest first. The gap left is returned as drift, and
+        snapshot size we lack is returned as missing.
+
+        known=None (rule 8 as written): known orders are never touched.
+        known="oldest" | "newest" (rule 8 extension, approved Nov 17 as G1 fix #2): the
+        drift is then removed from known orders at that price in that queue order
+        (`evicted` lots, `evicted_orders` orders). Phantom orders (accepted by us,
+        silently rejected on chain) are never cancelled by their owners, so they age;
+        "oldest" targets them first.
         """
+        if known not in (None, "oldest", "newest"):
+            raise ValueError(f"unknown eviction order {known!r}")
         book = self.books[asset]
-        out = {"trimmed": 0, "drift": 0, "missing": 0}
+        out = {"trimmed": 0, "drift": 0, "missing": 0, "evicted": 0, "evicted_orders": 0}
         for side, levels in ((Side.BUY, bids), (Side.SELL, asks)):
             if not levels:
                 continue
@@ -130,6 +139,20 @@ class Engine:
                     out["trimmed"] += q
                     gap -= q
                 out["drift"] += gap
+                if known is None or gap == 0:
+                    continue
+                nodes = [n for n in level if n.order.user != PLACEHOLDER]
+                for node in (nodes if known == "oldest" else reversed(nodes)):
+                    if gap == 0:
+                        break
+                    q = min(gap, node.remaining)
+                    if q == node.remaining:
+                        self._remove(node.order.oid)
+                        out["evicted_orders"] += 1
+                    else:
+                        book.reduce(node.order.oid, q)
+                    out["evicted"] += q
+                    gap -= q
             for px, sz in snap.items():
                 level = ours.get(px)
                 have = level.total if level is not None else 0
@@ -137,6 +160,24 @@ class Engine:
                     out["missing"] += sz - have
         for k, v in out.items():
             self.stats[f"reconcile_{k}"] += v
+        return out
+
+    def evict(self, oid: int) -> Order:
+        """Remove a resting order on outside evidence (G1 fix #1: an ALO the real touch admits
+        proves nothing real rested where it crosses). Counted in stats."""
+        order = self._remove(oid)
+        self.stats["evicted_by_gate"] += 1
+        return order
+
+    def clear(self, asset: int) -> dict[str, int]:
+        """Remove every resting order on one asset (G1 #3, short-horizon re-seed: the book is
+        rebuilt from a snapshot). Best price first, queue order inside a level: deterministic."""
+        book = self.books[asset]
+        oids = [nd.order.oid for side in (Side.BUY, Side.SELL) for lv in book.levels(side) for nd in lv]
+        out = {"cleared_known": 0, "cleared_placeholder": 0}
+        for oid in oids:
+            order = self._remove(oid)
+            out["cleared_placeholder" if order.user == PLACEHOLDER else "cleared_known"] += 1
         return out
 
     def end_block(self, height: int, time_ms: int) -> None:

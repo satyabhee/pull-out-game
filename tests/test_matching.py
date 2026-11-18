@@ -251,7 +251,7 @@ def test_reconcile_trims_placeholders_newest_first_and_never_known_orders(eng):
     eng.seed(0, B, 100, 4)                       # newer placeholder
     out = eng.reconcile(0, bids=[(100, 4)], asks=[])
     # ours 12, snapshot 4: gap 8 -> newer placeholder 4, older placeholder 4; known order kept
-    assert out == {"trimmed": 8, "drift": 0, "missing": 0}
+    assert out == {"trimmed": 8, "drift": 0, "missing": 0, "evicted": 0, "evicted_orders": 0}
     assert resting(eng, B) == [(100, PLACEHOLDER, 1), (100, "m", 3)]
     eng.books[0].check_invariants()
 
@@ -260,7 +260,7 @@ def test_reconcile_reports_drift_when_placeholders_run_out(eng):
     eng.seed(0, S, 105, 2)
     eng.apply(place("m", S, 105, 6))
     out = eng.reconcile(0, bids=[], asks=[(105, 3)])
-    assert out == {"trimmed": 2, "drift": 3, "missing": 0}
+    assert out == {"trimmed": 2, "drift": 3, "missing": 0, "evicted": 0, "evicted_orders": 0}
     assert resting(eng, S) == [(105, "m", 6)]
 
 
@@ -268,8 +268,47 @@ def test_reconcile_range_and_missing(eng):
     eng.seed(0, B, 103, 5)                       # above the snapshot's best bid: snapshot says 0
     eng.seed(0, B, 90, 5)                        # below the snapshot's range: untouched
     out = eng.reconcile(0, bids=[(101, 7), (100, 1)], asks=[])
-    assert out == {"trimmed": 5, "drift": 0, "missing": 8}  # nothing added for missing
+    assert out == {"trimmed": 5, "drift": 0, "missing": 8, "evicted": 0, "evicted_orders": 0}  # nothing added for missing
     assert resting(eng, B) == [(90, PLACEHOLDER, 5)]
+
+
+def test_reconcile_evicts_known_orders_oldest_first_when_asked(eng):
+    eng.seed(0, S, 105, 2)
+    eng.apply(place("old", S, 105, 2, Tif.ALO, cloid="0xo"))
+    eng.apply(place("mid", S, 105, 3))
+    eng.apply(place("new", S, 105, 4))
+    out = eng.reconcile(0, bids=[], asks=[(105, 5)], known="oldest")
+    # ours 11, snapshot 5: placeholder 2, then drift 4 -> "old" removed (2), "mid" reduced by 2
+    assert out == {"trimmed": 2, "drift": 4, "missing": 0, "evicted": 4, "evicted_orders": 1}
+    assert resting(eng, S) == [(105, "mid", 1), (105, "new", 4)]
+    assert "old" not in eng.by_user and not eng.by_cloid    # indices follow the removal
+    eng.books[0].check_invariants()
+
+
+def test_reconcile_evicts_newest_first_and_rejects_unknown_order(eng):
+    eng.apply(place("old", S, 105, 2))
+    eng.apply(place("new", S, 105, 4))
+    out = eng.reconcile(0, bids=[], asks=[(105, 2)], known="newest")
+    assert (out["evicted"], out["evicted_orders"]) == (4, 1)
+    assert resting(eng, S) == [(105, "old", 2)]
+    with pytest.raises(ValueError):
+        eng.reconcile(0, bids=[], asks=[], known="random")
+
+
+def test_evict_removes_a_known_order_and_counts_it(eng):
+    eng.apply(place("m", B, 100, 3, Tif.ALO, cloid="0xc"))
+    (oid,) = list(eng.books[0].index)
+    assert eng.evict(oid).user == "m"
+    assert eng.books[0].best_bid() is None and not eng.by_cloid and eng.stats["evicted_by_gate"] == 1
+
+
+def test_clear_removes_every_order_on_one_asset_only(eng):
+    eng.seed(0, B, 100, 5)
+    eng.apply(place("m", S, 105, 3, Tif.ALO, cloid="0xc"))
+    eng.seed(1, B, 50, 1)
+    assert eng.clear(0) == {"cleared_known": 1, "cleared_placeholder": 1}
+    assert eng.books[0].best_bid() is None and eng.books[0].best_ask() is None
+    assert eng.books[1].best_bid() == 50 and not eng.by_user and not eng.by_cloid
 
 
 def test_duplicate_cloid_is_unresolved_never_guessed(eng):
