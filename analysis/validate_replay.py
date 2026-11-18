@@ -205,6 +205,9 @@ def categorize(flags: set) -> str:
 
 class ValidateObserver(Observer):
     def __init__(self, real_by_hash: dict, alo_truth: dict):
+        # H11 scoring rule (g1-dd-placeholder, NOT approved; default off): with keep_known, every refill
+        # counts as a re-seed and known engine orders placed before it score as WILDCARD
+        self.wildcard_pre_reseed_known = False
         self.real_by_hash = real_by_hash
         self.alo_truth = alo_truth
         self.seq = 0
@@ -298,6 +301,8 @@ class ValidateObserver(Observer):
             self.reseed_time[s.asset] = s.time_ms
         elif result.get("refill"):                     # keep-known re-seed: known orders stay known
             self.reseed_time[s.asset] = s.time_ms
+            if self.wildcard_pre_reseed_known:         # H11 rule: a refill counts as a re-seed for scoring
+                self.reseed_seq[s.asset] = self.seq
 
     # ---------------------------------------------------------- scoring
     def flags_for(self, rec: TxRecord, rp) -> set:
@@ -354,7 +359,13 @@ class ValidateObserver(Observer):
         side = rec.side.opposite
         real = [(px, sz, m if self.quoted_since(m, rec.asset, side, px, rec.reseed_seq, rec.seq) else WILDCARD)
                 for px, sz, m in rec.real]
-        engine = [(px, sz, WILDCARD if m == PLACEHOLDER else m, oid) for px, sz, m, oid in rec.engine]
+        # a known engine order placed before the last re-seed (only with reseed_keep_known: the plain
+        # re-seed clears them) is pre-re-seed liquidity too, scored like a placeholder
+        if self.wildcard_pre_reseed_known:
+            engine = [(px, sz, WILDCARD if m == PLACEHOLDER or self.placed_seq.get(oid, rec.reseed_seq + 1) <= rec.reseed_seq
+                       else m, oid) for px, sz, m, oid in rec.engine]
+        else:
+            engine = [(px, sz, WILDCARD if m == PLACEHOLDER else m, oid) for px, sz, m, oid in rec.engine]
         return real, engine
 
     def real_makers_in_window(self, rec: TxRecord) -> bool:
@@ -383,7 +394,8 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False,
         touch_reconcile=False, touch_n_cap=False, keep_known=False, skip_lead_in=False,
         snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
-        outside_other_txs=False, other_position="end"):
+        outside_other_txs=False, other_position="end", placeholder_ttl_ms=None,
+        placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
@@ -391,7 +403,9 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap,
                 keep_known=keep_known, skip_lead_in=skip_lead_in,
                 snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
-                other_position=other_position, engine=engine if engine is not None else Engine(stp=stp))
+                other_position=other_position, placeholder_ttl_ms=placeholder_ttl_ms,
+                placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap,
+                reseed_keep_known=reseed_keep_known, engine=engine if engine is not None else Engine(stp=stp))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -399,6 +413,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
             real_by_hash[tr.hash].append(tr)
     alo_truth = load_alo_status(hl_data, heights, rp.t0, rp.t1)
     obs = (observer_cls or ValidateObserver)(real_by_hash, alo_truth)
+    obs.wildcard_pre_reseed_known = wildcard_pre_reseed_known
     rp.observer = obs
     for _ in rp:
         pass
@@ -535,6 +550,13 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
         triage["other_position"] = rp.other_position
     if (rp.snapshot_shift, rp.outside_position, rp.engine.stp, rp.outside_other_txs) != (0, "end", "cancel_taker", False):
         res.update(triage)                          # G1 triage flags: only when not the default
+    ph = {"placeholder_ttl_ms": rp.placeholder_ttl_ms, "placeholder_queue": rp.placeholder_queue,
+          "placeholder_cap": rp.placeholder_cap, "reseed_keep_known": rp.reseed_keep_known}
+    if tuple(ph.values()) != (None, "ahead", None, False):
+        res.update(ph)                              # H11 placeholder flags: only when not the default
+        res.update({f"ph:{k}": v for k, v in sorted(rp.ph_stats.items())})
+    if obs.wildcard_pre_reseed_known:
+        res["wildcard_pre_reseed_known"] = True
     res.update(scope_metrics(scored))
     post = [r for r in rows if not r["warmup"]]
     res["excluded_real_maker_prewindow"] = sum(r["status"].startswith("excluded") for r in post)
@@ -691,6 +713,16 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     ap.add_argument("--other-position", choices=["end", "start", "index"], default="end",
                     help="with --outside-other-txs: where those fills go (index = at their own tx's position)")
     ap.add_argument("--stp", choices=["cancel_taker", "expire_maker"], default="cancel_taker", help="triage H8")
+    ap.add_argument("--placeholder-ttl-ms", type=int, help="H11: placeholders expire this long after their snapshot")
+    ap.add_argument("--placeholder-queue", choices=["ahead", "behind"], default="ahead",
+                    help="H11: behind = known orders get priority over placeholders at a level")
+    ap.add_argument("--placeholder-cap", choices=["next"],
+                    help="H11, LOOK-AHEAD (measurement only): cap re-seeded levels by the next snapshot + real trades")
+    ap.add_argument("--reseed-keep-known", action="store_true",
+                    help="H11: alias of --keep-known")
+    ap.add_argument("--wildcard-pre-reseed-known", action="store_true",
+                    help="H11 scoring (NOT approved, default off): with --keep-known, known engine orders placed "
+                         "before the last re-seed score as WILDCARD")
 
 
 def replay_kwargs(a) -> dict:
@@ -700,7 +732,10 @@ def replay_kwargs(a) -> dict:
                 touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap,
                 keep_known=a.keep_known, skip_lead_in=a.skip_lead_in,
                 snapshot_shift=a.snapshot_shift, outside_position=a.outside_position, stp=a.stp,
-                outside_other_txs=a.outside_other_txs, other_position=a.other_position)
+                outside_other_txs=a.outside_other_txs, other_position=a.other_position,
+                placeholder_ttl_ms=a.placeholder_ttl_ms, placeholder_queue=a.placeholder_queue,
+                placeholder_cap=a.placeholder_cap, reseed_keep_known=a.reseed_keep_known,
+                wildcard_pre_reseed_known=a.wildcard_pre_reseed_known)
 
 
 def options_tag(a) -> str:
@@ -713,7 +748,11 @@ def options_tag(a) -> str:
                     f"-shift{a.snapshot_shift}" if a.snapshot_shift else "",
                     "-ofstart" if a.outside_position == "start" else "", "-stpexpire" if a.stp == "expire_maker" else "",
                     "-ofother" if a.outside_other_txs else "",
-                    f"-oth{a.other_position}" if a.other_position != "end" else ""])
+                    f"-oth{a.other_position}" if a.other_position != "end" else "",
+                    f"-phttl{a.placeholder_ttl_ms}" if a.placeholder_ttl_ms is not None else "",
+                    "-phbehind" if a.placeholder_queue == "behind" else "",
+                    "-phcapnext" if a.placeholder_cap else "", "-keepknown" if a.reseed_keep_known else "",
+                    "-wcknown" if a.wildcard_pre_reseed_known else ""])
 
 
 def main(argv=None):
