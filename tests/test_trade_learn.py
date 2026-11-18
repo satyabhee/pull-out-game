@@ -161,3 +161,12 @@ def test_refill_back_puts_missing_snapshot_size_behind_known_orders(tmp_path):
     back.engine.books[0].check_invariants()
     with pytest.raises(ValueError):
         Replay(window, hl, listing, refill_position="middle")
+
+
+def test_cli_refill_default_is_back_and_front_is_reported(tmp_path):
+    window, hl = sweep_window(tmp_path)
+    vr.main([str(window), "--hl-data", str(hl), "--reseed", "--keep-known", "--out", str(tmp_path / "d")])
+    assert "refill_position,back" in (tmp_path / "d" / "summary.csv").read_text()
+    vr.main([str(window), "--hl-data", str(hl), "--reseed", "--keep-known", "--refill-position", "front",
+             "--out", str(tmp_path / "f")])
+    assert "refill_position" not in (tmp_path / "f" / "summary.csv").read_text()

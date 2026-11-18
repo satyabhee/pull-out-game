@@ -102,6 +102,8 @@ POLICIES = {"listing": listing, "class": class_policy, "priority": priority_poli
 # CLI default (validate_replay / validate_chunks): correct the book from each applied tx's real trades
 # (engine_py/replay.Replay trade_learn; measured in handoff/integrate_result.md). run() and Replay stay off.
 DEFAULT_TRADE_LEARN = "sweep,queue,name-clip"
+# CLI default for keep-known refills: missing snapshot size behind known orders (chunks: recall_full 23.0% -> 26.8%)
+DEFAULT_REFILL_POSITION = "back"
 
 CATEGORIES = ("outside-fill timing", "wrong ALO decision", "unknown pre-window order", "unresolved cancel",
               "ordering", "margin rejection (unobservable)", "real bug (unexplained)")
@@ -732,7 +734,7 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="H11, LOOK-AHEAD (measurement only): cap re-seeded levels by the next snapshot + real trades")
     ap.add_argument("--reseed-keep-known", action="store_true",
                     help="H11: alias of --keep-known")
-    ap.add_argument("--refill-position", choices=["front", "back"], default="front",
+    ap.add_argument("--refill-position", choices=["front", "back"], default=DEFAULT_REFILL_POSITION,
                     help="keep-known: missing snapshot size goes ahead of known orders (front) or behind them")
     ap.add_argument("--oid-guard", choices=["ghost", "ratio25", "ratio50", "cap3000", "none"],
                     help="int-oid resolver preset (default ghost = data/oids defaults; none = old rule)")
@@ -781,7 +783,7 @@ def options_tag(a) -> str:
                     "-tloff" if a.trade_learn == "off" else
                     f"-tl{a.trade_learn.replace(',', '+')}" if a.trade_learn != DEFAULT_TRADE_LEARN else "",
                     f"-og{a.oid_guard}" if a.oid_guard not in (None, "ghost") else "",
-                    "-refillback" if a.refill_position == "back" else ""])
+                    f"-refill{a.refill_position}" if a.refill_position != DEFAULT_REFILL_POSITION else ""])
 
 
 def main(argv=None):
