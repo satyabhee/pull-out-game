@@ -383,7 +383,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False,
         touch_reconcile=False, touch_n_cap=False, keep_known=False, skip_lead_in=False,
         snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
-        outside_other_txs=False):
+        outside_other_txs=False, other_position="end"):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
@@ -391,7 +391,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap,
                 keep_known=keep_known, skip_lead_in=skip_lead_in,
                 snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
-                engine=engine if engine is not None else Engine(stp=stp))
+                other_position=other_position, engine=engine if engine is not None else Engine(stp=stp))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -531,6 +531,8 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
     triage = {"snapshot_shift": rp.snapshot_shift, "shift_dropped": rp.shift_dropped,
               "outside_position": rp.outside_position, "stp": rp.engine.stp,
               "outside_fill_other_tx": rp.parse_stats["outside_fill_other_tx"]}
+    if rp.other_position != "end":
+        triage["other_position"] = rp.other_position
     if (rp.snapshot_shift, rp.outside_position, rp.engine.stp, rp.outside_other_txs) != (0, "end", "cancel_taker", False):
         res.update(triage)                          # G1 triage flags: only when not the default
     res.update(scope_metrics(scored))
@@ -686,6 +688,8 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     ap.add_argument("--outside-position", choices=["end", "start"], default="end", help="triage H7")
     ap.add_argument("--outside-other-txs", action="store_true",
                     help="triage H9: trades linked to non-book txs (SetGlobalAction) become outside fills")
+    ap.add_argument("--other-position", choices=["end", "start", "index"], default="end",
+                    help="with --outside-other-txs: where those fills go (index = at their own tx's position)")
     ap.add_argument("--stp", choices=["cancel_taker", "expire_maker"], default="cancel_taker", help="triage H8")
 
 
@@ -696,7 +700,7 @@ def replay_kwargs(a) -> dict:
                 touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap,
                 keep_known=a.keep_known, skip_lead_in=a.skip_lead_in,
                 snapshot_shift=a.snapshot_shift, outside_position=a.outside_position, stp=a.stp,
-                outside_other_txs=a.outside_other_txs)
+                outside_other_txs=a.outside_other_txs, other_position=a.other_position)
 
 
 def options_tag(a) -> str:
@@ -708,7 +712,8 @@ def options_tag(a) -> str:
                     "-keep" if a.keep_known else "", "-nolead" if a.skip_lead_in else "",
                     f"-shift{a.snapshot_shift}" if a.snapshot_shift else "",
                     "-ofstart" if a.outside_position == "start" else "", "-stpexpire" if a.stp == "expire_maker" else "",
-                    "-ofother" if a.outside_other_txs else ""])
+                    "-ofother" if a.outside_other_txs else "",
+                    f"-oth{a.other_position}" if a.other_position != "end" else ""])
 
 
 def main(argv=None):
