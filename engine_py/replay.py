@@ -32,7 +32,7 @@ from data.oids import OidEstimator, OidResolver
 from data.parse import COIN_TO_ASSET, Stats, _hour_files, _lines, iter_books, iter_trades, iter_window, nearest_book
 from engine_py.matching import PLACEHOLDER, Engine
 from engine_py.types import (ASSETS, Action, Block, Cancel, CancelByCloid, Fill, Modify, OutsideFill, Place,
-                             Reject, RejectReason, Side, Tif)
+                             Reject, RejectReason, Side, Tif, ZERO_HASH)
 
 COINS = tuple(ASSETS[a].name for a in sorted(ASSETS))       # ("BTC", "ETH")
 OUTSIDE_FILL_POSITION = "end of block, after every policy-ordered action, in tid order"
@@ -145,7 +145,8 @@ class Replay:
                  alo_gate: str | None = None, gate_max_age_ms: int | None = None,
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False,
-                 snapshot_shift: int = 0, outside_position: str = "end", outside_other_txs: bool = False):
+                 snapshot_shift: int = 0, outside_position: str = "end", outside_other_txs: bool = False,
+                 other_position: str = "end"):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -164,7 +165,17 @@ class Replay:
         block; snapshots pushed outside the window are dropped (counted in `shift_dropped`).
         outside_position="start" applies outside fills before the block's policy-ordered actions.
         outside_other_txs=True: trades linked to non-book txs (SetGlobalAction) become outside fills
-        (data/parse.iter_window)."""
+        (data/parse.iter_window).
+        other_position (needs outside_other_txs; default "end" = with the zero-hash fills, as above):
+        where the non-zero-hash outside fills go, the zero-hash ones staying at outside_position:
+        "start" = before every other action of the block; "index" = at their own tx's position, i.e.
+        before the first policy-ordered action whose tx_index is larger (listing order: exactly
+        where the tx sits in the block)."""
+        if other_position not in ("end", "start", "index"):
+            raise ValueError(f"unknown other_position {other_position!r}")
+        if other_position != "end" and not outside_other_txs:
+            raise ValueError("other_position needs outside_other_txs")
+        self.other_position = other_position
         self.window_dir = Path(window_dir)
         self.hl_data = Path(hl_data)
         self.policy = policy
@@ -174,7 +185,8 @@ class Replay:
         self.engine = engine or Engine()
         self.parse_stats = Stats()
         self.blocks: list[Block] = list(iter_window(self.window_dir, self.hl_data, self.parse_stats,
-                                                              outside_other_txs=outside_other_txs))
+                                                              outside_other_txs=outside_other_txs,
+                                                              other_at_tx_index=other_position == "index"))
         self.t0, self.t1 = self.blocks[0].time_ms, self.blocks[-1].time_ms
         meta_path = self.window_dir / "window.json"
         self.window_meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
@@ -242,6 +254,26 @@ class Replay:
         if self.check_permutation and sorted(map(id, out)) != sorted(map(id, book)):
             raise PolicyError(f"block {block.height}: policy did not return a permutation of the block's actions")
         return out, outside
+
+    def _sequence(self, ordered: list[Action], outside: list[OutsideFill]) -> list[Action]:
+        """The block's apply order: policy-ordered actions plus outside fills (see other_position)."""
+        if self.other_position == "end":
+            return [*outside, *ordered] if self.outside_position == "start" else [*ordered, *outside]
+        other = [a for a in outside if a.hash != ZERO_HASH]
+        zero = [a for a in outside if a.hash == ZERO_HASH]
+        if self.other_position == "start":
+            body = [*zero, *ordered] if self.outside_position == "start" else [*ordered, *zero]
+            return [*other, *body]
+        other.sort(key=lambda a: (a.tx_index, a.item_index))
+        seq: list[Action] = []
+        i = 0
+        for a in ordered:
+            while i < len(other) and other[i].tx_index < a.tx_index:
+                seq.append(other[i])
+                i += 1
+            seq.append(a)
+        seq += other[i:]
+        return [*zero, *seq] if self.outside_position == "start" else [*seq, *zero]
 
     def _gate(self, block: Block, p: Place) -> bool | None:
         """True admit / False reject / None abstain, for an ALO, against the real touch."""
@@ -360,7 +392,7 @@ class Replay:
             ordered, outside = self._ordered(b)
             fills: list[Fill] = []
             rejects: list[Reject] = []
-            for a in ([*outside, *ordered] if self.outside_position == "start" else [*ordered, *outside]):
+            for a in self._sequence(ordered, outside):
                 f, r = self._apply(b, a)
                 fills += f
                 rejects += r

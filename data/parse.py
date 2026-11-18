@@ -137,7 +137,7 @@ def decode_tx(tx: dict, tx_index: int, stats: Stats) -> list:
 
 
 def iter_window(window_dir, hl_data=None, stats: Stats | None = None,
-                outside_other_txs: bool = False) -> Iterator[Block]:
+                outside_other_txs: bool = False, other_at_tx_index: bool = False) -> Iterator[Block]:
     """Yield the window's blocks in strictly increasing height order.
 
     With `hl_data`, zero-hash BTC/ETH trades are appended to the block whose
@@ -146,7 +146,13 @@ def iter_window(window_dir, hl_data=None, stats: Stats | None = None,
     in this block that decodes to no BTC/ETH book action (e.g. SetGlobalAction, the oracle
     update that fires triggers/liquidations) are also outside fills, in the same end-of-block
     tid order. Counted as stats["outside_fill_other_tx"].
+    other_at_tx_index=True (measurement, needs outside_other_txs): those fills carry their own tx's
+    index as tx_index (item_index = tid order within the tx) instead of len(txs), so the replay can
+    apply them at the tx's position (engine_py/replay.Replay other_position="index"). They still
+    come after the book actions in Block.actions; zero-hash trades are unchanged.
     """
+    if other_at_tx_index and not outside_other_txs:
+        raise ValueError("other_at_tx_index needs outside_other_txs")
     window_dir = Path(window_dir)
     stats = stats if stats is not None else Stats()
     files = _block_files(window_dir)
@@ -175,17 +181,24 @@ def iter_window(window_dir, hl_data=None, stats: Stats | None = None,
 
         actions: list = []
         other: list = []
+        at_index: list = []
         for i, tx in enumerate(b["txs"]):
             decoded = decode_tx(tx, i, stats)
             actions.extend(decoded)
             if not decoded and tx["hash"] in by_hash:
-                other += by_hash.pop(tx["hash"])
                 stats["outside_fill_other_tx"] += 1
+                if other_at_tx_index:
+                    for k, tr in enumerate(sorted(by_hash.pop(tx["hash"]), key=lambda t: t.tid)):
+                        at_index.append(tr.as_outside_fill(height, i, k))
+                else:
+                    other += by_hash.pop(tx["hash"])
 
         trades = sorted(outside.pop(b["blockTime"], []) + other, key=lambda t: t.tid)
         for k, tr in enumerate(trades):
             actions.append(tr.as_outside_fill(height, len(b["txs"]), k))
             stats["action:OutsideFill"] += 1
+        actions += at_index
+        stats["action:OutsideFill"] += len(at_index)
 
         stats["blocks"] += 1
         stats["txs"] += len(b["txs"])

@@ -377,14 +377,14 @@ def book_text(book, side, depth=BOOK_DEPTH) -> str:
 def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
         alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False,
         touch_reconcile=False, touch_n_cap=False, snapshot_shift=0, outside_position="end", stp="cancel_taker",
-        observer_cls=None, engine=None, outside_other_txs=False):
+        observer_cls=None, engine=None, outside_other_txs=False, other_position="end"):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
                 gate_max_age_ms=gate_max_age_ms, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
                 reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap,
                 snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
-                engine=engine if engine is not None else Engine(stp=stp))
+                other_position=other_position, engine=engine if engine is not None else Engine(stp=stp))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -461,6 +461,8 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
     triage = {"snapshot_shift": rp.snapshot_shift, "shift_dropped": rp.shift_dropped,
               "outside_position": rp.outside_position, "stp": rp.engine.stp,
               "outside_fill_other_tx": rp.parse_stats["outside_fill_other_tx"]}
+    if rp.other_position != "end":
+        triage["other_position"] = rp.other_position
     if (rp.snapshot_shift, rp.outside_position, rp.engine.stp, rp.outside_other_txs) != (0, "end", "cancel_taker", False):
         res.update(triage)                          # G1 triage flags: only when not the default
     for scope, rs in [("all", scored)] + [(c, [r for r in scored if r["coin"] == c]) for c in COINS]:
@@ -650,6 +652,8 @@ def main(argv=None):
     ap.add_argument("--outside-position", choices=["end", "start"], default="end", help="triage H7")
     ap.add_argument("--outside-other-txs", action="store_true",
                     help="triage H9: trades linked to non-book txs (SetGlobalAction) become outside fills")
+    ap.add_argument("--other-position", choices=["end", "start", "index"], default="end",
+                    help="with --outside-other-txs: where those fills go (index = at their own tx's position)")
     ap.add_argument("--stp", choices=["cancel_taker", "expire_maker"], default="cancel_taker", help="triage H8")
     a = ap.parse_args(argv)
     tag = "".join([f"-gate{a.gate_max_age_ms if a.gate_max_age_ms is not None else ''}" if a.alo_gate else "",
@@ -658,13 +662,14 @@ def main(argv=None):
                    "-touch" if a.touch_reconcile else "", "-ncap" if a.touch_n_cap else "",
                    f"-shift{a.snapshot_shift}" if a.snapshot_shift else "",
                    "-ofstart" if a.outside_position == "start" else "", "-stpexpire" if a.stp == "expire_maker" else "",
-                   "-ofother" if a.outside_other_txs else ""])
+                   "-ofother" if a.outside_other_txs else "",
+                   f"-oth{a.other_position}" if a.other_position != "end" else ""])
     out = a.out or f"report/validate/{Path(a.window).name}-{a.policy}{tag}"
     run(a.window, a.hl_data, a.policy, out, a.anchors, not a.no_resolver, alo_gate=a.alo_gate,
         gate_max_age_ms=a.gate_max_age_ms, evict_known=a.evict_known, nearest_ratio=a.nearest_ratio,
         reseed=a.reseed, touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap,
         snapshot_shift=a.snapshot_shift, outside_position=a.outside_position, stp=a.stp,
-        outside_other_txs=a.outside_other_txs)
+        outside_other_txs=a.outside_other_txs, other_position=a.other_position)
     print(f"\nCSVs in {out}")
 
 
