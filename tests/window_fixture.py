@@ -46,6 +46,7 @@ class Window:
         self.books: list[tuple[str, int, list, list]] = []
         self.trades: list[dict] = []
         self.anchors: list[dict] | None = None
+        self.bbos: list[dict] = []
         self.warmup_blocks = warmup_blocks
 
     def block(self, txs, dt_ms=None) -> int:
@@ -63,6 +64,11 @@ class Window:
     def book(self, coin, time_ms, bids, asks):
         """bids/asks: [(px str, sz str)], best first."""
         self.books.append((coin, time_ms, bids, asks))
+
+    def bbo(self, coin, time_ms, bid, ask):
+        """bid/ask: (px str, sz str, n) or None, as the bbo ws feed sends them."""
+        lv = lambda x: {"px": x[0], "sz": x[1], "n": x[2]} if x else None
+        self.bbos.append({"channel": "bbo", "data": {"coin": coin, "time": time_ms, "bbo": [lv(bid), lv(ask)]}})
 
     def trade(self, coin, side, px, sz, time_ms, h, tid, buyer, seller):
         self.trades.append({"coin": coin, "side": side, "px": px, "sz": sz, "time": time_ms,
@@ -95,6 +101,10 @@ class Window:
                 for x in self.trades:
                     if x["coin"] == coin:
                         f.write(json.dumps({"msg": {"data": [x]}}) + "\n")
+        for coin in ("BTC", "ETH"):
+            rows = [m for m in self.bbos if m["data"]["coin"] == coin]
+            if rows:
+                (hour / f"bbo_{coin}.jsonl").write_text("".join(json.dumps({"msg": m}) + "\n" for m in rows))
         if alo_status is not None:
             with open(hour / "alo_status.jsonl", "w") as f:
                 for x in alo_status:

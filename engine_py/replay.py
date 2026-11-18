@@ -29,7 +29,7 @@ from pathlib import Path
 
 from data.oids import OidEstimator, OidResolver
 from data.parse import COIN_TO_ASSET, Stats, _hour_files, _lines, iter_books, iter_trades, iter_window, nearest_book
-from engine_py.matching import Engine
+from engine_py.matching import PLACEHOLDER, Engine
 from engine_py.types import (ASSETS, Action, Block, Cancel, CancelByCloid, Fill, Modify, OutsideFill, Place,
                              Reject, RejectReason, Side, Tif)
 
@@ -66,7 +66,7 @@ class RealTouch:
     def __init__(self, snapshots=(), trades=(), bbos=()):
         ev = [(s.time_ms, self.SNAP, s.asset, 0, s.bids[0][0] if s.bids else None,
                s.asks[0][0] if s.asks else None) for s in snapshots]
-        ev += [(t, self.BBO, a, 0, b, k) for t, a, b, k in bbos]
+        ev += [(t, self.BBO, a, 0, b, k) for t, a, b, k in bbos]      # b, k = (px, sz, n) | None
         ev += [(t.time_ms, self.TRADE, t.asset, t.tid, t.taker_side, t.px) for t in trades]
         ev.sort(key=lambda e: e[:4])
         self.events = ev
@@ -75,6 +75,7 @@ class RealTouch:
         self.ask: dict[int, int | None] = {}
         self.updated: dict[int, int] = {}
         self.errors: dict[int, list[tuple[int, int]]] = {a: [] for a in ASSETS}   # (bid err, ask err) ticks
+        self.bbo: dict[int, tuple] = {}     # asset -> (time, bid level | None, ask level | None), latest
 
     def advance(self, before_ms: int) -> None:
         while self.i < len(self.events) and self.events[self.i][0] < before_ms:
@@ -90,6 +91,10 @@ class RealTouch:
                     self.bid[a] = px
                     if self.ask.get(a) is not None and self.ask[a] <= px:
                         self.ask[a] = px + 1
+            elif kind == self.BBO:
+                self.bbo[a] = (t, x, y)
+                self.bid[a] = x[0] if x else None
+                self.ask[a] = y[0] if y else None
             else:
                 if kind == self.SNAP and a in self.updated and x is not None and y is not None \
                         and self.bid.get(a) is not None and self.ask.get(a) is not None:
@@ -106,16 +111,16 @@ class RealTouch:
 
 def iter_bbo(hl_data, coin: str, t0_ms: int, t1_ms: int):
     """Recorded bbo feed (hl_data/<date>/<hour>/bbo_<COIN>.jsonl[.gz]), if any:
-    (time, asset, bid ticks | None, ask ticks | None)."""
+    (time, asset, bid, ask) with bid/ask = (px ticks, sz lots, n orders) or None."""
     asset = COIN_TO_ASSET[coin]
     spec = ASSETS[asset]
+    lv = lambda x: (spec.px_to_ticks(x["px"]), spec.sz_to_lots(x["sz"]), int(x["n"])) if x else None
     for path in _hour_files(Path(hl_data), f"bbo_{coin}"):
         for rec in _lines(path):
             d = rec["msg"]["data"]
             if t0_ms <= d["time"] <= t1_ms:
                 b, k = d["bbo"]
-                yield (d["time"], asset, spec.px_to_ticks(b["px"]) if b else None,
-                       spec.px_to_ticks(k["px"]) if k else None)
+                yield d["time"], asset, lv(b), lv(k)
 
 
 class Observer:
@@ -137,7 +142,8 @@ class Replay:
                  nearest_ratio: int = 0, check_permutation: bool = True, hasher: Hasher | None = None,
                  observer: Observer | None = None, engine: Engine | None = None,
                  alo_gate: str | None = None, gate_max_age_ms: int | None = None,
-                 reconcile_known: str | None = None, reseed: bool = False):
+                 reconcile_known: str | None = None, reseed: bool = False,
+                 touch_reconcile: bool = False, touch_n_cap: bool = False):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -146,7 +152,11 @@ class Replay:
         reconcile_known="oldest"|"newest" (G1 fix #2): rule 8 also removes drift from known orders.
         reseed=True (G1 #3, short horizons): at every snapshot, after measuring rule 8 trimmed/drift/
         missing, the asset's book is cleared and re-seeded from the snapshot as placeholders, so
-        errors cannot carry past one snapshot interval. Scoring starts at the first block."""
+        errors cannot carry past one snapshot interval. Scoring starts at the first block.
+        touch_reconcile=True (needs recorded bbo): before every block, rule 8 against the latest bbo
+        as a one-level snapshot, evicting known orders oldest first: nothing rests better than the
+        real touch, and the touch level holds at most its real size. touch_n_cap=True also evicts
+        known orders (oldest first) while our touch level has more orders than bbo's n."""
         self.window_dir = Path(window_dir)
         self.hl_data = Path(hl_data)
         self.policy = policy
@@ -184,7 +194,9 @@ class Replay:
         if reseed:
             self.warmup_end_height = self.blocks[0].height     # every horizon starts from a snapshot
         self.touch: RealTouch | None = None
-        if alo_gate == "touch":
+        self.touch_reconcile, self.touch_n_cap = touch_reconcile, touch_n_cap
+        self.touch_reconciled: Counter = Counter()  # (coin, trimmed|drift|evicted|...|n_capped) -> lots/orders
+        if alo_gate == "touch" or touch_reconcile:
             lo = self.t0 - TOUCH_LOOKBACK_MS
             self.touch = RealTouch(
                 [s for coin in COINS for s in iter_books(self.hl_data, coin, lo, self.t1)],
@@ -265,6 +277,35 @@ class Replay:
                 self.gate_stats[f"evicted_lots:{ASSETS[p.asset].name}"] += q
         return eng.apply(action)
 
+    def _reconcile_touch(self) -> None:
+        eng = self.engine
+        for asset in sorted(ASSETS):
+            latest = self.touch.bbo.get(asset)
+            if latest is None:
+                self.touch_reconciled[(ASSETS[asset].name, "abstain_no_bbo")] += 1
+                continue
+            _, bid, ask = latest
+            res = eng.reconcile(asset, [bid[:2]] if bid else [], [ask[:2]] if ask else [], known="oldest")
+            name = ASSETS[asset].name
+            for k, v in res.items():
+                self.touch_reconciled[(name, k)] += v
+            if self.touch_n_cap:
+                for side, lvl in ((Side.BUY, bid), (Side.SELL, ask)):
+                    if lvl is None:
+                        continue
+                    level = eng.books[asset].side(side).get(lvl[0])
+                    if level is None:
+                        continue
+                    nodes = list(level)
+                    extra = len(nodes) - lvl[2]
+                    for nd in nodes:
+                        if extra <= 0:
+                            break
+                        if nd.order.user != PLACEHOLDER:
+                            eng.evict(nd.order.oid)
+                            self.touch_reconciled[(name, "n_capped")] += 1
+                            extra -= 1
+
     def _apply(self, block: Block, action: Action) -> tuple[list[Fill], list[Reject]]:
         self.observer.before_action(self, block, action)
         before = self.engine.next_oid
@@ -291,6 +332,8 @@ class Replay:
             self.block_index = bi
             if self.touch is not None:
                 self.touch.advance(b.time_ms)
+            if self.touch_reconcile:
+                self._reconcile_touch()
             ordered, outside = self._ordered(b)
             fills: list[Fill] = []
             rejects: list[Reject] = []

@@ -65,6 +65,7 @@ CATEGORIES = ("outside-fill timing", "wrong ALO decision", "unknown pre-window o
 INFO_ALO_REJECTED = "info: engine rejected a real maker's ALO at that price"   # a flag, not a category
 FIRST_N = 20
 BOOK_DEPTH = 5
+G1_TARGET_PCT = 80                   # Satya, Nov 18: per-fill strict recall >= 80%
 WILDCARD = "*"                       # horizon mode: a maker whose order predates the last re-seed
 HORIZON_BUCKETS_MS = (2000, 4000, 6000, 8000, 10000, 12000)
 
@@ -335,11 +336,12 @@ def book_text(book, side, depth=BOOK_DEPTH) -> str:
 # ------------------------------------------------------------------ run
 
 def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
-        alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False):
+        alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False,
+        touch_reconcile=False, touch_n_cap=False):
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
                 gate_max_age_ms=gate_max_age_ms, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
-                reseed=reseed)
+                reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap)
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -411,6 +413,7 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
            "evict_known": rp.reconcile_known or "off",
            "nearest_ratio": rp.resolver.nearest_ratio if rp.resolver is not None else "",
            "reseed": "every snapshot" if rp.reseed else "off",
+           "touch_reconcile": ("bbo every block" + (" + n cap" if rp.touch_n_cap else "")) if rp.touch_reconcile else "off",
            "real_linked_txs_not_in_window": unlinked}
     for scope, rs in [("all", scored)] + [(c, [r for r in scored if r["coin"] == c]) for c in COINS]:
         n = len(rs)
@@ -423,6 +426,11 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
         res[f"{scope}:match_rate_real_linked_only"] = rate(sum(r["status"] == "match" for r in realrs), len(realrs))
         res[f"{scope}:engine_only_txs"] = sum(r["engine_only"] for r in rs)
         rn, en = sum(r["real_notional"] for r in rs), sum(r["engine_notional"] for r in rs)
+        mn = sum(r["matched_notional"] for r in rs)
+        res[f"{scope}:fill_f1"] = rate(2 * mn, rn + en)          # 2PR/(P+R) = 2*matched/(real+engine)
+        if scope == "all":
+            res["g1_target"] = ("" if not rn else "pass" if 100 * mn >= G1_TARGET_PCT * rn else "fail")
+            res["g1_target_rule"] = f"all:fill_recall >= {G1_TARGET_PCT / 100:.2f} (report with fill_precision)"
         res[f"{scope}:fill_recall"] = rate(sum(r["matched_notional"] for r in rs), rn)
         res[f"{scope}:fill_precision"] = rate(sum(r["matched_notional"] for r in rs), en)
         res[f"{scope}:fill_recall_px_sz"] = rate(sum(r["matched_notional_px"] for r in rs), rn)
@@ -438,6 +446,7 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
     res["alo_confusion"] = dict(obs.alo_confusion)
     res["resolver_stats"] = dict(rp.resolver.stats) if rp.resolver is not None else {}
     res["gate_stats"] = dict(rp.gate_stats)
+    res["touch_reconciled"] = {f"{c}:{k}": v for (c, k), v in sorted(rp.touch_reconciled.items())}
     res["touch_errors"] = {}
     if rp.touch is not None:
         for asset, errs in rp.touch.errors.items():
@@ -502,6 +511,7 @@ def write_csvs(out: Path, res: dict, rows: list, obs) -> None:
     scalars += [(f"resolver:{k}", v) for k, v in sorted(res["resolver_stats"].items())]
     scalars += [(f"reconciled:{k}", v) for k, v in res["reconciled"].items()]
     scalars += [(f"gate:{k}", v) for k, v in sorted(res["gate_stats"].items())]
+    scalars += [(f"touch_reconcile:{k}", v) for k, v in res["touch_reconciled"].items()]
     scalars += [(f"touch:{c}:{k}", v) for c, d in sorted(res["touch_errors"].items()) for k, v in d.items()]
     write("summary.csv", ["metric", "value"], scalars)
     pm = res["per_minute"]
@@ -528,12 +538,19 @@ def print_report(res: dict) -> None:
           f"warm-up ends at {res['warmup_end_height']}")
     print(f"outside fills: {res['outside_fill_position']}")
     print(f"ALO gate: {res['alo_gate']} (max age {res['gate_max_age_ms'] or 'none'} ms)  known-order eviction: "
-          f"{res['evict_known']}  resolver nearest_ratio: {res['nearest_ratio'] or 0}  re-seed: {res['reseed']}")
+          f"{res['evict_known']}  resolver nearest_ratio: {res['nearest_ratio'] or 0}  re-seed: {res['reseed']}  "
+          f"touch reconcile: {res['touch_reconcile']}")
+    if res["touch_reconciled"]:
+        print("  touch reconcile: " + ", ".join(f"{k} {v}" for k, v in res["touch_reconciled"].items() if v))
     if res["gate_stats"]:
         print("  gate: " + ", ".join(f"{k} {v}" for k, v in sorted(res["gate_stats"].items())))
     for c, d in sorted(res["touch_errors"].items()):
         print(f"  touch estimate vs snapshots, {c}: exact {d['exact']}/{d['n']}, |error| median {d['median_ticks']} "
               f"p90 {d['p90_ticks']} ticks")
+    print(f"G1 target ({res['g1_target_rule']}): {res['g1_target'] or 'n/a'}")
+    for scope in ("all", *COINS):
+        print(f"  {scope:<4} PER-FILL STRICT recall {res[f'{scope}:fill_recall'] or 'n/a'}  "
+              f"precision {res[f'{scope}:fill_precision'] or 'n/a'}  F1 {res[f'{scope}:fill_f1'] or 'n/a'}")
     for scope in ("all", *COINS):
         print(f"  {scope:<4} scored {res[f'{scope}:scored']:>5}  matched {res[f'{scope}:matched']:>5}  "
               f"match rate {res[f'{scope}:match_rate'] or 'n/a'}  (px/size only {res[f'{scope}:match_rate_px_sz'] or 'n/a'}; "
@@ -579,14 +596,17 @@ def main(argv=None):
     ap.add_argument("--nearest-ratio", type=int, default=0,
                     help="resolver: accept the nearest of several candidates if all others are this many times farther")
     ap.add_argument("--reseed", action="store_true", help="G1 #3: rebuild each book from every snapshot")
+    ap.add_argument("--touch-reconcile", action="store_true", help="rule 8 against the recorded bbo before every block")
+    ap.add_argument("--touch-n-cap", action="store_true", help="with --touch-reconcile: cap touch order count at bbo n")
     a = ap.parse_args(argv)
     tag = "".join([f"-gate{a.gate_max_age_ms if a.gate_max_age_ms is not None else ''}" if a.alo_gate else "",
                    f"-evict{a.evict_known}" if a.evict_known else "",
-                   f"-nr{a.nearest_ratio}" if a.nearest_ratio else "", "-reseed" if a.reseed else ""])
+                   f"-nr{a.nearest_ratio}" if a.nearest_ratio else "", "-reseed" if a.reseed else "",
+                   "-touch" if a.touch_reconcile else "", "-ncap" if a.touch_n_cap else ""])
     out = a.out or f"report/validate/{Path(a.window).name}-{a.policy}{tag}"
     run(a.window, a.hl_data, a.policy, out, a.anchors, not a.no_resolver, alo_gate=a.alo_gate,
         gate_max_age_ms=a.gate_max_age_ms, evict_known=a.evict_known, nearest_ratio=a.nearest_ratio,
-        reseed=a.reseed)
+        reseed=a.reseed, touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap)
     print(f"\nCSVs in {out}")
 
 

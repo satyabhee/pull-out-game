@@ -10,6 +10,7 @@ from engine_py.matching import PLACEHOLDER
 from engine_py.replay import Observer, PolicyError, Replay, listing
 from engine_py.types import ASSETS, Modify, OutsideFill, Place, RejectReason, Side
 from tests.window_fixture import A, B, M, T0, ZERO, Window, cancel_tx, order, place_tx, schedule_tx, tx
+N_ = "0x" + "e" * 40
 
 BTC = ASSETS[0]
 
@@ -193,7 +194,7 @@ def test_iter_bbo_reads_the_recorded_feed(tmp_path):
     d.mkdir(parents=True)
     rec = {"channel": "bbo", "data": {"coin": "BTC", "time": 5, "bbo": [{"px": "64407.0", "sz": "1", "n": 2}, None]}}
     (d / "bbo_BTC.jsonl").write_text(json.dumps({"recv_ms": 0, "msg": rec}) + "\n")
-    assert list(iter_bbo(tmp_path, "BTC", 0, 10)) == [(5, 0, ticks("64407"), None)]
+    assert list(iter_bbo(tmp_path, "BTC", 0, 10)) == [(5, 0, (ticks("64407"), lots("1"), 2), None)]
     assert list(iter_bbo(tmp_path, "BTC", 6, 10)) == []
 
 
@@ -287,3 +288,73 @@ def test_reseed_rebuilds_the_book_from_each_snapshot(tmp_path):
     assert [(nd.order.user, nd.remaining) for nd in book.side(Side.SELL)[ticks("60010")]] == [(PLACEHOLDER, lots("0.001"))]
     assert book.best_bid() == ticks("59990") and M not in r.engine.by_user
     assert r.warmup_end_height == 1000
+
+
+# ------------------------------------------------------------------ per-block touch reconcile (bbo)
+
+def touch_window(tmp_path, bbo_bid, bbo_ask, txs0, bbo_time=T0 + 50):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 10, [("60000", "0.003")], [("60010", "0.001")])
+    w.block(txs0, dt_ms=0)
+    if bbo_bid is not None or bbo_ask is not None:
+        w.bbo("BTC", bbo_time, bbo_bid, bbo_ask)
+    w.block([], dt_ms=100)
+    return w
+
+
+def test_touch_reconcile_trims_a_stale_placeholder_at_the_touch(tmp_path):
+    w = touch_window(tmp_path, ("60000", "0.001", 1), ("60010", "0.001", 1), [])
+    r = Replay(*w.write(), listing, touch_reconcile=True)
+    list(r)
+    assert r.engine.books[0].side(Side.BUY)[ticks("60000")].total == lots("0.001")
+    assert r.touch_reconciled[("BTC", "trimmed")] == lots("0.002")
+
+
+def test_touch_reconcile_evicts_a_phantom_better_than_the_real_touch(tmp_path):
+    w = touch_window(tmp_path, ("60000", "0.003", 1), ("60010", "0.001", 1),
+                     [place_tx(M, "0xm1", 0, order(px="60005", tif="Alo"))])      # rests at 60005: not real
+    r = Replay(*w.write(), listing, touch_reconcile=True)
+    list(r)
+    assert r.engine.books[0].best_bid() == ticks("60000") and M not in r.engine.by_user
+    assert r.touch_reconciled[("BTC", "evicted_orders")] == 1
+
+
+def test_touch_reconcile_changes_nothing_when_the_book_agrees(tmp_path):
+    w = touch_window(tmp_path, ("60000", "0.003", 1), ("60010", "0.001", 1), [])
+    r = Replay(*w.write(), listing, touch_reconcile=True)
+    list(r)
+    got = {k: v for k, v in r.touch_reconciled.items() if k[0] == "BTC" and v}
+    assert got == {("BTC", "abstain_no_bbo"): 1} and r.engine.books[0].side(Side.BUY)[ticks("60000")].total == lots("0.003")
+
+
+def test_touch_reconcile_abstains_without_bbo(tmp_path):
+    w = touch_window(tmp_path, None, None, [])
+    r = Replay(*w.write(), listing, touch_reconcile=True)
+    list(r)
+    assert r.touch_reconciled[("BTC", "abstain_no_bbo")] == 2
+    assert r.engine.books[0].side(Side.BUY)[ticks("60000")].total == lots("0.003")
+
+
+def test_touch_n_cap_evicts_extra_known_orders_oldest_first(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 10, [], [("60020", "0.001")])
+    w.block([place_tx(M, "0xm1", 0, order(px="60000", sz="0.001")),
+             place_tx(N_, "0xn1", 0, order(px="60000", sz="0.001"))], dt_ms=0)
+    w.bbo("BTC", T0 + 50, ("60000", "0.002", 1), ("60020", "0.001", 1))   # same size, but one order
+    w.block([], dt_ms=100)
+    r = Replay(*w.write(), listing, touch_reconcile=True, touch_n_cap=True)
+    list(r)
+    assert [nd.order.user for nd in r.engine.books[0].side(Side.BUY)[ticks("60000")]] == [N_]
+    assert r.touch_reconciled[("BTC", "n_capped")] == 1
+
+
+def test_gate_uses_the_bbo_touch(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 10, [("60000", "0.001")], [("60020", "0.001")])
+    w.block([], dt_ms=0)
+    w.bbo("BTC", T0 + 50, ("60000", "0.001", 1), ("60005", "0.001", 1))
+    w.block([place_tx(A, "0xa1", 0, order(px="60010"))], dt_ms=100)       # crosses the real ask 60005
+    r = Replay(*w.write(), listing, alo_gate="touch")
+    out = list(r)
+    assert [x.reason for x in out[1][2]] == [RejectReason.ALO_WOULD_CROSS]
+    assert r.gate_stats["reject_engine_would_admit"] == 1

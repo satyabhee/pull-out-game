@@ -6,6 +6,9 @@ import gzip
 import json
 
 from analysis import validate_replay as vr
+from engine_py.types import ASSETS
+
+ASSETS_BTC = ASSETS[0]
 from tests.window_fixture import A, B, C, M, T0, ZERO, Window, cancel_tx, order, place_tx, tx
 
 N = "0x" + "e" * 40
@@ -264,6 +267,17 @@ def test_summary_reports_fill_recall_and_precision(tmp_path):
     real_buy(w, h, "0xa1", M, sz="0.0005")              # engine filled 0.001 from M: half was real
     res, rows = run(w, tmp_path)
     assert res["all:fill_recall"] == "1.0000" and res["all:fill_precision"] == "0.5000"
+    assert res["all:fill_f1"] == "0.6667" and res["g1_target"] == "pass"
+
+
+def test_g1_target_fails_below_80_percent_recall(tmp_path):
+    w = Window(tmp_path)
+    h = two_makers_then_taker(w)                         # engine fills M; chain filled N
+    real_buy(w, h, "0xa1", N)
+    res, _ = run(w, tmp_path)
+    assert res["all:fill_recall"] == "0.0000" and res["g1_target"] == "fail"
+    summary = dict(csv.reader(open(tmp_path / "out" / "summary.csv")))
+    assert summary["g1_target"] == "fail" and "0.80" in summary["g1_target_rule"]
 
 
 def test_nearest_ratio_reaches_the_resolver(tmp_path):
@@ -298,3 +312,16 @@ def test_reseed_scores_orders_placed_after_it_strictly(tmp_path):
     _, rows = run(reseed_window(tmp_path, quote_after_reseed=True), tmp_path, reseed=True)
     r = row(rows, "0xa1")
     assert r["status"] == "mismatch" and r["match_px_sz"] == 1
+
+
+def test_touch_reconcile_reaches_the_replay_and_the_summary(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 10, [("59990", "0.003")], [(PX, "0.001")])
+    w.block([], dt_ms=0)
+    w.bbo("BTC", T0 + 50, ("59990", "0.001", 1), (PX, "0.001", 1))
+    w.block([], dt_ms=100)
+    res, _ = run(w, tmp_path, touch_reconcile=True, touch_n_cap=True)
+    assert res["touch_reconcile"] == "bbo every block + n cap"
+    assert res["touch_reconciled"]["BTC:trimmed"] == ASSETS_BTC.sz_to_lots("0.002")
+    summary = dict(csv.reader(open(tmp_path / "out" / "summary.csv")))
+    assert summary["touch_reconcile:BTC:trimmed"] == str(ASSETS_BTC.sz_to_lots("0.002"))
