@@ -149,7 +149,7 @@ def test_two_consistent_assignments_fall_back_and_never_guess():
     # adjacent counts 0 and 1 are within the pair slack: (X1, X3) and (X2, X3) both fit
     eng, res, (x1, x2, x3) = joint_setup([0, 1, 40], [(0, 5000), (1000, 6000)], [5000, 5040])
     assert len(cancel2(eng, 5000)) == 1
-    assert {x1, x2, x3} <= set(eng.books[0].index) if hasattr(eng.books[0], "index") else True
+    assert x1 in eng.books[0] and x2 in eng.books[0]
     assert res.stats["resolved_block"] == 0 and res.stats["block_conflict"] >= 1
 
 
@@ -188,3 +188,79 @@ def test_in_tx_group_uses_exact_spacing_inside_a_placement_tx():
     assert cancel2(eng, 5000) == [] and xs[0] not in eng.books[0]
     assert cancel2(eng, 5002) == [] and xs[2] not in eng.books[0] and xs[1] in eng.books[0]
     assert res.stats["resolved_group"] == 2
+
+
+# ------------------------------------------- stress worlds with random-walk drift (copied from agent 4's repro)
+import random as _random
+
+
+class GWorld:
+    """Users place single orders at counts (true oid = base + k + random-walk invisible ids) and cancel groups
+    of them in block 2; truth is known by construction."""
+
+    def __init__(self, orders, groups, drift_per_mille, walk_seed, **kw):
+        self.base = 5_000_000
+        rng, extra, last = _random.Random(walk_seed), 0, 0
+        self.true = [0] * len(orders)
+        for i in sorted(range(len(orders)), key=lambda j: orders[j][1]):
+            extra += sum(1 for _ in range(orders[i][1] - last) if rng.random() < drift_per_mille / 1000)
+            last = orders[i][1]
+            self.true[i] = self.base + orders[i][1] + extra
+        counts = {(1, i, 0): k for i, (_, k) in enumerate(orders)}
+        kmax = max(k for _, k in orders) + 1000
+        counts[(1, len(orders), 0)] = kmax
+        anchors = [(0, self.base), (kmax, self.base + kmax + kmax * drift_per_mille // 1000)]
+        bg = {(2, u): [(0, self.true[i]) for i in idx] for u, idx in groups.items()}
+        self.eng = Engine()
+        self.res = OidResolver(self.eng, OidEstimator(counts, anchors, block_groups=bg), **kw)
+        self.eng.resolve_oid = self.res
+        self.eo = []
+        for i, (u, k) in enumerate(orders):
+            a = Place(user=u, block=1, asset=0, side=Side.BUY, px=1000 + i, sz=1, tif=Tif.ALO, cloid=None,
+                      reduce_only=False, tx_index=i, item_index=0, hash="0x1", priority=None)
+            before = self.eng.next_oid
+            self.eng.apply(a)
+            self.res.note(a, before)
+            self.eo.append(before)
+
+    def run(self, groups):
+        correct = wrong = 0
+        for u, idx in groups.items():
+            for i in idx:
+                snap = {e for e in self.eo if e in self.eng.books[0]}
+                self.eng.apply(Cancel(user=u, block=2, asset=0, oid=self.true[i], tx_index=0, item_index=0,
+                                      hash="0x2", priority=None))
+                gone = snap - {e for e in self.eo if e in self.eng.books[0]}
+                if gone == {self.eo[i]}:
+                    correct += 1
+                elif gone:
+                    wrong += 1
+        return correct, wrong
+
+
+def stress_world(seed, **kw):
+    rng = _random.Random(seed)
+    users = ["u1", "u2", "u3"]
+    n = rng.choice([15, 40, 80])
+    orders = [(rng.choice(users), k) for k in sorted(rng.sample(range(50, 1900), n))]
+    groups = {}
+    for u in users:
+        mine = [i for i, (uu, _) in enumerate(orders) if uu == u]
+        if len(mine) >= 2:
+            groups[u] = sorted(rng.sample(mine, min(len(mine), rng.randint(2, 6))))
+    return GWorld(orders, groups, rng.choice([10, 30, 50]), seed, **kw), groups
+
+
+@pytest.mark.parametrize("seed", [392, 838, 961])
+def test_margin_guard_removes_the_known_wrong_resolutions(seed):
+    w, groups = stress_world(seed)
+    assert w.run(groups)[1] == 0
+
+
+def test_stress_worlds_have_zero_wrong_and_the_joint_layer_still_fires():
+    correct = wrong = fired = 0
+    for seed in range(1500):
+        w, groups = stress_world(seed)
+        c, bad = w.run(groups)
+        correct, wrong, fired = correct + c, wrong + bad, fired + w.res.stats["resolved_block"]
+    assert wrong == 0 and fired > 0
