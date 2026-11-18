@@ -221,7 +221,8 @@ class OidResolver:
     def __init__(self, engine, est: OidEstimator, base: int = 50, per_mille: int = 50, nearest_ratio: int = 0,
                  joint_tx: bool = True, joint_block: bool = True, group_gap: int = 0,
                  pair_slack: int = 3, pair_lo: int = 2, pair_per_mille: int = 80, node_budget: int = 20000,
-                 guard_mult: int = 2, ghost_guard: bool = True):
+                 guard_mult: int = 2, ghost_guard: bool = True, max_tol: int | None = None,
+                 ratio_per_mille: int | None = None):
         """nearest_ratio > 0: when several orders are within tolerance, accept the nearest one only if
         every other is at least nearest_ratio times farther (and >= base ids farther); 0 = never.
         joint_tx / joint_block: the two joint layers (module doc). group_gap: ids that may be missing
@@ -229,7 +230,8 @@ class OidResolver:
         self.joint_tx, self.joint_block, self.group_gap = joint_tx, joint_block, group_gap
         self.pair_slack, self.pair_lo, self.pair_per_mille = pair_slack, pair_lo, pair_per_mille
         self.node_budget, self.guard_mult = node_budget, guard_mult
-        self.ghost_guard = ghost_guard
+        self.ratio_per_mille = ratio_per_mille          # refuse when |est - oid| > ratio * tolerance (None = off)
+        self.ghost_guard, self.max_tol = ghost_guard, max_tol     # max_tol: orders whose tolerance is larger are never candidates
         a = est.anchors
         spans = [est.distance_to_anchor(min(est.counts.values())), est.distance_to_anchor(max(est.counts.values()))] if est.counts and a else [0]
         spans += [k1 - k0 for (k0, _), (k1, _) in zip(a, a[1:])]
@@ -256,7 +258,11 @@ class OidResolver:
             return
         e = self.est.estimate_count(k)
         if e is not None:
-            self.hl[engine_oid] = (e, self.est.tolerance(k, self.base, self.per_mille))
+            tol = self.est.tolerance(k, self.base, self.per_mille)
+            if self.max_tol is not None and tol > self.max_tol:
+                self.stats["far_from_anchor"] += 1        # estimate too loose to resolve against: not a candidate
+                return
+            self.hl[engine_oid] = (e, tol)
             self.meta[engine_oid] = (k, (action.block, action.tx_index))
 
     def __call__(self, user: str, asset: int, hl_oid: int) -> int | None:
@@ -290,7 +296,7 @@ class OidResolver:
                 self.stats["ambiguous"] += 1            # never guess between two of the user's orders
                 self._last_reason = "ambiguous"
                 return None
-        if self._is_ghosted(user, asset, hl_oid):
+        if self._refused(user, asset, hl_oid, hits[0][1]):
             return None
         if len(hits) > 1:
             self.stats["resolved_nearest"] += 1
@@ -298,7 +304,14 @@ class OidResolver:
         self.last = hits[0][1]
         return self.last
 
-    def _is_ghosted(self, user: str, asset: int, hl_oid: int) -> bool:
+    def _refused(self, user: str, asset: int, hl_oid: int, x: int) -> bool:
+        """Final per-order guards on a resolution to engine order x: ratio, then ghost."""
+        if self.ratio_per_mille is not None:
+            e, tol = self.hl[x]
+            if abs(e - hl_oid) * 1000 > self.ratio_per_mille * tol:
+                self.stats["ratio"] += 1
+                self._last_reason = "ratio"
+                return True
         if self.ghost_guard and self._ghosts(user, asset, hl_oid) > 1:
             self.stats["ghost"] += 1                    # abstain: another placement of the user could be the target
             self._last_reason = "ghost"
@@ -350,7 +363,7 @@ class OidResolver:
                                        else self._analyse_block(user, grp))
             oid = res.get(item)
             if oid is not None and oid in self.engine.books[asset]:
-                if self._is_ghosted(user, asset, hl_oid):
+                if self._refused(user, asset, hl_oid, oid):
                     return None
                 self.stats["resolved_group" if layer == "tx" else "resolved_block"] += 1
                 return oid

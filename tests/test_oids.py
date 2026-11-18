@@ -116,6 +116,7 @@ def test_from_files_is_built_once_per_process_and_rebuilt_when_an_input_changes(
 
 # ------------------------------------------------------------------ joint resolution (agent 3)
 def joint_setup(ks, anchors, block_items, nearest_ratio=0, **kw):
+    kw = {"joint_block": True, **kw}
     """User 'u' places one order per count k in ks (block 1, one tx each); block_items = the user's
     int-oid cancel items of block 2."""
     counts = {(1, i, 0): k for i, k in enumerate(ks)}
@@ -182,7 +183,7 @@ def test_in_tx_group_uses_exact_spacing_inside_a_placement_tx():
     counts = {(1, 0, 0): 0, (1, 0, 1): 1, (1, 0, 2): 2, (1, 1, 0): 3, (1, 9, 0): 1000}
     e = OidEstimator(counts, [(0, 5000), (1000, 6000)], groups={(2, "u"): [[(0, 5000), (0, 5002)]]})
     eng = Engine()
-    res = OidResolver(eng, e, joint_block=False)
+    res = OidResolver(eng, e, joint_tx=True)
     eng.resolve_oid = res
     xs = [place(eng, res, "u", p, 100 + i) for i, p in enumerate([(1, 0, 0), (1, 0, 1), (1, 0, 2), (1, 1, 0)])]
     assert cancel2(eng, 5000) == [] and xs[0] not in eng.books[0]
@@ -199,6 +200,7 @@ class GWorld:
     of them in block 2; truth is known by construction."""
 
     def __init__(self, orders, groups, drift_per_mille, walk_seed, **kw):
+        kw = {"joint_block": True, "joint_tx": True, **kw}
         self.base = 5_000_000
         rng, extra, last = _random.Random(walk_seed), 0, 0
         self.true = [0] * len(orders)
@@ -304,3 +306,36 @@ def test_estimator_collects_every_placement_per_user_and_asset(tmp_path):
     window, _ = w.write()
     est = OidEstimator.from_window(window, [])
     assert est.placers[(A.lower(), 0)] == [0, 2] and est.placers[(A.lower(), 1)] == [1]
+
+
+def test_far_from_anchor_orders_are_never_candidates():
+    # anchors 2,000,000 counts apart: tolerance in the middle is 50 + 5% * 1,000,000 = 50,050 > max_tol
+    counts = {(1, 0, 0): 0, (1, 1, 0): 1_000_000, (1, 2, 0): 2_000_000}
+    anchors = [(0, 5000), (2_000_000, 2_005_000)]
+    for cap, resolved in ((2000, 0), (None, 1)):
+        e = OidEstimator(counts, anchors)
+        eng = Engine()
+        res = OidResolver(eng, e, max_tol=cap, ghost_guard=False)
+        eng.resolve_oid = res
+        oid = place(eng, res, "u", (1, 1, 0), 100)
+        _, rej = eng.apply(Cancel(user="u", **{**META, "block": 2}, asset=0, oid=1_005_000 + 7))
+        assert res.stats["resolved"] == resolved
+        if cap:
+            assert res.stats["far_from_anchor"] == 1 and oid in eng.books[0] and res.stats["no_candidate"] == 1
+
+
+def test_ratio_guard_refuses_a_candidate_far_inside_the_tolerance():
+    counts = {(1, 0, 0): 0, (1, 1, 0): 500, (1, 2, 0): 1000}
+    for r, resolved in ((None, 1), (500, 0), (900, 1)):
+        eng = Engine()
+        res = OidResolver(eng, OidEstimator(counts, [(0, 5000), (1000, 6000)]), ratio_per_mille=r, ghost_guard=False)
+        eng.resolve_oid = res
+        place(eng, res, "u", (1, 1, 0), 100)               # estimate 5500, tolerance 50 + 5% * 500 = 75
+        eng.apply(Cancel(user="u", **{**META, "block": 2}, asset=0, oid=5500 + 60))   # 60 of 75 = 0.8
+        assert res.stats["resolved"] == resolved
+        assert res.stats["ratio"] == (1 - resolved if r else 0)
+
+
+def test_defaults_are_the_safe_ones():
+    r = OidResolver(Engine(), OidEstimator({}, []))
+    assert (r.joint_tx, r.joint_block, r.ghost_guard, r.max_tol, r.ratio_per_mille) == (True, True, True, None, None)
