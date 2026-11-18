@@ -215,14 +215,15 @@ class OidResolver:
 
     def __init__(self, engine, est: OidEstimator, base: int = 50, per_mille: int = 50, nearest_ratio: int = 0,
                  joint_tx: bool = True, joint_block: bool = True, group_gap: int = 0,
-                 pair_slack: int = 3, pair_lo: int = 2, pair_per_mille: int = 80, node_budget: int = 20000):
+                 pair_slack: int = 3, pair_lo: int = 2, pair_per_mille: int = 80, node_budget: int = 20000,
+                 guard_mult: int = 2):
         """nearest_ratio > 0: when several orders are within tolerance, accept the nearest one only if
         every other is at least nearest_ratio times farther (and >= base ids farther); 0 = never.
         joint_tx / joint_block: the two joint layers (module doc). group_gap: ids that may be missing
         between two items of one placement tx. pair_*: cross-tx spacing tolerance (module doc)."""
         self.joint_tx, self.joint_block, self.group_gap = joint_tx, joint_block, group_gap
         self.pair_slack, self.pair_lo, self.pair_per_mille = pair_slack, pair_lo, pair_per_mille
-        self.node_budget = node_budget
+        self.node_budget, self.guard_mult = node_budget, guard_mult
         self.meta: dict[int, tuple[int, tuple[int, int]]] = {}   # engine oid -> (count k, (block, tx_index))
         self._jc_block: int | None = None
         self._jc: dict = {}
@@ -363,15 +364,18 @@ class OidResolver:
                 self.stats["block_conflict"] += 1
         return out
 
-    def _pair_ok(self, oa: int, ka: int, ob: int, kb: int) -> bool:
+    def _pair_ok(self, oa: int, ka: int, ob: int, kb: int, mult: int = 1) -> bool:
         """Offsets of two cancelled oids agree with the counted positions up to invisible-id drift."""
         if kb < ka:
             oa, ka, ob, kb = ob, kb, oa, ka
         d = (ob - oa) - (kb - ka)                       # ids spent on events we cannot see (>= 0 ideally)
-        return -self.pair_lo <= d <= self.pair_slack + (kb - ka) * self.pair_per_mille // 1000
+        return -self.pair_lo * mult <= d <= (self.pair_slack + (kb - ka) * self.pair_per_mille // 1000) * mult
 
     def _analyse_block(self, user: str, group) -> dict:
-        """Items pinned to one order in every consistent complete assignment of the user's block cancels."""
+        """Items pinned to one order in every consistent complete assignment of the user's block cancels,
+        under the pair tolerance AND under guard_mult times that tolerance, with the same answer. The wide
+        pass is the margin guard: if the true assignment violated the slack (invisible-id noise) a decoy
+        could be the only fit; with a wider tolerance the true one comes back and the item turns ambiguous."""
         items = sorted(set(group))
         if len(items) < 2:
             return {}
@@ -383,6 +387,19 @@ class OidResolver:
         if len(live) < 2:
             return {}
         live.sort(key=lambda j: (len(cands[j]), j))     # fewest candidates first: prunes early
+        narrow = self._search(items, cands, live, 1)
+        wide = self._search(items, cands, live, max(1, self.guard_mult)) if narrow is not None else None
+        if narrow is None or wide is None or not narrow:
+            self.stats["block_conflict"] += 1
+            return {}
+        out = {j_item: x for j_item, x in narrow.items() if wide.get(j_item) == x}
+        if len(out) < len(live):
+            self.stats["block_conflict"] += 1
+        return out
+
+    def _search(self, items, cands, live, mult):
+        """{item: engine oid} for items with the same order in every consistent complete assignment,
+        {} when none is consistent, None when the search budget ran out."""
         sols: list[list[int]] = []
         nodes = 0
         assign: list[tuple[int, int, int]] = []         # (j, k, x) in DFS order
@@ -398,7 +415,7 @@ class OidResolver:
                 nodes += 1
                 if nodes > self.node_budget:
                     return False
-                if x in used or any(not self._pair_ok(o, k, items[jj][1], kk) for jj, kk, _ in assign):
+                if x in used or any(not self._pair_ok(o, k, items[jj][1], kk, mult) for jj, kk, _ in assign):
                     continue
                 assign.append((j, k, x)); used.add(x)
                 ok = dfs(d + 1)
@@ -406,14 +423,11 @@ class OidResolver:
                 if not ok:
                     return False
             return True
-        if not dfs(0) or not sols:
-            self.stats["block_conflict"] += 1
-            return {}
+        if not dfs(0):
+            return None
         out = {}
         for pos, j in enumerate(sorted(live)):
             xs = {s[pos] for s in sols}
             if len(xs) == 1:
                 out[items[j]] = next(iter(xs))
-        if len(out) < len(live):
-            self.stats["block_conflict"] += 1
         return out
