@@ -304,3 +304,19 @@ def test_estimator_collects_every_placement_per_user_and_asset(tmp_path):
     window, _ = w.write()
     est = OidEstimator.from_window(window, [])
     assert est.placers[(A.lower(), 0)] == [0, 2] and est.placers[(A.lower(), 1)] == [1]
+
+
+def test_far_from_anchor_orders_are_never_candidates():
+    # anchors 2,000,000 counts apart: tolerance in the middle is 50 + 5% * 1,000,000 = 50,050 > max_tol
+    counts = {(1, 0, 0): 0, (1, 1, 0): 1_000_000, (1, 2, 0): 2_000_000}
+    anchors = [(0, 5000), (2_000_000, 2_005_000)]
+    for cap, resolved in ((2000, 0), (None, 1)):
+        e = OidEstimator(counts, anchors)
+        eng = Engine()
+        res = OidResolver(eng, e, max_tol=cap, ghost_guard=False)
+        eng.resolve_oid = res
+        oid = place(eng, res, "u", (1, 1, 0), 100)
+        _, rej = eng.apply(Cancel(user="u", **{**META, "block": 2}, asset=0, oid=1_005_000 + 7))
+        assert res.stats["resolved"] == resolved
+        if cap:
+            assert res.stats["far_from_anchor"] == 1 and oid in eng.books[0] and res.stats["no_candidate"] == 1

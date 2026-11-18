@@ -221,7 +221,7 @@ class OidResolver:
     def __init__(self, engine, est: OidEstimator, base: int = 50, per_mille: int = 50, nearest_ratio: int = 0,
                  joint_tx: bool = True, joint_block: bool = True, group_gap: int = 0,
                  pair_slack: int = 3, pair_lo: int = 2, pair_per_mille: int = 80, node_budget: int = 20000,
-                 guard_mult: int = 2, ghost_guard: bool = True):
+                 guard_mult: int = 2, ghost_guard: bool = True, max_tol: int | None = 2000):
         """nearest_ratio > 0: when several orders are within tolerance, accept the nearest one only if
         every other is at least nearest_ratio times farther (and >= base ids farther); 0 = never.
         joint_tx / joint_block: the two joint layers (module doc). group_gap: ids that may be missing
@@ -229,7 +229,7 @@ class OidResolver:
         self.joint_tx, self.joint_block, self.group_gap = joint_tx, joint_block, group_gap
         self.pair_slack, self.pair_lo, self.pair_per_mille = pair_slack, pair_lo, pair_per_mille
         self.node_budget, self.guard_mult = node_budget, guard_mult
-        self.ghost_guard = ghost_guard
+        self.ghost_guard, self.max_tol = ghost_guard, max_tol     # max_tol: orders whose tolerance is larger are never candidates
         a = est.anchors
         spans = [est.distance_to_anchor(min(est.counts.values())), est.distance_to_anchor(max(est.counts.values()))] if est.counts and a else [0]
         spans += [k1 - k0 for (k0, _), (k1, _) in zip(a, a[1:])]
@@ -256,7 +256,11 @@ class OidResolver:
             return
         e = self.est.estimate_count(k)
         if e is not None:
-            self.hl[engine_oid] = (e, self.est.tolerance(k, self.base, self.per_mille))
+            tol = self.est.tolerance(k, self.base, self.per_mille)
+            if self.max_tol is not None and tol > self.max_tol:
+                self.stats["far_from_anchor"] += 1        # estimate too loose to resolve against: not a candidate
+                return
+            self.hl[engine_oid] = (e, tol)
             self.meta[engine_oid] = (k, (action.block, action.tx_index))
 
     def __call__(self, user: str, asset: int, hl_oid: int) -> int | None:
