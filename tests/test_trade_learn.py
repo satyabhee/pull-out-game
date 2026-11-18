@@ -84,3 +84,16 @@ def test_bad_mode_fails_loudly_and_summary_reports_only_when_set(tmp_path):
     assert not any(k.startswith(("trade_learn", "learn:")) for k in res)
     res, _ = vr.run(window, hl, quiet=True, trade_learn="sweep")
     assert res["trade_learn"] == "sweep" and res["learn:swept_known_lots:BTC"] == lots("0.002")
+
+
+def test_name_clip_names_only_the_just_filled_size_and_keeps_the_rest_anonymous_behind(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 50, [], [("60010", "0.005")])
+    h1 = w.block([place_tx(A, "0xa1", 0, order(px="60010", sz="0.001", tif="Ioc"))], dt_ms=0)
+    w.trade("BTC", "B", "60010", "0.001", w.time_of(h1), "0xa1", 1, A, M)
+    window, hl = w.write()
+    r = Replay(window, hl, listing, trade_learn="both-clip")
+    list(r)
+    assert r.trade_learn == "both"
+    assert level(r, Side.SELL, "60010") == [(M, lots("0.001")), (PLACEHOLDER, lots("0.003"))]
+    r.engine.books[0].check_invariants()

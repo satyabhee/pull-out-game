@@ -253,9 +253,10 @@ class Replay:
         self.placeholder_ttl_ms, self.placeholder_queue = placeholder_ttl_ms, placeholder_queue
         self.placeholder_cap, self.reseed_keep_known = placeholder_cap, reseed_keep_known   # alias, see keep_known
         self.ph_stats: Counter = Counter()          # placeholder flag effects (lots / counts)
-        if trade_learn not in (None, "sweep", "name", "both"):
+        if trade_learn not in (None, "sweep", "name", "both", "name-clip", "both-clip"):
             raise ValueError(f"unknown trade_learn {trade_learn!r}")
-        self.trade_learn = trade_learn
+        self._name_clip = trade_learn is not None and trade_learn.endswith("-clip")
+        self.trade_learn = trade_learn.removesuffix("-clip") if trade_learn else None
         self.learn_stats: Counter = Counter()
         self._real_trades: dict[str, list] = {}
         if trade_learn is not None:
@@ -426,7 +427,12 @@ class Replay:
                 if any(nd.order.user == maker for nd in nodes) or nodes[0].order.user != PLACEHOLDER:
                     continue
                 ph, q = nodes[0].order, nodes[0].remaining
-                eng._remove(ph.oid)
+                if self._name_clip:                 # name only M's just-filled size; the rest stays anonymous
+                    q = min(q, sum(t.sz for t in trs if t.px == w and t.maker == maker))
+                if q == nodes[0].remaining:
+                    eng._remove(ph.oid)
+                else:
+                    eng.books[asset].reduce(ph.oid, q)
                 order = eng._new_order(maker, asset, side, w, q, Tif.GTC, None)
                 eng.books[asset].add(order, q, front=True)
                 eng.by_user.setdefault(maker, {})[order.oid] = None

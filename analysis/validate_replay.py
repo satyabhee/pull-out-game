@@ -559,7 +559,7 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
     if obs.wildcard_pre_reseed_known:
         res["wildcard_pre_reseed_known"] = True
     if rp.trade_learn is not None:                  # trade-learning flag: only when set
-        res["trade_learn"] = rp.trade_learn
+        res["trade_learn"] = rp.trade_learn + ("-clip" if rp._name_clip else "")
         res.update({f"learn:{k}": v for k, v in sorted(rp.learn_stats.items())})
     res.update(scope_metrics(scored))
     post = [r for r in rows if not r["warmup"]]
@@ -724,10 +724,10 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="H11, LOOK-AHEAD (measurement only): cap re-seeded levels by the next snapshot + real trades")
     ap.add_argument("--reseed-keep-known", action="store_true",
                     help="H11: alias of --keep-known")
-    ap.add_argument("--trade-learn", choices=["sweep", "name", "both"],
+    ap.add_argument("--trade-learn", choices=["sweep", "name", "both", "name-clip", "both-clip"],
                     help="correct the book from each tx's real trades after it is applied (later txs only): "
                          "sweep = remove what the real taker must have consumed; name = front placeholder at the "
-                         "last real price becomes the last real maker's order")
+                         "last real price becomes the last real maker's order (-clip: only the size that maker just filled)")
     ap.add_argument("--wildcard-pre-reseed-known", action="store_true",
                     help="H11 scoring (NOT approved, default off): with --keep-known, known engine orders placed "
                          "before the last re-seed score as WILDCARD")
