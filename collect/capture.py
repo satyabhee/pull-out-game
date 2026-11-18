@@ -25,6 +25,9 @@ Settings (environment variables):
   WINDOW_BLOCKS=6100   windows mode only (~7 min of chain)
   WARMUP_BLOCKS=1740   windows mode: warmup_end_height = start + WARMUP_BLOCKS
   MAX_ANCHORS=100      orderStatus lookups per window (chunks: CHUNK_ANCHORS=2), max 1 per 2 s
+  ANCHOR_MODE=cloid    which lookups: cloid = placements with a cloid, spread over the fetched blocks (the answer
+                       is an exact oid at a known position, so the estimator can use it); targets = the legacy
+                       int-oid cancel targets (mostly placed before the chunk, so never locatable)
   MAX_AGE_MIN=30       never request a block estimated older than this
   FRESH_MIN=20         on restart, finish a partial window only if its oldest missing block is younger
   ONCE=1               capture one window/chunk and exit (for testing)
@@ -45,6 +48,7 @@ LEAD_IN_BLOCKS = int(os.environ.get("LEAD_IN_BLOCKS", 0))   # chunks: blocks fet
 REQUEST_LOG = os.path.join(HOME, "requests.jsonl")
 MAX_ANCHORS = int(os.environ.get("MAX_ANCHORS", 100))
 CHUNK_ANCHORS = int(os.environ.get("CHUNK_ANCHORS", 2))
+ANCHOR_MODE = os.environ.get("ANCHOR_MODE", "cloid")
 FRESH_MIN = float(os.environ.get("FRESH_MIN", 20))
 # Never request a block older than this. Nov 18 log: the cap hit while fetching ~84-min-old blocks after
 # ~10.5k blocks that day, so "archived" starts far earlier than the ~3 h assumed before. Chunks fetch
@@ -123,7 +127,7 @@ class Writer:
                 if job[0] == "save":
                     self.saver(job[1], job[2])
                 else:
-                    _, user, oid, ch = job
+                    _, user, oid, ch, extra = job
                     wait = self._last_info + self.info_gap_s - time.time()
                     if wait > 0:
                         time.sleep(wait)
@@ -133,7 +137,7 @@ class Writer:
                         r = {"error": repr(e)}
                     self._last_info = time.time()
                     with self.lock:
-                        self.anchors.append({"user": user, "oid": oid, "cancel_height": ch,
+                        self.anchors.append({**extra, "user": user, "oid": oid, "cancel_height": ch,
                                              "asked_at": self._last_info, "answer": r})
             except Exception as e:                       # a failed save must not vanish silently
                 with self.lock:
@@ -144,8 +148,10 @@ class Writer:
     def save(self, path, data):
         self.q.put(("save", path, data))
 
-    def ask(self, user, oid, cancel_height):
-        self.q.put(("anchor", user, oid, cancel_height))
+    def ask(self, user, oid, cancel_height, extra=None):
+        """extra: more fields stored on the anchor record (never a "height" key: data/oids.py reads that
+        as its own anchor format)."""
+        self.q.put(("anchor", user, oid, cancel_height, extra or {}))
 
     def snapshot(self):
         with self.lock:
@@ -179,6 +185,67 @@ def count_fetch(state, age_min):
         state["max_age_today_s"] = max(state["max_age_today_s"], round(age_min * 60, 1))
 
 
+def placement_items(tx):
+    """BTC/ETH limit placements with a cloid in one successful tx: [(item_index, item)]. Item numbering matches
+    data/parse.py and data/oids.py (order list / modify / batchModify list); triggers are skipped."""
+    if tx.get("error") is not None:
+        return []
+    a = tx.get("action") or {}
+    kind = a.get("type")
+    items = (a.get("orders", []) if kind == "order" else [a.get("order", {})] if kind == "modify"
+             else [m.get("order", {}) for m in a.get("modifies", [])] if kind == "batchModify" else [])
+    return [(i, o) for i, o in enumerate(items)
+            if isinstance(o, dict) and o.get("a") in (0, 1) and o.get("c") and "limit" in (o.get("t") or {})]
+
+
+class AnchorPicker:
+    """Which orderStatus lookups to make while a window/chunk is fetched (one pick per segment of blocks).
+
+    mode "cloid": ask by (user, cloid) for a PLACEMENT inside the fetched blocks. The answer carries the order's real
+    oid and timestamp, so data/oids.py can locate it in the blocks and use it as an anchor (an exact oid at a known
+    position). Each segment's pick is the placement in the middle of that segment's candidates (deterministic), so
+    anchors are spread evenly; a cloid seen twice in the fetched blocks is skipped (it would not locate uniquely).
+    mode "targets" (legacy): the int-oid cancel targets, quieter users first; mostly placed before the window."""
+
+    def __init__(self, mode=None, asked=()):
+        self.mode = ANCHOR_MODE if mode is None else mode
+        if self.mode not in ("cloid", "targets"):
+            raise ValueError(f"ANCHOR_MODE must be cloid or targets, not {self.mode!r}")
+        self.asked, self.pending, self.seen = set(asked), [], collections.Counter()
+
+    def feed(self, height, block):
+        for t, tx in enumerate(block["txs"]):
+            if self.mode == "cloid":
+                for i, o in placement_items(tx):
+                    self.seen[(tx["user"].lower(), o["c"])] += 1
+                    self.pending.append((height, t, i, tx["user"], o["c"]))
+            else:
+                a = tx["action"]
+                if a.get("type") == "cancel" and tx["error"] is None:
+                    for c in a.get("cancels", []):
+                        if c.get("a") in (0, 1) and isinstance(c.get("o"), int):
+                            self.pending.append((height, tx["user"], c["o"]))
+
+    def take(self):
+        """The lookup for the segment that just ended: (user, oid_or_cloid, extra_fields_for_the_record), or None.
+        Clears the segment's candidates either way."""
+        pend, self.pending = self.pending, []
+        if self.mode == "targets":
+            per_user = collections.Counter(u for _, u, _ in pend)
+            pend.sort(key=lambda c: per_user[c[1]])
+            ch, user, oid = next(((ch, u, o) for ch, u, o in pend if (u, o) not in self.asked), (None, None, None))
+            if not user:
+                return None
+            self.asked.add((user, oid))
+            return user, oid, {"cancel_height": ch}
+        ok = [c for c in pend if (c[3], c[4]) not in self.asked and self.seen[(c[3].lower(), c[4])] == 1]
+        if not ok:
+            return None
+        h, t, i, user, cloid = ok[len(ok) // 2]
+        self.asked.add((user, cloid))
+        return user, cloid, {"kind": "cloid", "placed_height": h, "tx": t, "item": i}
+
+
 def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max_anchors=None):
     """Fetch start..end oldest-first into its folder; collect anchors as we go. Returns final status."""
     writer = writer or Writer()
@@ -189,9 +256,9 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
     os.makedirs(d, exist_ok=True)
     wpath, apath = os.path.join(d, "window.json"), os.path.join(d, "anchors.json")
     old = json.load(open(apath)) if os.path.exists(apath) else []
-    asked = {(a["user"], a["oid"]) for a in old}
+    picker = AnchorPicker(asked={(a["user"], a["oid"]) for a in old})
     every = max(1, (end - start + 1) // max(1, max_anchors))   # spread lookups across the window
-    pending, n_asked = [], len(old)
+    n_asked = len(old)
     meta.setdefault("fetch_started", time.time())
     meta.update(start_height=start, end_height=end, warmup_end_height=start + warmup, status="fetching")
     meta.setdefault("failed_heights", [])
@@ -239,23 +306,15 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
             elif os.path.exists(p):
                 bt = (lambda x: x.get("blockDetails", x))(json.load(gzip.open(p, "rt")))["blockTime"]
                 meta["first_block_time" if h == start else "last_block_time"] = bt
-        if b is not None:                                     # remember BTC/ETH int-oid cancels for anchors
-            for tx in b["txs"]:
-                a = tx["action"]
-                if a.get("type") == "cancel" and tx["error"] is None:
-                    for c in a.get("cancels", []):
-                        if c.get("a") in (0, 1) and isinstance(c.get("o"), int):
-                            pending.append((h, tx["user"], c["o"]))
-        # one orderStatus lookup per `every` blocks, quieter users first; the writer paces them >= 2 s apart
-        if pending and n_asked < max_anchors and i % every == 0:
-            per_user = collections.Counter(u for _, u, _ in pending)
-            pending.sort(key=lambda c: per_user[c[1]])
-            ch, user, oid = next(((ch, u, o) for ch, u, o in pending if (u, o) not in asked), (None, None, None))
-            if user:
-                asked.add((user, oid))
+        if b is not None:
+            picker.feed(h, b)
+        # one orderStatus lookup at the end of every `every`-block segment; the writer paces them >= 2 s apart
+        if n_asked < max_anchors and (i + 1) % every == 0:
+            pick = picker.take()
+            if pick:
+                user, oid, extra = pick
                 n_asked += 1
-                writer.ask(user, oid, ch)
-            pending = []
+                writer.ask(user, oid, extra.get("cancel_height"), extra)
         if i % 300 == 0 and i:
             meta["blocks_on_disk"] = len(glob.glob(os.path.join(d, "*.json.gz")))
             save_json(wpath, meta); save_json(apath, old + writer.snapshot())
