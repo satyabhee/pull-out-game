@@ -53,12 +53,51 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from data.parse import iter_trades, recorder_hours
-from engine_py.matching import PLACEHOLDER
+from engine_py.matching import PLACEHOLDER, Engine
 from engine_py.replay import COINS, OUTSIDE_FILL_POSITION, Observer, Replay, listing
 from engine_py.types import (ASSETS, Cancel, CancelByCloid, Modify, OutsideFill, Place, RejectReason, Side,
                              Tif, ZERO_HASH)
 
-POLICIES = {"listing": listing}
+
+
+# --- G1 triage (H1), THROWAWAY measurement policies: not the ordering track's policies (engine_py/ordering.py).
+# Hyperliquid docs: within a block, actions that send no GTC/IOC order run first, then cancels, then
+# actions that send at least one GTC/IOC; within a class, proposer order. Consensus batches are not
+# visible in explorer blocks, so the whole block is treated as one batch.
+
+def tx_class(actions_of_tx) -> int:
+    """0: no GTC/IOC order (incl. ALO-only, scheduleCancel); 1: cancel; 2: sends a GTC/IOC order.
+    Classified on the tx's decoded BTC/ETH items only."""
+    if any((a.new if isinstance(a, Modify) else a).tif is not Tif.ALO
+           for a in actions_of_tx if isinstance(a, (Place, Modify))):
+        return 2
+    if any(isinstance(a, (Cancel, CancelByCloid)) for a in actions_of_tx):
+        return 1
+    return 0
+
+
+def _tx_classes(actions) -> dict:
+    by_tx = defaultdict(list)
+    for a in actions:
+        by_tx[a.tx_index].append(a)
+    return {k: tx_class(v) for k, v in by_tx.items()}
+
+
+def class_policy(actions):
+    """(class, tx_index, item_index): cancels before every GTC/IOC taker in the block."""
+    cls = _tx_classes(actions)
+    return sorted(actions, key=lambda a: (cls[a.tx_index], a.tx_index, a.item_index))
+
+
+def priority_policy(actions):
+    """class_policy, then GTC/IOC txs by grouping.p descending (priority fee; docs: IOCs >= 8 bps
+    in a 70 ms bucket sort by fee) instead of proposer order. No p sorts as 0."""
+    cls = _tx_classes(actions)
+    return sorted(actions, key=lambda a: (cls[a.tx_index], -(a.priority or 0) if cls[a.tx_index] == 2 else 0,
+                                          a.tx_index, a.item_index))
+
+
+POLICIES = {"listing": listing, "class": class_policy, "priority": priority_policy}
 
 CATEGORIES = ("outside-fill timing", "wrong ALO decision", "unknown pre-window order", "unresolved cancel",
               "ordering", "margin rejection (unobservable)", "real bug (unexplained)")
@@ -342,19 +381,24 @@ def book_text(book, side, depth=BOOK_DEPTH) -> str:
 
 def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
         alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False,
-        touch_reconcile=False, touch_n_cap=False, keep_known=False, skip_lead_in=False):
+        touch_reconcile=False, touch_n_cap=False, keep_known=False, skip_lead_in=False,
+        snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
+        outside_other_txs=False):
+    """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
                 gate_max_age_ms=gate_max_age_ms, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
                 reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap,
-                keep_known=keep_known, skip_lead_in=skip_lead_in)
+                keep_known=keep_known, skip_lead_in=skip_lead_in,
+                snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
+                engine=engine if engine is not None else Engine(stp=stp))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
         if tr.hash != ZERO_HASH:
             real_by_hash[tr.hash].append(tr)
     alo_truth = load_alo_status(hl_data, heights, rp.t0, rp.t1)
-    obs = ValidateObserver(real_by_hash, alo_truth)
+    obs = (observer_cls or ValidateObserver)(real_by_hash, alo_truth)
     rp.observer = obs
     for _ in rp:
         pass
@@ -484,6 +528,11 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
            "lead_in": "skipped" if rp.skip_lead_in and rp.lead_in else f"{rp.lead_in} blocks" if rp.lead_in else "none",
            "touch_reconcile": ("bbo every block" + (" + n cap" if rp.touch_n_cap else "")) if rp.touch_reconcile else "off",
            "real_linked_txs_not_in_window": unlinked}
+    triage = {"snapshot_shift": rp.snapshot_shift, "shift_dropped": rp.shift_dropped,
+              "outside_position": rp.outside_position, "stp": rp.engine.stp,
+              "outside_fill_other_tx": rp.parse_stats["outside_fill_other_tx"]}
+    if (rp.snapshot_shift, rp.outside_position, rp.engine.stp, rp.outside_other_txs) != (0, "end", "cancel_taker", False):
+        res.update(triage)                          # G1 triage flags: only when not the default
     res.update(scope_metrics(scored))
     post = [r for r in rows if not r["warmup"]]
     res["excluded_real_maker_prewindow"] = sum(r["status"].startswith("excluded") for r in post)
@@ -633,6 +682,11 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     ap.add_argument("--keep-known", action="store_true",
                     help="with --reseed: keep known orders at each snapshot, refill missing size at the front")
     ap.add_argument("--skip-lead-in", action="store_true", help="lead-in chunks: replay only the scored part")
+    ap.add_argument("--snapshot-shift", type=int, default=0, help="triage H4: apply snapshots k blocks later (<0 earlier)")
+    ap.add_argument("--outside-position", choices=["end", "start"], default="end", help="triage H7")
+    ap.add_argument("--outside-other-txs", action="store_true",
+                    help="triage H9: trades linked to non-book txs (SetGlobalAction) become outside fills")
+    ap.add_argument("--stp", choices=["cancel_taker", "expire_maker"], default="cancel_taker", help="triage H8")
 
 
 def replay_kwargs(a) -> dict:
@@ -640,7 +694,9 @@ def replay_kwargs(a) -> dict:
     return dict(use_resolver=not a.no_resolver, alo_gate=a.alo_gate, gate_max_age_ms=a.gate_max_age_ms,
                 evict_known=a.evict_known, nearest_ratio=a.nearest_ratio, reseed=a.reseed,
                 touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap,
-                keep_known=a.keep_known, skip_lead_in=a.skip_lead_in)
+                keep_known=a.keep_known, skip_lead_in=a.skip_lead_in,
+                snapshot_shift=a.snapshot_shift, outside_position=a.outside_position, stp=a.stp,
+                outside_other_txs=a.outside_other_txs)
 
 
 def options_tag(a) -> str:
@@ -649,7 +705,10 @@ def options_tag(a) -> str:
                     f"-evict{a.evict_known}" if a.evict_known else "",
                     f"-nr{a.nearest_ratio}" if a.nearest_ratio else "", "-reseed" if a.reseed else "",
                     "-touch" if a.touch_reconcile else "", "-ncap" if a.touch_n_cap else "",
-                    "-keep" if a.keep_known else "", "-nolead" if a.skip_lead_in else ""])
+                    "-keep" if a.keep_known else "", "-nolead" if a.skip_lead_in else "",
+                    f"-shift{a.snapshot_shift}" if a.snapshot_shift else "",
+                    "-ofstart" if a.outside_position == "start" else "", "-stpexpire" if a.stp == "expire_maker" else "",
+                    "-ofother" if a.outside_other_txs else ""])
 
 
 def main(argv=None):
