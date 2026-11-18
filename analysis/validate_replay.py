@@ -400,7 +400,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
         outside_other_txs=False, other_position="end", placeholder_ttl_ms=None,
         placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False,
-        trade_learn=None, oid_guard=None):
+        trade_learn=None, oid_guard=None, refill_position="front"):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
@@ -410,7 +410,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
                 other_position=other_position, placeholder_ttl_ms=placeholder_ttl_ms,
                 placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap,
-                reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, oid_guard=oid_guard, engine=engine if engine is not None else Engine(stp=stp))
+                reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, oid_guard=oid_guard, refill_position=refill_position, engine=engine if engine is not None else Engine(stp=stp))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -562,6 +562,8 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
         res.update({f"ph:{k}": v for k, v in sorted(rp.ph_stats.items())})
     if obs.wildcard_pre_reseed_known:
         res["wildcard_pre_reseed_known"] = True
+    if rp.refill_position != "front":
+        res["refill_position"] = rp.refill_position
     if rp.oid_guard not in (None, "ghost"):
         res["oid_guard"] = rp.oid_guard
     if rp.trade_learn is not None:                  # trade-learning flag: only when set
@@ -730,6 +732,8 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="H11, LOOK-AHEAD (measurement only): cap re-seeded levels by the next snapshot + real trades")
     ap.add_argument("--reseed-keep-known", action="store_true",
                     help="H11: alias of --keep-known")
+    ap.add_argument("--refill-position", choices=["front", "back"], default="front",
+                    help="keep-known: missing snapshot size goes ahead of known orders (front) or behind them")
     ap.add_argument("--oid-guard", choices=["ghost", "ratio25", "ratio50", "cap3000", "none"],
                     help="int-oid resolver preset (default ghost = data/oids defaults; none = old rule)")
     ap.add_argument("--trade-learn", metavar="RULES", default=DEFAULT_TRADE_LEARN,
@@ -756,7 +760,7 @@ def replay_kwargs(a) -> dict:
                 placeholder_cap=a.placeholder_cap, reseed_keep_known=a.reseed_keep_known,
                 wildcard_pre_reseed_known=a.wildcard_pre_reseed_known,
                 trade_learn=None if a.trade_learn == "off" else a.trade_learn,
-                oid_guard=a.oid_guard)
+                oid_guard=a.oid_guard, refill_position=a.refill_position)
 
 
 def options_tag(a) -> str:
@@ -776,7 +780,8 @@ def options_tag(a) -> str:
                     "-wcknown" if a.wildcard_pre_reseed_known else "",
                     "-tloff" if a.trade_learn == "off" else
                     f"-tl{a.trade_learn.replace(',', '+')}" if a.trade_learn != DEFAULT_TRADE_LEARN else "",
-                    f"-og{a.oid_guard}" if a.oid_guard not in (None, "ghost") else ""])
+                    f"-og{a.oid_guard}" if a.oid_guard not in (None, "ghost") else "",
+                    "-refillback" if a.refill_position == "back" else ""])
 
 
 def main(argv=None):

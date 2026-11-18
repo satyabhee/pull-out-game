@@ -143,3 +143,21 @@ def test_cli_default_is_sweep_queue_name_clip_and_off_disables_it(tmp_path):
     assert f"trade_learn,\"{vr.DEFAULT_TRADE_LEARN}\"" in (tmp_path / "d" / "summary.csv").read_text()
     vr.main([str(window), "--hl-data", str(hl), "--trade-learn", "off", "--out", str(tmp_path / "o")])
     assert "trade_learn" not in (tmp_path / "o" / "summary.csv").read_text()
+
+
+def test_refill_back_puts_missing_snapshot_size_behind_known_orders(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 50, [], [])
+    w.block([place_tx(M, "0xm1", 0, order(buy=False, px="60010", sz="0.001", tif="Gtc"))], dt_ms=0)
+    w.book("BTC", T0 + 500, [], [("60010", "0.003")])
+    w.block([], dt_ms=1000)
+    window, hl = w.write()
+    front = Replay(window, hl, listing, reseed=True, keep_known=True)
+    list(front)
+    assert level(front, Side.SELL, "60010") == [(PLACEHOLDER, lots("0.002")), (M, lots("0.001"))]
+    back = Replay(window, hl, listing, reseed=True, keep_known=True, refill_position="back")
+    list(back)
+    assert level(back, Side.SELL, "60010") == [(M, lots("0.001")), (PLACEHOLDER, lots("0.002"))]
+    back.engine.books[0].check_invariants()
+    with pytest.raises(ValueError):
+        Replay(window, hl, listing, refill_position="middle")

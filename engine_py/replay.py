@@ -159,7 +159,7 @@ class Replay:
                  other_position: str = "end",
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
                  placeholder_cap: str | None = None, reseed_keep_known: bool = False,
-                 trade_learn: str | None = None, oid_guard: str | None = None):
+                 trade_learn: str | None = None, oid_guard: str | None = None, refill_position: str = "front"):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -217,6 +217,8 @@ class Replay:
           "name-clip": as name, but only the size M just filled is named; the rest stays anonymous.
           Rules combine with commas, applied sweep, queue, name: e.g. "sweep,queue,name-clip".
           Aliases: "both" = "sweep,name", "both-clip" = "sweep,name-clip". Counters in `learn_stats`.
+        refill_position (keep_known): "front" (default) = Engine.refill's placement, missing snapshot size
+        ahead of every known order at the level; "back" = moved behind them (known orders queue first).
         oid_guard (int-oid resolver preset; None/"ghost" = data/oids defaults): "ratio25" / "ratio50"
         (ratio guard, ghost off), "cap3000" (max_tol 3000, ghost off), "none" (old rule: ghost and
         joint layers off).
@@ -272,6 +274,9 @@ class Replay:
         if oid_guard not in OID_GUARDS:
             raise ValueError(f"unknown oid_guard {oid_guard!r}")
         self.oid_guard = oid_guard
+        if refill_position not in ("front", "back"):
+            raise ValueError(f"unknown refill_position {refill_position!r}")
+        self.refill_position = refill_position
         self.learn_stats: Counter = Counter()
         self._real_trades: dict[str, list] = {}
         if self._rules:
@@ -397,6 +402,16 @@ class Replay:
         i = bisect.bisect_left(trs, (t0, -1))
         j = bisect.bisect_left(trs, (t1, -1))
         return sum(q for _, q in trs[i:j])
+
+    def _refill_to_back(self, asset: int, first_oid: int) -> None:
+        """refill_position="back": move the placeholders Engine.refill just created behind the level."""
+        book = self.engine.books[asset]
+        for oid in range(first_oid, self.engine.next_oid):
+            if oid in book:
+                nd = book.node(oid)
+                order, q = nd.order, nd.remaining
+                book.remove(oid)
+                book.add(order, q)
 
     def _note_refill(self, s, first_oid: int) -> None:
         """keep_known: register the placeholders Engine.refill just created (oids first_oid..) in
@@ -665,6 +680,8 @@ class Replay:
                     first = eng.next_oid
                     res.update(eng.refill(s.asset, s.bids, s.asks), refill=1)
                     self._note_refill(s, first)
+                    if self.refill_position == "back":
+                        self._refill_to_back(s.asset, first)
                 elif self.reseed:
                     res = eng.reconcile(s.asset, s.bids, s.asks)     # measure drift, then rebuild
                     res.update(eng.clear(s.asset), reseed=1)
