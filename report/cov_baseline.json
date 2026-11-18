@@ -1,0 +1,16 @@
+{
+ "stats": {
+  "prewindow": 3011,
+  "no_candidate": 26824,
+  "resolved": 12052,
+  "ambiguous": 42735,
+  "resolved_nearest": 3014
+ },
+ "lookups": 84622,
+ "shares": {
+  "resolved": "14.2%",
+  "no_candidate": "31.7%",
+  "ambiguous": "50.5%",
+  "prewindow": "3.6%"
+ }
+}
