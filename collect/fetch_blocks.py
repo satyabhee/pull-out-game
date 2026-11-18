@@ -11,15 +11,28 @@ any pacing). The explorer does not serve gzip (0 gzip responses), so Accept-Enco
 but has no effect.
 
 One request at a time (the explorer rate-limits per IP; parallel requests are slower).
+Only one explorer client per machine: Fetcher takes an exclusive lock (explorer.lock next to this file,
+or $HL_EXPLORER_LOCK), so a hand-run fetch can't share the IP's budget with the capture service.
+
+Archived-block guard (fail closed). Blocks older than ~3 h are "archived": 100/day per IP, and going
+over refuses EVERY block for the rest of the day. Archived blocks are served normally until the 100th,
+so the cap error comes too late to protect anything. Before EVERY request, Fetcher estimates the
+block's age from the nearest known (height, blockTime) reference (the recorder's newest header, or the
+last block it fetched) and raises TooOld, with no request sent, if the age is over max_age_min (120)
+or can't be estimated.
 Every block is checked
 (len(txs) == numTxs, error responses refused), written via temp file + rename, and
 skipped on rerun. Backs off on HTTP 429. Stops on the daily archived-block cap.
 capture.py imports Fetcher from this file.
 """
-import argparse, glob, gzip, http.client, json, os, random, sys, time, urllib.request
+import argparse, fcntl, glob, gzip, http.client, json, os, random, sys, time, urllib.request
 
 HOST, PATH = "rpc.hyperliquid.xyz", "/explorer"
 DEFAULT_INTERVAL = 0.8                  # pacing for --keepalive only
+BPS = 14.5                              # Hyperliquid blocks per second (approx.)
+MAX_AGE_MIN = 120.0                     # never request a block older than this (archived ~180 min)
+MAX_REF_GAP_MIN = 240.0                 # a reference further than this (in blocks / BPS) is too imprecise
+LOCK = os.environ.get("HL_EXPLORER_LOCK", os.path.join(os.path.dirname(os.path.abspath(__file__)), "explorer.lock"))
 
 
 class ArchivedCap(Exception):
@@ -30,11 +43,80 @@ class NotYet(Exception):
     """Height not produced yet ('invalid block height')."""
 
 
+class TooOld(Exception):
+    """Refused BEFORE requesting: the block may be archived, or its age can't be estimated (fail closed)."""
+
+
+class Busy(Exception):
+    """Another explorer client on this machine holds the lock."""
+
+
+def last_line(path):
+    """Last complete line of a (possibly .gz, possibly still growing) jsonl file, or None."""
+    if path.endswith(".gz"):
+        last = None
+        with gzip.open(path, "rt") as f:
+            for last in f:
+                pass
+        return last
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - 8192))
+        lines = [l for l in f.read().splitlines() if l.strip()]
+    return lines[-1].decode() if lines else None
+
+
+def recorder_head(hl_data):
+    """(height, blockTime_ms) of the newest block header the recorder wrote under hl_data, or None."""
+    for p in reversed(sorted(glob.glob(os.path.join(hl_data, "*", "*", "blocks.jsonl*")))[-2:]):
+        for _ in range(3):                     # the last line may be half-written
+            try:
+                m = json.loads(last_line(p))["msg"]
+                return int(m["height"]), int(m["blockTime"])
+            except Exception:
+                time.sleep(0.2)
+    return None
+
+
+def acquire_lock(path):
+    f = open(path, "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        raise Busy(f"another explorer client holds {path} (one client per IP; stop it first, "
+                   f"e.g. sudo systemctl stop hl-capture)")
+    return f
+
+
 class Fetcher:
-    def __init__(self, legacy=False, interval=0.0):
+    def __init__(self, legacy=False, interval=0.0, head=None, max_age_min=MAX_AGE_MIN, lock=LOCK):
+        """head: callable -> (height, blockTime_ms) of a recent block, or None. lock: path or None (tests)."""
         self.legacy, self.conn, self.interval = legacy, None, interval
         self.gzip_seen = self.plain_seen = self.http429 = 0
         self._last = 0.0
+        self.head, self.max_age_min = head, max_age_min
+        self.ref = None                        # (height, blockTime_ms) of the last block fetched
+        self._lock = acquire_lock(lock) if lock else None
+
+    def age_min(self, h):
+        """Estimated age of height h in minutes, from the nearest reference; None if no usable reference."""
+        refs = [r for r in (self.ref, self.head() if self.head else None) if r]
+        if not refs:
+            return None
+        rh, rt = min(refs, key=lambda r: abs(r[0] - h))
+        if abs(rh - h) / BPS / 60 > MAX_REF_GAP_MIN:
+            return None
+        return ((rh - h) / BPS * 1000 + time.time() * 1000 - rt) / 60000
+
+    def check_age(self, h):
+        age = self.age_min(h)
+        if age is None:
+            raise TooOld(f"block {h}: age unknown (no recorder header or fetched block near it); not requesting")
+        if age > self.max_age_min:
+            raise TooOld(f"block {h} is ~{age:.0f} min old > {self.max_age_min:.0f} min; not requesting "
+                         f"(archived blocks: 100/day per IP)")
+        return age
 
     def _pace(self):
         """Space requests >= interval apart: back-to-back keep-alive requests trip HTTP 429 (+1-2 s back-off)."""
@@ -87,9 +169,11 @@ class Fetcher:
         self.conn = None
 
     def get(self, h, tries=8):
-        """Return (parsed block, raw json bytes). Raises ArchivedCap, NotYet, or RuntimeError after `tries`."""
+        """Return (parsed block, raw json bytes). Raises TooOld (nothing sent), ArchivedCap, NotYet,
+        or RuntimeError after `tries`."""
         delay, last = 1.0, None
         for _ in range(tries):
+            self.check_age(h)                  # before EVERY request, retries included
             try:
                 status, data = self._raw(h)
                 if status == 429:
@@ -109,6 +193,8 @@ class Fetcher:
                     raise ValueError(msg)
                 if b.get("numTxs") is None or len(b["txs"]) != b["numTxs"]:
                     raise ValueError(f"incomplete: {len(b['txs'])}/{b.get('numTxs')}")
+                if b.get("blockTime"):
+                    self.ref = (h, int(b["blockTime"]))
                 return b, data
             except (ArchivedCap, NotYet):
                 raise
@@ -130,8 +216,10 @@ def main():
     ap.add_argument("start", type=int)
     ap.add_argument("end", type=int)
     ap.add_argument("--out")
-    ap.add_argument("--max-age-min", type=float, default=120,
-                    help="stop before requesting blocks older than this (archived blocks: 100/day/IP cap)")
+    ap.add_argument("--hl-data", default="hl_data",
+                    help="recorder data dir; its newest block header dates the blocks (default: ./hl_data)")
+    ap.add_argument("--max-age-min", type=float, default=MAX_AGE_MIN,
+                    help="never request blocks older than this (archived blocks: 100/day/IP cap)")
     ap.add_argument("--keepalive", action="store_true", help="one kept-open connection (measured slower)")
     ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL, help="min seconds between requests (keepalive)")
     args = ap.parse_args()
@@ -140,30 +228,22 @@ def main():
     todo = [h for h in range(args.start, args.end + 1) if not os.path.exists(os.path.join(out, f"{h}.json.gz"))]
     print(f"{args.end - args.start + 1} blocks in range, {len(todo)} to fetch "
           f"({'keep-alive' if args.keepalive else 'fresh connection per request'})")
-    f, t0, failed = Fetcher(not args.keepalive, args.interval if args.keepalive else 0), time.time(), []
-    prev_bt = None
-    hdrs = sorted(glob.glob("hl_data/*/*/blocks.jsonl"))       # recorder headers, if run next to the recorder
-    if todo and hdrs:
-        try:
-            m = json.loads(open(hdrs[-1]).readlines()[-1])
-            age = ((m["msg"]["height"] - todo[0]) / 14.5 + (time.time() * 1000 - m["recv_ms"]) / 1000) / 60
-            if age > args.max_age_min:
-                print(f"STOPPING: first block is ~{age:.0f} min old > {args.max_age_min:.0f} min; not requesting it")
-                sys.exit(2)
-        except (ValueError, KeyError, IndexError):
-            pass
+    try:
+        f = Fetcher(not args.keepalive, args.interval if args.keepalive else 0,
+                    head=lambda: recorder_head(args.hl_data), max_age_min=args.max_age_min)
+    except Busy as e:
+        print(f"STOPPING: {e}"); sys.exit(2)
+    t0, failed = time.time(), []
     for i, h in enumerate(todo, 1):
-        if prev_bt and (time.time() * 1000 - prev_bt) / 60000 > args.max_age_min:
-            print(f"STOPPING before height {h}: blocks are older than {args.max_age_min:.0f} min "
-                  f"(archived blocks are capped at 100/day per IP)"); break
         while True:
             try:
                 b, data = f.get(h)
-                prev_bt = b["blockTime"]
                 save(os.path.join(out, f"{h}.json.gz"), data)
                 break
             except NotYet:
                 time.sleep(1)                  # caught up with the head
+            except TooOld as e:
+                print(f"STOPPING: {e}"); sys.exit(2)
             except ArchivedCap as e:
                 print(f"STOPPING: explorer daily cap reached ({e})"); sys.exit(2)
             except RuntimeError as e:

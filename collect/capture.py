@@ -14,7 +14,7 @@ Settings (environment variables):
 Needs the hl-recorder service: the newest block height comes from its blocks.jsonl.
 """
 import collections, glob, gzip, json, os, shutil, sys, time, urllib.request
-from fetch_blocks import DEFAULT_INTERVAL, ArchivedCap, Fetcher, NotYet, save
+from fetch_blocks import DEFAULT_INTERVAL, ArchivedCap, Fetcher, NotYet, TooOld, last_line, recorder_head, save
 
 HOME = os.path.dirname(os.path.abspath(__file__))
 WIN_DIR = os.path.join(HOME, "windows")
@@ -49,20 +49,6 @@ def save_json(path, obj):
     with open(path + ".tmp", "w") as f:
         json.dump(obj, f, indent=1)
     os.replace(path + ".tmp", path)
-
-
-def last_line(path):
-    if path.endswith(".gz"):
-        last = None
-        with gzip.open(path, "rt") as f:
-            for last in f:
-                pass
-        return last
-    with open(path, "rb") as f:
-        f.seek(0, 2)
-        f.seek(max(0, f.tell() - 8192))
-        lines = [l for l in f.read().splitlines() if l.strip()]
-    return lines[-1].decode() if lines else None
 
 
 def newest_block():
@@ -106,20 +92,10 @@ def capture(fetcher, start, end, meta):
     meta.update(start_height=start, end_height=end, warmup_end_height=start + WARMUP, status="fetching")
     meta.setdefault("failed_heights", [])
     fetched_now, t0, status = 0, time.time(), None
-    prev_bt = None                                         # block time of the previous height (ms)
     for i, h in enumerate(range(start, end + 1)):
         p = os.path.join(d, f"{h}.json.gz")
         b = None
         if not os.path.exists(p):
-            if prev_bt is None:                            # first block to fetch: estimate from the newest height
-                newest, _ = newest_block()
-                age_min = (newest - h) / BPS / 60 if newest else 0
-            else:
-                age_min = (time.time() * 1000 - prev_bt) / 60000
-            if age_min > MAX_AGE_MIN:
-                meta["note"] = f"stopped at height {h}: blocks ~{age_min:.0f} min old > MAX_AGE_MIN={MAX_AGE_MIN:.0f}"
-                log(f"window {start}-{end}: {meta['note']} (never request old blocks)", loud=True)
-                break
             while True:
                 try:
                     b, data = fetcher.get(h)
@@ -128,6 +104,11 @@ def capture(fetcher, start, end, meta):
                     break
                 except NotYet:
                     time.sleep(1)
+                except TooOld as e:                        # nothing was requested (fail closed)
+                    meta["note"] = f"stopped at height {h}: {e}"
+                    log(f"window {start}-{end}: {meta['note']}", loud=True)
+                    status = "partial"
+                    break
                 except ArchivedCap as e:
                     status = "archived_cap"
                     log(f"archived cap at height {h}: {e}", loud=True)
@@ -138,10 +119,6 @@ def capture(fetcher, start, end, meta):
                     break
             if status:
                 break
-        if b is not None:
-            prev_bt = b["blockTime"]
-        elif os.path.exists(p):
-            prev_bt = None                                 # resumed: re-estimate from the newest height
         if h in (start, end) and os.path.exists(p):
             bt = b["blockTime"] if b is not None else (lambda x: x.get("blockDetails", x))(json.load(gzip.open(p, "rt")))["blockTime"]
             meta["first_block_time" if h == start else "last_block_time"] = bt
@@ -196,7 +173,10 @@ def unfinished_window():
         have = {int(os.path.basename(f).split(".")[0]) for f in glob.glob(os.path.join(os.path.dirname(wp), "*.json.gz"))}
         missing = [h for h in range(s, e + 1) if h not in have]
         newest, _ = newest_block()
-        age_min = (newest - missing[0]) / BPS / 60 if missing and newest else 0
+        if missing and newest is None:                     # age unknown: never resume blind (fail closed)
+            age_min = float("inf")
+        else:
+            age_min = (newest - missing[0]) / BPS / 60 if missing else 0
         if missing and age_min < FRESH_MIN:
             log(f"resuming window {s}-{e}: {len(missing)} blocks missing, oldest ~{age_min:.0f} min old")
             return s, e, m
@@ -212,12 +192,17 @@ def wait_for_cap_reset(fetcher):
     while True:
         time.sleep(1800)
         newest, _ = newest_block()
+        if newest is None:
+            log("cap probe skipped: recorder header unreadable; next probe in 30 min")
+            continue
         try:
             fetcher.get(newest - 50, tries=2)
             log("explorer accepts requests again (daily cap reset)", loud=True)
             return
         except ArchivedCap:
             log("still over the daily archived-block cap; next probe in 30 min")
+        except TooOld as e:
+            log(f"cap probe refused by the age guard ({e}); next probe in 30 min")
         except Exception as e:
             log(f"cap probe failed ({e}); next probe in 30 min")
 
@@ -228,7 +213,8 @@ def main():
     # an explicit WINDOW_BLOCKS wins; otherwise the size remembered after an archived-cap halving, else 6100
     window_blocks = int(os.environ["WINDOW_BLOCKS"]) if "WINDOW_BLOCKS" in os.environ else state.get("window_blocks", 6100)
     keep = os.environ.get("KEEPALIVE") == "1"           # default: fresh connection per request (measured faster)
-    fetcher = Fetcher(legacy=not keep, interval=float(os.environ.get("FETCH_INTERVAL", DEFAULT_INTERVAL)) if keep else 0)
+    fetcher = Fetcher(legacy=not keep, interval=float(os.environ.get("FETCH_INTERVAL", DEFAULT_INTERVAL)) if keep else 0,
+                      head=lambda: recorder_head(os.path.join(HOME, "hl_data")), max_age_min=MAX_AGE_MIN)
     log(f"capture started (window_blocks={window_blocks}, once={ONCE})")
     resume = unfinished_window()
     while True:
@@ -247,6 +233,8 @@ def main():
             start, end, meta = newest - window_blocks + 1, newest, {}
             log(f"window {start}-{end} starting ({window_blocks} blocks)")
         status = capture(fetcher, start, end, meta)
+        if status == "partial" and not glob.glob(os.path.join(WIN_DIR, f"{start}-{end}", "*.json.gz")):
+            time.sleep(60)                                 # guard refused the first block: don't spin
         if status == "archived_cap":
             # cap on the very first block = the IP is already locked out for the day, not a too-long window
             if glob.glob(os.path.join(WIN_DIR, f"{start}-{end}", "*.json.gz")):

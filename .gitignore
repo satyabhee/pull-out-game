@@ -31,3 +31,4 @@ g0_anchors.json
 # local agent plan (not published)
 AGENT_PLAN.md
 CLAUDE.local.md
+collect/explorer.lock
