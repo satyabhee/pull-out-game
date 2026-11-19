@@ -466,7 +466,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False,
         trade_learn=None, oid_guard=None, refill_position="front", oid_facts=False,
         name_prewindow=False, named_anon="front", deep_book=False,
-        learn_keep_known=False, facts_exclude=(), use_bbo=True):
+        learn_keep_known=False, facts_exclude=(), use_bbo=True, anchor_drop_kinds=()):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
@@ -478,7 +478,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap,
                 reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, oid_guard=oid_guard, refill_position=refill_position, oid_facts=oid_facts,
                 name_prewindow=name_prewindow and oid_facts, named_anon=named_anon, deep_book=deep_book, learn_keep_known=learn_keep_known, facts_exclude=facts_exclude,
-                use_bbo=use_bbo, engine=engine if engine is not None else Engine(stp=stp))
+                use_bbo=use_bbo, anchor_drop_kinds=anchor_drop_kinds, engine=engine if engine is not None else Engine(stp=stp))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -847,6 +847,8 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     ap.add_argument("--facts-exclude", default="",
                     help="comma-separated order-id fact sources to leave out (fills, hist, open, ws_orders, ws_fills)")
     ap.add_argument("--no-bbo", action="store_true", help="the touch ignores the recorded bbo feed")
+    ap.add_argument("--no-target-lookups", action="store_true",
+                    help="ignore capture's orderStatus answers for cancel targets (anchors.json kind 'target')")
     ap.add_argument("--learn-keep-known", action="store_true",
                     help="trade_learn's sweep and queue rules remove placeholders only, never an order we saw placed")
     ap.add_argument("--named-anon", choices=("front", "back"), default="front",
@@ -872,7 +874,8 @@ def replay_kwargs(a) -> dict:
                 oid_facts=not a.no_resolver and not a.no_oid_facts,
                 name_prewindow=a.name_prewindow, named_anon=a.named_anon,
                 deep_book=a.deep_book, learn_keep_known=a.learn_keep_known,
-                facts_exclude=tuple(x for x in a.facts_exclude.split(",") if x), use_bbo=not a.no_bbo)
+                facts_exclude=tuple(x for x in a.facts_exclude.split(",") if x), use_bbo=not a.no_bbo,
+                anchor_drop_kinds=("target",) if a.no_target_lookups else ())
 
 
 def options_tag(a) -> str:
@@ -900,7 +903,8 @@ def options_tag(a) -> str:
                     "-nodeep" if not a.deep_book else "",
                     "-learnkeep" if a.learn_keep_known else "",
                     f"-fx{a.facts_exclude.replace(',', '+')}" if a.facts_exclude else "",
-                    "-nobbo" if a.no_bbo else ""])
+                    "-nobbo" if a.no_bbo else "",
+                    "-notargets" if a.no_target_lookups else ""])
 
 
 def main(argv=None):

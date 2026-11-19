@@ -162,7 +162,7 @@ class Replay:
                  trade_learn: str | None = None, oid_guard: str | None = None, refill_position: str = "front",
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
                  deep_book: bool = False, deep_lookback_ms: int = 600_000, learn_keep_known: bool = False,
-                 facts_exclude: tuple = (), use_bbo: bool = True):
+                 facts_exclude: tuple = (), use_bbo: bool = True, anchor_drop_kinds: tuple = ()):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -313,6 +313,7 @@ class Replay:
                 if tr.hash != ZERO_HASH:
                     self._real_trades.setdefault(tr.hash, []).append(tr)
         self.facts_exclude, self.use_bbo = tuple(facts_exclude), use_bbo
+        self.anchor_drop_kinds = tuple(anchor_drop_kinds)    # e.g. ("target",): ignore capture's cancel-target lookups
         self.deep_book, self.deep_lookback_ms = deep_book, deep_lookback_ms
         self.deep_stats: Counter = Counter()
         self._deep: dict[tuple[int, Side], dict[int, int]] = {}      # (asset, side) -> {px: lots} reserve
@@ -342,12 +343,12 @@ class Replay:
             anchors = self.window_dir / "anchors.json"
         if use_resolver and oid_facts:
             est = OidEstimator.from_files(self.window_dir, anchors, facts=True, hl_data=self.hl_data,
-                                          exclude=self.facts_exclude)
+                                          exclude=self.facts_exclude, drop_kinds=self.anchor_drop_kinds)
             self.resolver = OidResolver(self.engine, est, nearest_ratio=nearest_ratio, **OID_GUARDS[oid_guard])
             self.resolver.named = self.named
             self.engine.resolve_oid = self.resolver
         elif use_resolver and anchors is not None:
-            est = OidEstimator.from_files(self.window_dir, anchors)
+            est = OidEstimator.from_files(self.window_dir, anchors, drop_kinds=self.anchor_drop_kinds)
             self.resolver = OidResolver(self.engine, est, nearest_ratio=nearest_ratio, **OID_GUARDS[oid_guard])
             self.engine.resolve_oid = self.resolver
 
