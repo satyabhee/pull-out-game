@@ -247,3 +247,11 @@ def test_shared_connection_updates_are_attributed_by_their_placement(tmp_path):
     (hour / "user_orders.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows))
     f = oid_facts.load(window, hl)
     assert sorted((x["oid"], x["user"]) for x in f.orders) == [(1, A.lower()), (2, B.lower())]
+
+
+def test_an_order_status_answer_gives_side_price_even_when_placed_before_the_window(tmp_path):
+    w, window, hl, ts = two_orders_then_cancel(tmp_path, cancel_oid=5)
+    ans = {"status": "order", "order": {"order": {"coin": "BTC", "side": "B", "limitPx": "59990.0", "origSz": "0.002",
+                                                   "oid": 5, "timestamp": T0 - 10_000, "cloid": None}, "status": "canceled"}}
+    est = OidEstimator.from_window(window, [{"user": A, "oid": 5, "kind": "target", "answer": ans}])
+    assert est.oid_px[5] == (A.lower(), 0, True, BTC.px_to_ticks("59990"), T0 - 10_000)

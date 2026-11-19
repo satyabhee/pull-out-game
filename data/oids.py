@@ -178,6 +178,7 @@ class OidEstimator:
         block_groups: dict = {}
         placers: dict = {}
         want: dict[tuple, int] = {}
+        answered: list = []
         for a in anchors:
             if "height" in a:
                 continue
@@ -191,7 +192,11 @@ class OidEstimator:
             key = (a["user"].lower(), asset, o["side"] == "B", Decimal(o["limitPx"]), Decimal(o["origSz"]),
                    int(o["timestamp"]), o.get("cloid"))
             want[key] = int(o["oid"])
+            answered.append((int(o["oid"]), a["user"].lower(), asset, o["side"] == "B", str(o["limitPx"]),
+                             int(o["timestamp"])))
         oid_px: dict[int, tuple] = {}
+        for oid, user, asset, buy, px, ts in answered:          # orderStatus answers: side / price / time too
+            _put_px(oid_px, oid, user, asset, buy, px, ts)
         for o in (facts.orders if facts else []):
             key = (o["user"], o["asset"], o["buy"], Decimal(o["px"]), Decimal(o["sz"]), o["timestamp"], o["cloid"])
             if want.get(key, o["oid"]) != o["oid"]:

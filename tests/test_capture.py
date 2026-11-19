@@ -408,3 +408,56 @@ def test_hist_is_asked_once_the_last_block_exists():
                         sleep=sleep)
     assert sorted(u for u, _ in asked) == ["0xa", "0xb"] and min(h for _, h in asked) >= 102
     assert all(r["at_chunk_end"] for r in w.take_info()["historicalOrders"])
+
+
+def test_int_oid_targets_take_btc_eth_cancels_and_modifies_only():
+    import collect.capture as cap
+    b = {"txs": [
+        {"user": "0xa", "error": None, "action": {"type": "cancel", "cancels": [{"a": 0, "o": 5}, {"a": 7, "o": 6}]}},
+        {"user": "0xb", "error": None, "action": {"type": "batchModify", "modifies": [
+            {"oid": 9, "order": {"a": 1}}, {"oid": "0xc1", "order": {"a": 1}}]}},
+        {"user": "0xc", "error": "x", "action": {"type": "cancel", "cancels": [{"a": 0, "o": 8}]}}]}
+    assert cap.int_oid_targets(b) == [("0xa", 5), ("0xb", 9)]
+
+
+def test_hist_users_put_recent_cancellers_after_the_top_contested_makers(tmp_path):
+    import json as _json
+    import collect.capture as cap
+    p = tmp_path / "t.json"
+    p.write_text(_json.dumps({"time": 1_000_000, "contested_scores": {"0xc1": 3, "0xc2": 2, "0xc3": 1, "0xc4": 1},
+                              "cancel_scores": {"0xk": 1}}))
+    got = cap.hist_end_users(6, p, now=1000.0, recent={"0xr1": 5, "0xr2": 9, "0xc1": 7})
+    assert got == ["0xc1", "0xc2", "0xc3", "0xr2", "0xr1", "0xk"]
+    assert cap.hist_end_users(2, tmp_path / "missing.json", recent={"0xr": 1}) == ["0xr"]
+
+
+def test_unpaced_lookups_skip_the_gap():
+    import collect.capture as cap
+    seen = []
+    w = cap.Writer(lookup=lambda u, o: (seen.append(o), {"status": "order"})[1], info_gap_s=100,
+                   budget=cap.info.Budget(per_min=10_000))
+    for o in range(3):
+        w.ask("0xa", o, 1, {"kind": "target"}, paced=False)
+    w.drain()
+    assert seen == [0, 1, 2] and all(a["kind"] == "target" for a in w.snapshot())
+
+
+def test_scored_block_cancel_targets_are_looked_up_unpaced_and_skip_covered_users(tmp_home, monkeypatch):
+    monkeypatch.setattr(cap, "TARGET_LOOKUPS", 10)
+
+    class F(StubFetcher):
+        def get(self, h):
+            self.last_age_min = 0.1
+            txs = [{"user": "0xu", "error": None, "action": {"type": "cancel", "cancels": [{"a": 0, "o": 100 + h}]}},
+                   {"user": "0xcov", "error": None, "action": {"type": "cancel", "cancels": [{"a": 1, "o": 200 + h}]}}]
+            b = {"height": h, "blockTime": 1000 + h, "numTxs": 2, "txs": txs}
+            return b, json.dumps({"blockDetails": b}).encode()
+    asked = []
+    w = cap.Writer(lookup=lambda u, o: (asked.append((u, o)), {"status": "unknownOid"})[1], info_gap_s=100,
+                   budget=cap.info.Budget(per_min=10_000))
+    extras = {"fill_users": 0, "hist_users": 0, "trades": lambda a, b: [], "tracked": lambda: [],
+              "covered": lambda: ["0xCOV"]}
+    meta = {"kind": "chunk"}
+    assert cap.capture(F(), 10, 14, meta, writer=w, state={}, warmup=2, max_anchors=0, extras=extras) == "complete"
+    assert asked == [("0xu", 112), ("0xu", 113), ("0xu", 114)]          # scored blocks only, covered user skipped,
+    assert meta["target_lookups"] == 3 and meta["target_candidates"] == 6  # and no 100-s gap between them

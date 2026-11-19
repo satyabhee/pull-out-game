@@ -71,7 +71,8 @@ OPEN_LEAD_MS = int(os.environ.get("OPEN_LEAD_MS", 1500))
 CHUNK_HIST_USERS = int(os.environ.get("CHUNK_HIST_USERS", 1))
 HIST_END_USERS = int(os.environ.get("HIST_END_USERS", 6))
 TRACKERS_FILE = os.environ.get("TRACKERS_FILE", "trackers.json")
-HIST_END_RANDOM = os.environ.get("HIST_END_RANDOM") == "1"   # experiment: per-chunk coin flip (seeded by the snapshot)
+HIST_END_RANDOM = os.environ.get("HIST_END_RANDOM") == "1"
+TARGET_LOOKUPS = int(os.environ.get("TARGET_LOOKUPS", 0))    # orderStatus of int-oid cancel targets in the SCORED blocks   # experiment: per-chunk coin flip (seeded by the snapshot)
 INFO_FILES = {"userFillsByTime": "fills.json", "frontendOpenOrders": "open_orders.json",
               "historicalOrders": "hist_orders.json"}
 FRESH_MIN = float(os.environ.get("FRESH_MIN", 20))
@@ -169,9 +170,9 @@ class Writer:
                         self.info[kind].append({**extra, "user": user, "kind": kind, "args": list(args),
                                                 "asked_at": t, "answered_at": time.time(), "answer": r})
                 else:
-                    _, user, oid, ch, extra = job
+                    _, user, oid, ch, extra, paced = job
                     wait = self._last_info + self.info_gap_s - time.time()
-                    if wait > 0:
+                    if paced and wait > 0:
                         time.sleep(wait)
                     self.budget.take(info.weight_of("orderStatus"))
                     try:
@@ -191,10 +192,10 @@ class Writer:
     def save(self, path, data):
         self.q.put(("save", path, data))
 
-    def ask(self, user, oid, cancel_height, extra=None):
+    def ask(self, user, oid, cancel_height, extra=None, paced=True):
         """extra: more fields stored on the anchor record (never a "height" key: data/oids.py reads that
-        as its own anchor format)."""
-        self.q.put(("anchor", user, oid, cancel_height, extra or {}))
+        as its own anchor format). paced=False: only the weight budget paces it (no info_gap_s)."""
+        self.q.put(("anchor", user, oid, cancel_height, extra or {}, paced))
 
     def ask_info(self, kind, user, args=(), extra=None):
         """One info lookup (collect/info.py CALLS[kind](user, *args)); the answer is kept raw in info[kind]."""
@@ -276,6 +277,23 @@ def placement_items(tx):
              else [m.get("order", {}) for m in a.get("modifies", [])] if kind == "batchModify" else [])
     return [(i, o) for i, o in enumerate(items)
             if isinstance(o, dict) and o.get("a") in (0, 1) and o.get("c") and "limit" in (o.get("t") or {})]
+
+
+def int_oid_targets(block):
+    """(user, real oid) of every successful BTC/ETH int-oid cancel and int-oid modify target in a block."""
+    out = []
+    for tx in block.get("txs", []):
+        if tx.get("error"):
+            continue
+        a, u = tx.get("action", {}), tx.get("user", "")
+        k = a.get("type")
+        if k == "cancel":
+            out += [(u, c["o"]) for c in a.get("cancels", []) if c.get("a") in (0, 1) and isinstance(c.get("o"), int)]
+        elif k in ("modify", "batchModify"):
+            for m in ([a] if k == "modify" else a.get("modifies", [])):
+                if isinstance(m.get("oid"), int) and (m.get("order") or {}).get("a") in (0, 1):
+                    out.append((u, m["oid"]))
+    return out
 
 
 class AnchorPicker:
@@ -428,6 +446,7 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
     wpath, apath = os.path.join(d, "window.json"), os.path.join(d, "anchors.json")
     old = json.load(open(apath)) if os.path.exists(apath) else []
     picker = AnchorPicker(asked={(a["user"], a["oid"]) for a in old})
+    scored_targets = {}                                    # (user, real oid) -> height: int-oid targets, scored blocks
     every = max(1, (end - start + 1) // max(1, max_anchors))   # spread lookups across the window
     n_asked = len(old)
     meta.setdefault("fetch_started", time.time())
@@ -481,6 +500,9 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
         if b is not None:
             picker.feed(h, b)
             cancels.update(int_cancel_users(b))
+            if h >= start + warmup:
+                for u, oid in int_oid_targets(b):
+                    scored_targets.setdefault((u, oid), h)
         # one orderStatus lookup at the end of every `every`-block segment; the writer paces them >= 2 s apart
         if n_asked < max_anchors and (i + 1) % every == 0:
             pick = picker.take()
@@ -494,6 +516,15 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
     meta["int_cancel_users"] = dict(sorted(cancels.items(), key=lambda x: (-x[1], x[0]))[:30])
     if extras and status is None:
         ask_extras(writer, extras, meta, cancels)
+    if TARGET_LOOKUPS and status is None and scored_targets:
+        covered = {u.lower() for u in (extras or {}).get("covered", lambda: [])()} | \
+            {u.lower() for u in meta.get("hist_end_user_list", [])}
+        todo = [(u, o, h) for (u, o), h in scored_targets.items() if u.lower() not in covered and (u, o) not in
+                {(a["user"], a["oid"]) for a in old}]
+        meta["target_lookups"] = min(len(todo), TARGET_LOOKUPS)
+        meta["target_candidates"] = len(scored_targets)
+        for u, o, h in todo[:TARGET_LOOKUPS]:
+            writer.ask(u, o, h, {"kind": "target"}, paced=False)
     writer.drain()                                         # every block on disk, every lookup answered
     anchors = old + writer.snapshot()
     with writer.lock:
@@ -609,7 +640,7 @@ def recent_headers():
 
 def chunk_extras():
     return {"fill_users": CHUNK_FILL_USERS, "hist_users": CHUNK_HIST_USERS, "trades": recorder_trades,
-            "tracked": tracked_now}
+            "tracked": tracked_now, "covered": tracked_now}
 
 
 def tracked_now():
@@ -628,6 +659,11 @@ class CancellerTally:
     def __init__(self, path=None, keep=30):
         self.path = path or os.path.join(HOME, "cancellers.json")
         self.recent = collections.deque(maxlen=keep)
+
+    @property
+    def last(self):
+        """The previous chunk's int-oid cancel counts ({} before the first chunk)."""
+        return dict(self.recent[-1]) if self.recent else {}
 
     def add(self, counts):
         self.recent.append(collections.Counter(counts or {}))
@@ -682,21 +718,31 @@ def prefetch_open_orders(writer, last_snap, period_ms, lead_ms=None, now=time.ti
     return int(writer.ask_info_now("frontendOpenOrders", users, {"prefetch": True}) * 1000)
 
 
-def hist_end_users(n, path=None, exclude=(), now=None, max_age_s=3600):
-    """Users for the end-of-chunk historicalOrders: the ranker's contested makers, then its cancel ranking, then
-    the rest of its order; fresh file only; minus `exclude` (streamed live already)."""
+def hist_end_users(n, path=None, exclude=(), now=None, max_age_s=3600, recent=None, contested_first=3):
+    """Users for the end-of-chunk historicalOrders: the ranker's top `contested_first` contested makers, then the
+    previous chunk's top int-oid cancellers (`recent`, {user: count}), then the ranker's cancel ranking and the rest
+    of its order; minus `exclude` (streamed live already). Without a fresh ranker file: `recent` only."""
     try:
         d = json.load(open(path or os.path.join(HOME, TRACKERS_FILE)))
+        if (now if now is not None else time.time()) * 1000 - d.get("time", 0) > max_age_s * 1000:
+            d = {}
     except (OSError, ValueError):
-        return []
-    if (now if now is not None else time.time()) * 1000 - d.get("time", 0) > max_age_s * 1000:
-        return []
+        d = {}
     skip = {u.lower() for u in exclude}
     out = []
-    for group in ("contested_scores", "cancel_scores", "counts"):
-        for u in d.get(group, {}):
+
+    def add(users, limit=None):
+        k = 0
+        for u in users:
+            if limit is not None and k >= limit:
+                return
             if u.lower() not in skip and u not in out:
                 out.append(u)
+                k += 1
+    add(d.get("contested_scores", {}), contested_first)
+    add([u for u, _ in sorted((recent or {}).items(), key=lambda x: (-x[1], x[0]))])
+    for group in ("cancel_scores", "counts"):
+        add(d.get(group, {}))
     return out[:n]
 
 
@@ -761,9 +807,10 @@ def run_chunks(fetcher, state, writer, cancellers=None):
         if HIST_END_RANDOM:
             meta["arm_hist_end"] = bool(hist_on)
         if hist_on:
-            hu = hist_end_users(HIST_END_USERS, exclude=tracked_now())
+            hu = hist_end_users(HIST_END_USERS, exclude=tracked_now(), recent=cancellers.last)
             ask_hist_at_end(writer, end, hu)
             meta["hist_end_users"] = len(hu)
+            meta["hist_end_user_list"] = hu
         status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=warmup, max_anchors=CHUNK_ANCHORS,
                          extras=chunk_extras())
         cancellers.add(meta.get("int_cancel_users"))
