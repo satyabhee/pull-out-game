@@ -73,14 +73,20 @@ def _window_range(window_dir: Path):
     return read_block(files[0][1])["blockTime"], read_block(files[-1][1])["blockTime"]
 
 
-def load(window_dir, hl_data=None, recorder_margin_ms: int = 60_000) -> OidFacts:
+SOURCES = ("fills", "hist", "open", "ws_orders", "ws_fills")
+
+
+def load(window_dir, hl_data=None, recorder_margin_ms: int = 60_000, exclude=()) -> OidFacts:
     """Facts for one window: its info files, plus the recorder's user streams within the window's time range
-    (+- recorder_margin_ms)."""
+    (+- recorder_margin_ms). exclude: source names to leave out (SOURCES; ablations)."""
+    bad = set(exclude) - set(SOURCES)
+    if bad:
+        raise ValueError(f"unknown fact sources {sorted(bad)}")
     window_dir = Path(window_dir)
     facts = OidFacts()
     for name, src in WINDOW_FILES.items():
         p = window_dir / name
-        if not p.exists():
+        if not p.exists() or src in exclude:
             continue
         for rec in json.loads(p.read_text()):
             ans, user = rec.get("answer"), rec.get("user", "")
@@ -104,7 +110,7 @@ def load(window_dir, hl_data=None, recorder_margin_ms: int = 60_000) -> OidFacts
         t0, t1 = _window_range(window_dir)
         if t0 is not None:
             lo, hi = t0 - recorder_margin_ms, t1 + recorder_margin_ms
-            for path in _hour_files(Path(hl_data), "user_orders", lo, hi):
+            for path in ([] if "ws_orders" in exclude else _hour_files(Path(hl_data), "user_orders", lo, hi)):
                 for r in _records(path, lo, hi):
                     m = r.get("msg") or {}
                     for x in m.get("data") or []:
@@ -112,7 +118,7 @@ def load(window_dir, hl_data=None, recorder_margin_ms: int = 60_000) -> OidFacts
                                    (x or {}).get("statusTimestamp"))
                         if o:
                             facts.orders.append(o)
-            for path in _hour_files(Path(hl_data), "user_fills", lo, hi):
+            for path in ([] if "ws_fills" in exclude else _hour_files(Path(hl_data), "user_fills", lo, hi)):
                 for r in _records(path, lo, hi):
                     m = r.get("msg") or {}
                     d = m.get("data") or {}

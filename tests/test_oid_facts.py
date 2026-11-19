@@ -215,3 +215,16 @@ def test_stream_order_truth_joins_tracked_statuses_by_cloid_and_by_shape(tmp_pat
     r = Replay(window, hl, listing, oid_facts=True)
     t = vr.stream_order_truth(r, hl)
     assert {k[2]: v["truth"] for k, v in t.items()} == {0: "rejected_alo", 1: "accepted"}
+
+
+def test_fact_sources_can_be_left_out_for_ablations(tmp_path):
+    import pytest
+    w, window, hl, ts = two_orders_then_cancel(tmp_path)
+    (window / "hist_orders.json").write_text(json.dumps([hist(A, 777, "59990.0", "0.001", ts)]))
+    assert len(oid_facts.load(window, hl).orders) == 1
+    assert oid_facts.load(window, hl, exclude=("hist",)).orders == []
+    with pytest.raises(ValueError):
+        oid_facts.load(window, hl, exclude=("nope",))
+    r = Replay(window, hl, listing, oid_facts=True, facts_exclude=("hist",))
+    list(r)
+    assert r.resolver.stats.get("resolved_exact", 0) == 0          # the only fact was left out

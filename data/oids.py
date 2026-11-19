@@ -258,7 +258,7 @@ class OidEstimator:
         return est
 
     @classmethod
-    def from_files(cls, window_dir, anchor_file, facts: bool = False, hl_data=None) -> "OidEstimator":
+    def from_files(cls, window_dir, anchor_file, facts: bool = False, hl_data=None, exclude=()) -> "OidEstimator":
         """from_window on the anchor file (None = no anchors), built once per process per (window, anchors, facts)
         and rebuilt when a block file, the anchor file or the facts change. The estimator is read-only, so it is
         shared. facts=True: also data/oid_facts.load(window_dir, hl_data)."""
@@ -268,10 +268,10 @@ class OidEstimator:
         fx = None
         if facts:
             from data import oid_facts
-            fx = oid_facts.load(window_dir, hl_data)
+            fx = oid_facts.load(window_dir, hl_data, exclude=exclude)
         sig = (tuple(sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns) for _, p in _block_files(window_dir))),
                st and st.st_size, st and st.st_mtime_ns, None if fx is None else fx.files_sig())
-        key = (window_dir.resolve(), anchor_file and anchor_file.resolve(), bool(facts),
+        key = (window_dir.resolve(), anchor_file and anchor_file.resolve(), bool(facts), tuple(sorted(exclude)),
                None if hl_data is None else str(Path(hl_data).resolve()))
         hit = _estimator_cache.get(key)
         if hit is None or hit[0] != sig:

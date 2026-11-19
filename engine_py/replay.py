@@ -161,7 +161,8 @@ class Replay:
                  placeholder_cap: str | None = None, reseed_keep_known: bool = False,
                  trade_learn: str | None = None, oid_guard: str | None = None, refill_position: str = "front",
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
-                 deep_book: bool = False, deep_lookback_ms: int = 600_000, learn_keep_known: bool = False):
+                 deep_book: bool = False, deep_lookback_ms: int = 600_000, learn_keep_known: bool = False,
+                 facts_exclude: tuple = (), use_bbo: bool = True):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -241,6 +242,8 @@ class Replay:
         (a non-ALO buy above the last ask / sell below the last bid), as placeholders behind any known order at
         each price; what that order leaves is taken out again right after it. Nothing else ever sees it.
         `deep_stats` counts.
+        facts_exclude: order-id fact sources to leave out (data/oid_facts.SOURCES; ablations).
+        use_bbo=False: the touch (ALO gate, touch reconcile) ignores the recorded bbo feed (snapshots + trades only).
         learn_keep_known=True: trade_learn's sweep and queue rules remove placeholders only, never a known order
         (one we saw placed): such an order may still rest on chain (its owner's later cancel names it).
         oid_guard (int-oid resolver preset; None/"ghost" = data/oids defaults): "ratio25" / "ratio50"
@@ -309,6 +312,7 @@ class Replay:
             for tr in iter_trades(self.hl_data, COINS, self.t0, self.t1):
                 if tr.hash != ZERO_HASH:
                     self._real_trades.setdefault(tr.hash, []).append(tr)
+        self.facts_exclude, self.use_bbo = tuple(facts_exclude), use_bbo
         self.deep_book, self.deep_lookback_ms = deep_book, deep_lookback_ms
         self.deep_stats: Counter = Counter()
         self._deep: dict[tuple[int, Side], dict[int, int]] = {}      # (asset, side) -> {px: lots} reserve
@@ -337,7 +341,8 @@ class Replay:
         if anchors is None and (self.window_dir / "anchors.json").exists():
             anchors = self.window_dir / "anchors.json"
         if use_resolver and oid_facts:
-            est = OidEstimator.from_files(self.window_dir, anchors, facts=True, hl_data=self.hl_data)
+            est = OidEstimator.from_files(self.window_dir, anchors, facts=True, hl_data=self.hl_data,
+                                          exclude=self.facts_exclude)
             self.resolver = OidResolver(self.engine, est, nearest_ratio=nearest_ratio, **OID_GUARDS[oid_guard])
             self.resolver.named = self.named
             self.engine.resolve_oid = self.resolver
@@ -377,7 +382,7 @@ class Replay:
             self.touch = RealTouch(
                 [s for coin in COINS for s in iter_books(self.hl_data, coin, lo, self.t1)],
                 iter_trades(self.hl_data, COINS, lo, self.t1),
-                [x for coin in COINS for x in iter_bbo(self.hl_data, coin, lo, self.t1)])
+                [x for coin in COINS for x in iter_bbo(self.hl_data, coin, lo, self.t1)] if self.use_bbo else [])
         self.gate_stats: Counter = Counter()
         self.reconciled: Counter = Counter()        # (coin, trimmed|drift|missing|evicted...) -> lots
         self.outside_fill_log: list[tuple[int, int, int]] = []   # (height, tid, lots unmatched)
@@ -394,7 +399,7 @@ class Replay:
     def _name_prewindow(self) -> None:
         """name_prewindow (see __init__): split the seeded placeholders into the known pre-window orders."""
         from data import oid_facts
-        facts = oid_facts.load(self.window_dir, self.hl_data)
+        facts = oid_facts.load(self.window_dir, self.hl_data, exclude=self.facts_exclude)
         alive = self.t0 + max(self.seed_offsets.values(), default=0)
         items = oid_facts.resting_at(facts, self.t0, max(alive, self.t0))
         if not items:
