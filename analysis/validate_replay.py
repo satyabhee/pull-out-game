@@ -402,7 +402,8 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
         outside_other_txs=False, other_position="end", placeholder_ttl_ms=None,
         placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False,
-        trade_learn=None, oid_guard=None, refill_position="front", oid_facts=False):
+        trade_learn=None, oid_guard=None, refill_position="front", oid_facts=False,
+        name_prewindow=False, named_anon="front", deep_book=False):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
@@ -412,7 +413,8 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
                 other_position=other_position, placeholder_ttl_ms=placeholder_ttl_ms,
                 placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap,
-                reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, oid_guard=oid_guard, refill_position=refill_position, oid_facts=oid_facts, engine=engine if engine is not None else Engine(stp=stp))
+                reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, oid_guard=oid_guard, refill_position=refill_position, oid_facts=oid_facts,
+                name_prewindow=name_prewindow and oid_facts, named_anon=named_anon, deep_book=deep_book, engine=engine if engine is not None else Engine(stp=stp))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -574,6 +576,17 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
         res["facts:anchors"] = len(est.anchors)
         res["facts:exact"] = len(est.exact)
         res["facts:oid_px"] = sum(v is not None for v in est.oid_px.values())
+    if rp.deep_book:
+        res["deep_book"] = True
+        for k, v in sorted(rp.deep_stats.items()):
+            res["deep:" + k] = v
+    if rp.named or rp.name_stats:
+        for k, v in sorted(rp.name_stats.items()):
+            res["name:" + k] = v
+        for k in ("resolved_named", "named_gone"):
+            res["name:" + k] = rp.resolver.stats.get(k, 0) if rp.resolver is not None else 0
+        if rp.named_anon != "front":
+            res["named_anon"] = rp.named_anon
         res["facts:dropped_anchors"] = est.dropped_anchors
     if rp.trade_learn is not None:                  # trade-learning flag: only when set
         res["trade_learn"] = rp.trade_learn
@@ -755,6 +768,15 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     ap.add_argument("--no-oid-facts", action="store_true",
                     help="resolver ignores real order-id facts (fills.json, hist_orders.json, open_orders.json, "
                          "recorder user streams); default: uses them as anchors and exact oid matches")
+    ap.add_argument("--name-prewindow", action="store_true",
+                    help="with facts: pre-window orders the facts show resting at the seed snapshot become their real "
+                         "owner's orders (real oid, queue by oid). Off by default: neutral on 46 Mac chunks (G1 -0.3, "
+                         "full recall +0.3 points)")
+    ap.add_argument("--deep-book", action="store_true",
+                    help="liquidity past the full snapshot's 20 levels from the coarse book (book_*_sf4), split over "
+                         "prices by what was observable, used only by orders whose limit reaches past the last level")
+    ap.add_argument("--named-anon", choices=("front", "back"), default="front",
+                    help="where the anonymous rest of a level with named pre-window orders queues (default front)")
     ap.add_argument("--wildcard-pre-reseed-known", action="store_true",
                     help="H11 scoring (NOT approved, default off): with --keep-known, known engine orders placed "
                          "before the last re-seed score as WILDCARD")
@@ -773,7 +795,9 @@ def replay_kwargs(a) -> dict:
                 wildcard_pre_reseed_known=a.wildcard_pre_reseed_known,
                 trade_learn=None if a.trade_learn == "off" else a.trade_learn,
                 oid_guard=a.oid_guard, refill_position=a.refill_position,
-                oid_facts=not a.no_resolver and not a.no_oid_facts)
+                oid_facts=not a.no_resolver and not a.no_oid_facts,
+                name_prewindow=a.name_prewindow, named_anon=a.named_anon,
+                deep_book=a.deep_book)
 
 
 def options_tag(a) -> str:
@@ -795,7 +819,10 @@ def options_tag(a) -> str:
                     f"-tl{a.trade_learn.replace(',', '+')}" if a.trade_learn != DEFAULT_TRADE_LEARN else "",
                     f"-og{a.oid_guard}" if a.oid_guard not in (None, "ghost") else "",
                     f"-refill{a.refill_position}" if a.refill_position != DEFAULT_REFILL_POSITION else "",
-                    "-nofacts" if a.no_oid_facts else ""])
+                    "-nofacts" if a.no_oid_facts else "",
+                    "-name" if a.name_prewindow and not a.no_oid_facts else "",
+                    "-anonback" if a.named_anon == "back" else "",
+                    "-deep" if a.deep_book else ""])
 
 
 def main(argv=None):

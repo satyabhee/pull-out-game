@@ -160,7 +160,8 @@ class Replay:
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
                  placeholder_cap: str | None = None, reseed_keep_known: bool = False,
                  trade_learn: str | None = None, oid_guard: str | None = None, refill_position: str = "front",
-                 oid_facts: bool = False):
+                 oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
+                 deep_book: bool = False, deep_lookback_ms: int = 600_000):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -223,6 +224,23 @@ class Replay:
         oid_facts: the int-oid resolver also uses real order-id facts (data/oid_facts.py: fills.json,
         hist_orders.json, open_orders.json in the window, user_orders/user_fills recorder streams): located facts
         become anchors and exact oid -> placement matches; other facts give the target's side and price.
+        name_prewindow=True (with oid_facts): pre-window orders the window's open_orders.json shows resting (placed
+        before the first block) take their share of the seeded placeholder at their price as KNOWN orders of
+        their real owner, in real-oid order, so the owner's later int-oid / cloid cancels and modifies find them
+        and their fills carry the real maker. Size at the first block = size at the answer + that order's fills
+        since (fact fills; recorded trades of the maker at that price when the maker has no fill facts), capped by
+        the placeholder. named_anon: the anonymous rest of the level queues "front" (ahead) or "back" of them.
+        A price the snapshot range covers but does not show is skipped (named_conflict); deeper prices add the
+        order outright (named_deep). `named` maps real oid -> engine oid; `name_stats` counts.
+        deep_book=True: liquidity past the full snapshot's last level, from the recorder's coarse book (book_*_sf4,
+        same times; prices grouped into buckets). At every full snapshot each bucket's size beyond that last level
+        (less the full levels inside it and the known orders resting there) goes into a RESERVE, split over the
+        bucket's prices by what was observable up to then: sizes those prices showed in full snapshots of the last
+        deep_lookback_ms, real trades there, known orders there; evenly over the bucket's prices when nothing
+        was seen. The reserve enters the book only for an order whose own limit reaches past that last level
+        (a non-ALO buy above the last ask / sell below the last bid), as placeholders behind any known order at
+        each price; what that order leaves is taken out again right after it. Nothing else ever sees it.
+        `deep_stats` counts.
         oid_guard (int-oid resolver preset; None/"ghost" = data/oids defaults): "ratio25" / "ratio50"
         (ratio guard, ghost off), "cap3000" (max_tol 3000, ghost off), "none" (old rule: ghost and
         joint layers off).
@@ -288,7 +306,29 @@ class Replay:
             for tr in iter_trades(self.hl_data, COINS, self.t0, self.t1):
                 if tr.hash != ZERO_HASH:
                     self._real_trades.setdefault(tr.hash, []).append(tr)
+        self.deep_book, self.deep_lookback_ms = deep_book, deep_lookback_ms
+        self.deep_stats: Counter = Counter()
+        self._deep: dict[tuple[int, Side], dict[int, int]] = {}      # (asset, side) -> {px: lots} reserve
+        self._deep_edge: dict[tuple[int, Side], int] = {}            # last full level price per side
+        if deep_book:
+            lo = self.t0 - deep_lookback_ms - 60_000
+            self._sf = {(s.asset, s.time_ms): s for coin in COINS
+                        for s in iter_books(self.hl_data, coin, lo, self.t1 + 60_000, suffix="_sf4")}
+            self._full_hist = sorted((s for coin in COINS for s in iter_books(self.hl_data, coin, lo, self.t1 + 60_000)),
+                                     key=lambda s: s.time_ms)
+            self._deep_trades = [tr for tr in iter_trades(self.hl_data, COINS, lo, self.t1 + 60_000)
+                                 if tr.hash != ZERO_HASH]
         self._seed()
+        if name_prewindow and not oid_facts:
+            raise ValueError("name_prewindow needs oid_facts")
+        if named_anon not in ("front", "back"):
+            raise ValueError(f"unknown named_anon {named_anon!r}")
+        self.named: dict[int, int] = {}
+        self.named_levels: set[tuple[str, int, Side, int]] = set()   # (user, asset, side, px) of named orders
+        self.name_stats: Counter = Counter()
+        self.named_anon = named_anon
+        if name_prewindow:
+            self._name_prewindow()
 
         self.resolver: OidResolver | None = None
         if anchors is None and (self.window_dir / "anchors.json").exists():
@@ -296,6 +336,7 @@ class Replay:
         if use_resolver and oid_facts:
             est = OidEstimator.from_files(self.window_dir, anchors, facts=True, hl_data=self.hl_data)
             self.resolver = OidResolver(self.engine, est, nearest_ratio=nearest_ratio, **OID_GUARDS[oid_guard])
+            self.resolver.named = self.named
             self.engine.resolve_oid = self.resolver
         elif use_resolver and anchors is not None:
             est = OidEstimator.from_files(self.window_dir, anchors)
@@ -344,6 +385,201 @@ class Replay:
             snap = nearest_book(self.hl_data, coin, self.t0)
             self._seed_levels(snap.asset, snap.bids, snap.asks, snap.time_ms)
             self.seed_offsets[coin] = snap.time_ms - self.t0
+            if self.deep_book:
+                self._build_deep(snap)
+
+    def _name_prewindow(self) -> None:
+        """name_prewindow (see __init__): split the seeded placeholders into the known pre-window orders."""
+        from data import oid_facts
+        facts = oid_facts.load(self.window_dir, self.hl_data)
+        alive = self.t0 + max(self.seed_offsets.values(), default=0)
+        items = oid_facts.resting_at(facts, self.t0, max(alive, self.t0))
+        if not items:
+            return
+        fill_users = {f["user"] for f in facts.fills}
+        fills_of: dict[int, list] = {}
+        for f in facts.fills:
+            fills_of.setdefault(f["oid"], []).append((f["time"], ASSETS[f["asset"]].sz_to_lots(f["sz"])))
+        t_end = max([x["ref_ms"] or self.t1 for x in items] + [self.t1])
+        traded: Counter = Counter()                       # (maker, asset, maker side, px) -> lots since t0
+        for tr in iter_trades(self.hl_data, COINS, self.t0, t_end):
+            if tr.hash != ZERO_HASH:
+                traded[(tr.maker, tr.asset, tr.taker_side.opposite, tr.px)] += tr.sz
+        eng = self.engine
+        by_level: dict[tuple[int, Side, int], list] = {}
+        for x in items:
+            o, ref = x["order"], x["ref_ms"]
+            spec = ASSETS[o["asset"]]
+            side, px = (Side.BUY if o["buy"] else Side.SELL), spec.px_to_ticks(o["px"])
+            q = spec.sz_to_lots(x["rem"])
+            fs = fills_of.get(o["oid"], ())
+            if ref is None:                              # original size less what filled before the window
+                q -= sum(sz for t, sz in fs if t < self.t0)
+                self.name_stats["sized_from_orig"] += 1
+            elif o["user"] in fill_users:                # size then + what filled since the window began
+                q += sum(sz for t, sz in fs if self.t0 <= t <= ref)
+            else:                                        # no fill facts: the maker's trades at that price
+                k = (o["user"], o["asset"], side, px)
+                add = min(traded[k], max(spec.sz_to_lots(o["sz"]) - q, 0))
+                traded[k] -= add
+                q += add
+            self.name_stats["from_" + o["source"]] += 1
+            if q > 0:
+                by_level.setdefault((o["asset"], side, px), []).append((o, q))
+        edge = {(a, sd): (min(lv) if sd is Side.BUY else max(lv)) if lv else None     # the seeded snapshot's range
+                for a in eng.books for sd in (Side.BUY, Side.SELL) for lv in (eng.books[a].side(sd),)}
+        for (asset, side, px), named in sorted(by_level.items(), key=lambda kv: (kv[0][0], kv[0][1].value, kv[0][2])):
+            book = eng.books[asset]
+            level = book.side(side).get(px)
+            phs = [nd for nd in level if nd.order.user == PLACEHOLDER] if level is not None else []
+            if not phs:
+                e = edge[(asset, side)]
+                deeper = e is not None and (px < e if side is Side.BUY else px > e)
+                if level is not None or not deeper:
+                    self.name_stats["named_conflict"] += len(named)
+                    continue
+                for o, q in named:
+                    self._rest_named(o, asset, side, px, q)
+                    self.name_stats["named_deep"] += 1
+                continue
+            ph = phs[0]
+            avail = ph.remaining
+            meta = self.ph_meta.get(ph.order.oid)
+            eng._remove(ph.order.oid)
+            take = []
+            for o, q in named:
+                q2 = min(q, avail)
+                if q2 <= 0:
+                    self.name_stats["named_no_room"] += 1
+                    continue
+                self.name_stats["named_clipped_lots"] += q - q2
+                avail -= q2
+                take.append((o, q2))
+            anon = lambda: avail > 0 and self._seed_one(asset, side, px, avail, *(meta[:2] if meta else (self.t0, 0)))
+            if self.named_anon == "front":
+                anon()
+            for o, q in take:
+                self._rest_named(o, asset, side, px, q)
+                self.name_stats["named"] += 1
+                self.name_stats["named_lots"] += q
+            if self.named_anon == "back":
+                anon()
+
+    def _rest_named(self, o: dict, asset: int, side: Side, px: int, q: int) -> None:
+        eng = self.engine
+        order = eng._new_order(o["user"], asset, side, px, q, Tif.GTC, o.get("cloid"))
+        eng._rest(order, q)
+        self.named[o["oid"]] = order.oid
+        self.named_levels.add((o["user"], asset, side, px))
+
+    # ------------------------------------------------------------ deep book (deep_book=True)
+    def _build_deep(self, snap) -> None:
+        """Reserve of liquidity past snap's last full level, from the coarse book at the same time (see __init__)."""
+        asset = snap.asset
+        for side in (Side.BUY, Side.SELL):
+            self._deep[(asset, side)] = {}
+            self._deep_edge.pop((asset, side), None)
+        sf = self._sf.get((asset, snap.time_ms))
+        if sf is None:
+            self.deep_stats["no_coarse_book"] += 1
+            return
+        book = self.engine.books[asset]
+        for side, full, coarse in ((Side.BUY, snap.bids, sf.bids), (Side.SELL, snap.asks, sf.asks)):
+            if not full or len(coarse) < 2:
+                continue
+            edge = full[-1][0]
+            self._deep_edge[(asset, side)] = edge
+            pxs = [px for px, _ in coarse]
+            w = min(abs(a - b) for a, b in zip(pxs, pxs[1:]))
+            fullmap = dict(full)
+            res: dict[int, int] = {}
+            ev = self._deep_evidence(asset, side, snap.time_ms)
+            for bpx, bsz in coarse:
+                lo, hi = (bpx, bpx + w - 1) if side is Side.BUY else (bpx - w + 1, bpx)   # bucket's tick range
+                beyond = [p for p in range(lo, hi + 1) if (p < edge if side is Side.BUY else p > edge)]
+                if not beyond:
+                    continue
+                levels = book.side(side)
+                known = sum(levels[p].total for p in beyond if p in levels)
+                q = bsz - sum(sz for p, sz in fullmap.items() if lo <= p <= hi) - known
+                if q <= 0:
+                    continue
+                wts = {p: ev.get(p, 0) + (levels[p].total if p in levels else 0) for p in beyond}
+                if sum(wts.values()) > 0:
+                    self.deep_stats["buckets_from_evidence"] += 1
+                else:
+                    wts = {p: 1 for p in beyond}
+                    self.deep_stats["buckets_even"] += 1
+                tot, given = sum(wts.values()), 0
+                shares = sorted(((p, q * wt // tot) for p, wt in wts.items() if wt), key=lambda x: -wts[x[0]])
+                for p, x in shares:
+                    given += x
+                shares[0] = (shares[0][0], shares[0][1] + q - given)         # rounding to the best-supported price
+                for p, x in shares:
+                    if x > 0:
+                        res[p] = res.get(p, 0) + x
+                self.deep_stats["reserve_lots"] += q
+            self._deep[(asset, side)] = res
+
+    def _deep_evidence(self, asset: int, side: Side, at_ms: int) -> dict[int, int]:
+        """{px: weight} observable by at_ms: last size each price showed in a full snapshot of the lookback, plus
+        real maker-side trade size there."""
+        lo = at_ms - self.deep_lookback_ms
+        ev: dict[int, int] = {}
+        for s in self._full_hist:
+            if s.asset != asset or not lo <= s.time_ms <= at_ms:
+                continue
+            for px, sz in (s.bids if side is Side.BUY else s.asks):
+                ev[px] = sz
+        for tr in self._deep_trades:
+            if tr.asset == asset and lo <= tr.time_ms <= at_ms and tr.taker_side.opposite is side:
+                ev[tr.px] = ev.get(tr.px, 0) + tr.sz
+        return ev
+
+    def _deep_in(self, action) -> list | None:
+        """Put the reserve into the book for an order whose limit reaches past the last full level."""
+        p = action.new if isinstance(action, Modify) else action
+        if not isinstance(p, Place) or p.tif is Tif.ALO:
+            return None
+        side = p.side.opposite
+        edge = self._deep_edge.get((p.asset, side))
+        res = self._deep.get((p.asset, side))
+        if edge is None or not res or not (p.px > edge if p.side is Side.BUY else p.px < edge):
+            return None
+        eng = self.engine
+        book = eng.books[p.asset]
+        own = book.side(p.side)
+        best_own = (max(own) if p.side is Side.BUY else min(own)) if own else None
+        out = []
+        for px in sorted(res, reverse=side is Side.BUY):
+            if not (px <= p.px if p.side is Side.BUY else px >= p.px):
+                continue                                 # past this order's limit: it cannot reach
+            if best_own is not None and (px <= best_own if side is Side.SELL else px >= best_own):
+                continue                                 # would cross our own book
+            oid = eng.seed(p.asset, side, px, res[px])
+            self.ph_meta[oid] = (self._block.time_ms if self._block is not None else self.t0, -1, res[px], p.asset)
+            out.append((oid, p.asset, side, px, res[px]))
+        if out:
+            self.deep_stats["orders_reaching_past"] += 1
+        return out
+
+    def _deep_out(self, placed: list) -> None:
+        """Take back what the order left; the reserve keeps only that."""
+        eng = self.engine
+        for oid, asset, side, px, q in placed:
+            book = eng.books[asset]
+            left = book.node(oid).remaining if oid in book else 0
+            if oid in book:
+                book.remove(oid)
+            used = q - left
+            res = self._deep[(asset, side)]
+            if left:
+                res[px] = left
+            else:
+                res.pop(px, None)
+            if used:
+                self.deep_stats["consumed_lots"] += used
+                self.deep_stats["consumed_levels"] += 1
 
     def _seed_one(self, asset: int, side: Side, px: int, sz: int, time_ms: int, rank: int) -> int:
         oid = self.engine.seed(asset, side, px, sz)
@@ -630,8 +866,11 @@ class Replay:
         self.observer.before_action(self, block, action)
         before = self.engine.next_oid
         self._block = block
+        deep = self._deep_in(action) if self.deep_book else None
         gated = self._apply_gated(action) if self.touch is not None else None
         fills, rejects = gated if gated is not None else self.engine.apply(action)
+        if deep:
+            self._deep_out(deep)
         created = before if self.engine.next_oid > before and isinstance(action, (Place, Modify)) else None
         if created is not None:
             self.placed[created] = action.new if isinstance(action, Modify) else action
@@ -700,6 +939,8 @@ class Replay:
                     res = eng.reconcile(s.asset, s.bids, s.asks, known=self.reconcile_known)
                 for k, v in res.items():
                     self.reconciled[(ASSETS[s.asset].name, k)] += v
+                if self.deep_book:
+                    self._build_deep(s)
                 self.observer.after_reconcile(self, b, s, res, minute)
             if self.hasher is not None:
                 state_hash = self.hasher(eng, state_hash, b.height)

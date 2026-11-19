@@ -449,11 +449,12 @@ def _snapshot(asset: int, d: dict) -> BookSnapshot:
     return BookSnapshot(asset=asset, time_ms=d["time"], bids=conv(d["levels"][0]), asks=conv(d["levels"][1]))
 
 
-def iter_books(hl_data, coin: str, t0_ms: int, t1_ms: int) -> Iterator[BookSnapshot]:
-    """L2 snapshots with t0 <= time <= t1, deduplicated by time, in time order."""
+def iter_books(hl_data, coin: str, t0_ms: int, t1_ms: int, suffix: str = "") -> Iterator[BookSnapshot]:
+    """L2 snapshots with t0 <= time <= t1, deduplicated by time, in time order. suffix="_sf4": the recorder's
+    coarse book (nSigFigs 4: prices grouped into buckets, bids rounded down, asks up)."""
     asset = COIN_TO_ASSET[coin]
     seen: dict[int, dict] = {}
-    for path in _hour_files(Path(hl_data), f"book_{coin}", t0_ms, t1_ms):
+    for path in _hour_files(Path(hl_data), f"book_{coin}{suffix}", t0_ms, t1_ms):
         for rec in _records(path, t0_ms, t1_ms):
             d = rec["msg"]["data"]
             if t0_ms <= d["time"] <= t1_ms:

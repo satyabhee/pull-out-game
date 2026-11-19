@@ -340,6 +340,7 @@ class OidResolver:
         joint_tx / joint_block: the two joint layers (module doc). group_gap: ids that may be missing
         between two items of one placement tx. pair_*: cross-tx spacing tolerance (module doc)."""
         self.joint_tx, self.joint_block, self.group_gap = joint_tx, joint_block, group_gap
+        self.named: dict[int, int] = {}                 # real oid -> engine oid of a named pre-window order
         self.pair_slack, self.pair_lo, self.pair_per_mille = pair_slack, pair_lo, pair_per_mille
         self.node_budget, self.guard_mult = node_budget, guard_mult
         self.ratio_per_mille = ratio_per_mille          # refuse when |est - oid| > ratio * tolerance (None = off)
@@ -383,6 +384,16 @@ class OidResolver:
 
     def __call__(self, user: str, asset: int, hl_oid: int) -> int | None:
         self.last, self._last_reason = None, None
+        if hl_oid in self.named:                        # a pre-window order named from open_orders.json
+            x = self.named[hl_oid]
+            if x in self.engine.books[asset] and x in self.engine.by_user.get(user, {}):
+                self.stats["resolved_named"] += 1
+                self.stats["resolved"] += 1
+                self.last = x
+                return x
+            self.stats["named_gone"] += 1
+            self._last_reason = "named_gone"
+            return None
         if hl_oid in self.est.exact:                    # the real oid of an in-window placement is known
             x = self.by_pos.get(self.est.exact[hl_oid])
             if x is not None and x in self.engine.books[asset] and x in self.engine.by_user.get(user, {}):

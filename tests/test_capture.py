@@ -365,3 +365,20 @@ def test_history_skips_users_already_streamed_and_meta_keeps_cancellers(tmp_home
     cap.capture(StubFetcher(), 10, 12, meta, writer=w, state={}, warmup=0, max_anchors=0,
                 extras={"hist_users": 1, "tracked": lambda: ["0xu"]})
     assert calls == [] and meta["int_cancel_users"] == {"0xu": 3}
+
+
+def test_open_orders_are_prefetched_just_before_the_predicted_snapshot():
+    import collect.capture as cap
+    clock = {"t": 1000.0}
+    slept = []
+    def sleep(s):
+        slept.append(s); clock["t"] += s
+    asked = []
+    w = cap.Writer(calls={"frontendOpenOrders": lambda u: (asked.append((u, clock["t"])), [])[1]},
+                   budget=cap.info.Budget(per_min=10_000))
+    trades = [{"users": ["0x" + "a" * 40, "0x" + "b" * 40], "side": "B", "coin": "BTC", "px": "1", "sz": "1"}]
+    got = cap.prefetch_open_orders(w, last_snap=995_000, period_ms=12_000, lead_ms=1500,
+                                   now=lambda: clock["t"], sleep=sleep, trades=trades)
+    assert slept == [pytest.approx(5.5)]                  # 995 s + 12 s - 1.5 s = 1005.5 s
+    assert [u for u, _ in asked] == ["0x" + "b" * 40] and got is not None
+    assert w.take_info()["frontendOpenOrders"][0]["prefetch"] is True

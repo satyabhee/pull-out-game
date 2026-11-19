@@ -30,7 +30,10 @@ Settings (environment variables):
                        int-oid cancel targets (mostly placed before the chunk, so never locatable)
   CHUNK_FILL_USERS=6   chunks: userFillsByTime for the users in the most BTC/ETH trades of the fetched blocks
                        (fills.json; every fill carries the order's oid and the tx hash -> exact anchors)
-  CHUNK_OPEN_USERS=5   chunks: frontendOpenOrders of the top recent makers, asked at the snapshot (open_orders.json)
+  CHUNK_OPEN_USERS=5   chunks: frontendOpenOrders of the top recent makers (open_orders.json), asked all at once
+                       OPEN_LEAD_MS before the predicted next snapshot, which then becomes the chunk's snapshot, so
+                       the answers show what rested just before scoring starts
+  OPEN_LEAD_MS=1500    (0 = old behaviour: asked after the chunk is planned, through the writer queue)
   CHUNK_HIST_USERS=1   chunks: historicalOrders of the users with the most int-oid cancels (hist_orders.json)
   INFO_WEIGHT_PER_MIN=600  weight budget for all info lookups (IP limit 1200/min; collect/info.py)
   MAX_AGE_MIN=30       never request a block estimated older than this
@@ -57,6 +60,7 @@ CHUNK_ANCHORS = int(os.environ.get("CHUNK_ANCHORS", 2))
 ANCHOR_MODE = os.environ.get("ANCHOR_MODE", "cloid")
 CHUNK_FILL_USERS = int(os.environ.get("CHUNK_FILL_USERS", 6))
 CHUNK_OPEN_USERS = int(os.environ.get("CHUNK_OPEN_USERS", 5))
+OPEN_LEAD_MS = int(os.environ.get("OPEN_LEAD_MS", 1500))
 CHUNK_HIST_USERS = int(os.environ.get("CHUNK_HIST_USERS", 1))
 INFO_FILES = {"userFillsByTime": "fills.json", "frontendOpenOrders": "open_orders.json",
               "historicalOrders": "hist_orders.json"}
@@ -185,6 +189,32 @@ class Writer:
     def ask_info(self, kind, user, args=(), extra=None):
         """One info lookup (collect/info.py CALLS[kind](user, *args)); the answer is kept raw in info[kind]."""
         self.q.put(("info", kind, user, tuple(args), extra or {}))
+
+    def ask_info_now(self, kind, users, extra=None):
+        """Ask `kind` for every user at once (one thread each, weight booked as usual) and wait for the answers;
+        stored like ask_info's. Returns the latest answer time (s)."""
+        def one(u):
+            self.budget.take(info.weight_of(kind))
+            t = time.time()
+            try:
+                r = self.calls[kind](u)
+            except Exception as e:
+                r = {"error": repr(e)}
+            self.budget.add(info.weight_of(kind, r) - info.weight_of(kind))
+            with self.lock:
+                self.info[kind].append({**(extra or {}), "user": u, "kind": kind, "args": [], "asked_at": t,
+                                        "answered_at": time.time(), "answer": r})
+        threads = [threading.Thread(target=one, args=(u,), daemon=True) for u in users]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        with self.lock:
+            return max([r["answered_at"] for r in self.info[kind]], default=time.time())
+
+    def drop_info(self, kind):
+        with self.lock:
+            self.info.pop(kind, None)
 
     def snapshot(self):
         with self.lock:
@@ -609,9 +639,42 @@ def ask_open_orders(writer, snap_ms, trades=None, n=None):
     return users
 
 
+def snapshot_period_ms(path=None, default=12_400):
+    """Median gap between the recorder's recent BTC snapshots (they come on a steady cadence)."""
+    p = path or os.path.join(HOME, "hl_data", time.strftime("%Y-%m-%d/%H", time.gmtime()), "book_BTC.jsonl")
+    if not os.path.exists(p):
+        return default
+    t = sorted(r["msg"]["data"]["time"] for r in tail_lines(p, 65536)
+               if isinstance(r.get("msg"), dict) and "data" in r["msg"])
+    gaps = sorted(b - a for a, b in zip(t, t[1:]) if b > a)
+    return gaps[len(gaps) // 2] if gaps else default
+
+
+def prefetch_open_orders(writer, last_snap, period_ms, lead_ms=None, now=time.time, sleep=time.sleep, trades=None):
+    """OPEN_LEAD_MS mode: wait until lead_ms before the predicted next snapshot (last_snap + period), then ask
+    frontendOpenOrders of the top recent makers all at once. Returns the latest answer time (ms), or None when
+    nothing was asked (no users / mode off)."""
+    lead_ms = OPEN_LEAD_MS if lead_ms is None else lead_ms
+    if not lead_ms or not CHUNK_OPEN_USERS:
+        return None
+    target = last_snap + period_ms - lead_ms
+    while target < now() * 1000 - period_ms / 2:     # that snapshot is already (nearly) here: aim at the next
+        target += period_ms
+    wait = target / 1000 - now()
+    if wait > 0:
+        sleep(wait)
+    t = now() * 1000
+    trades = recorder_trades(t - 600_000, t) if trades is None else trades
+    users = top_makers(trades, CHUNK_OPEN_USERS)
+    if not users:
+        return None
+    return int(writer.ask_info_now("frontendOpenOrders", users, {"prefetch": True}) * 1000)
+
+
 def run_chunks(fetcher, state, writer, cancellers=None):
     last_snap, last_start = 0, 0.0
     cancellers = cancellers or CancellerTally()
+    answered = None                                  # prefetched open orders: latest answer time (ms)
     while True:
         pct = disk_pct()
         if pct > 85:
@@ -620,6 +683,19 @@ def run_chunks(fetcher, state, writer, cancellers=None):
         snap = latest_snapshot_ms()
         if snap is None or snap <= last_snap or time.time() - last_start < CHUNK_EVERY_S:
             time.sleep(0.5); continue
+        if OPEN_LEAD_MS and CHUNK_OPEN_USERS:
+            if answered is None:
+                answered = prefetch_open_orders(writer, snap, snapshot_period_ms())
+                if answered is None:
+                    answered = 0                     # no users: chunk without open orders
+                continue
+            if answered and snap <= answered:
+                time.sleep(0.2); continue            # wait for the snapshot after the answers
+            if answered and snap - answered > OPEN_LEAD_MS + 5_000:
+                log(f"snapshot {snap} came {snap - answered} ms after the open-orders answers; asking again")
+                writer.drop_info("frontendOpenOrders")
+                answered = None
+                continue
         span = plan_chunk(snap, recent_headers(), CHUNK_BLOCKS)
         if span is None:
             if time.time() * 1000 - snap > 30_000:
@@ -629,7 +705,12 @@ def run_chunks(fetcher, state, writer, cancellers=None):
         last_snap, last_start = snap, time.time()
         start, end, warmup = with_lead_in(span, LEAD_IN_BLOCKS)
         meta = {"kind": "chunk", "snapshot_time": snap, "lead_in_blocks": warmup}
-        ask_open_orders(writer, snap)
+        if OPEN_LEAD_MS and CHUNK_OPEN_USERS:
+            if answered:
+                meta["open_orders_lead_ms"] = snap - answered
+            answered = None
+        else:
+            ask_open_orders(writer, snap)
         status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=warmup, max_anchors=CHUNK_ANCHORS,
                          extras=chunk_extras())
         cancellers.add(meta.get("int_cancel_users"))

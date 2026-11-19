@@ -10,8 +10,9 @@ Sources (all optional; a window without them gives empty facts and the resolver 
     user_fills.jsonl  userFills of the tracked top makers
 
 Two normalized lists:
-  orders: {"user", "asset", "buy", "px" (str), "sz" (str, original size), "timestamp", "oid", "cloid", "status", "source"}
-  fills:  {"user", "asset", "buy" (the user's side), "px" (str), "oid", "hash", "crossed", "time", "source"}
+  orders: {"user", "asset", "buy", "px" (str), "sz" (str, original size), "rem" (str, size left at status_ts),
+           "timestamp", "oid", "cloid", "status", "status_ts" (ms; for open_orders the answer time), "source"}
+  fills:  {"user", "asset", "buy" (the user's side), "px" (str), "sz" (str), "oid", "hash", "crossed", "time", "source"}
 Only BTC/ETH. Users lower-cased. These are TRUTH about real orders: data/oids.py uses them to locate placements
 (anchors) and to identify the order a cancel names; they are never fed to the engine as actions.
 """
@@ -40,14 +41,15 @@ class OidFacts:
         return len(self.orders), len(self.fills)
 
 
-def _order(o: dict, user: str, source: str, status=None) -> dict | None:
+def _order(o: dict, user: str, source: str, status=None, status_ts=None) -> dict | None:
     asset = _COIN.get(o.get("coin"))
     if asset is None or "oid" not in o:
         return None
     try:
         return {"user": user.lower(), "asset": asset, "buy": o["side"] == "B", "px": str(o["limitPx"]),
                 "sz": str(o.get("origSz", o.get("sz"))), "timestamp": int(o["timestamp"]), "oid": int(o["oid"]),
-                "cloid": o.get("cloid"), "status": status, "source": source}
+                "cloid": o.get("cloid"), "status": status, "source": source, "rem": str(o.get("sz", o.get("origSz"))),
+                "status_ts": int(status_ts) if status_ts is not None else None}
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -58,7 +60,7 @@ def _fill(f: dict, user: str, source: str) -> dict | None:
         return None
     try:
         return {"user": user.lower(), "asset": asset, "buy": f["side"] == "B", "px": str(f["px"]),
-                "oid": int(f["oid"]), "hash": f.get("hash"), "crossed": bool(f.get("crossed")),
+                "sz": str(f.get("sz", "0")), "oid": int(f["oid"]), "hash": f.get("hash"), "crossed": bool(f.get("crossed")),
                 "time": int(f["time"]), "source": source}
     except (KeyError, TypeError, ValueError):
         return None
@@ -92,7 +94,10 @@ def load(window_dir, hl_data=None, recorder_margin_ms: int = 60_000) -> OidFacts
                     if f:
                         facts.fills.append(f)
                 else:
-                    o = _order(x.get("order", x), user, src, x.get("status"))
+                    o = _order(x.get("order", x), user, src, x.get("status"), x.get("statusTimestamp"))
+                    if o and src == "open":
+                        a = rec.get("answered_at")
+                        o["status_ts"] = int(a * 1000) if isinstance(a, (int, float)) else None
                     if o:
                         facts.orders.append(o)
     if hl_data is not None:
@@ -103,7 +108,8 @@ def load(window_dir, hl_data=None, recorder_margin_ms: int = 60_000) -> OidFacts
                 for r in _records(path, lo, hi):
                     m = r.get("msg") or {}
                     for x in m.get("data") or []:
-                        o = _order((x or {}).get("order", {}), m.get("user", ""), "ws", (x or {}).get("status"))
+                        o = _order((x or {}).get("order", {}), m.get("user", ""), "ws", (x or {}).get("status"),
+                                   (x or {}).get("statusTimestamp"))
                         if o:
                             facts.orders.append(o)
             for path in _hour_files(Path(hl_data), "user_fills", lo, hi):
@@ -115,3 +121,33 @@ def load(window_dir, hl_data=None, recorder_margin_ms: int = 60_000) -> OidFacts
                         if f and lo <= f["time"] <= hi:
                             facts.fills.append(f)
     return facts
+
+
+
+def resting_at(facts: OidFacts, t0_ms: int, alive_ms: int) -> list[dict]:
+    """Orders placed before t0_ms (the window's first block, so none of our placements) that rested at alive_ms
+    (the seed snapshot), one per oid in oid order, each {"order": orders-list dict, "ref_ms", "rem"}:
+      open_orders answer      still resting at the answer: ref = answer time, rem = size then;
+      a final status (hist / ws: canceled, filled, ...) at or after alive_ms: ref = that time, rem = size left then;
+      only "open" updates (ws), no final status in the recorder range: ref None (rem = original size).
+    A final status before alive_ms drops the order (gone before the snapshot)."""
+    by_oid: dict[int, list] = {}
+    for o in facts.orders:
+        if o["timestamp"] < t0_ms:
+            by_oid.setdefault(o["oid"], []).append(o)
+    out = []
+    for oid in sorted(by_oid):
+        recs = by_oid[oid]
+        live = [o for o in recs if o["source"] == "open"]
+        final = sorted((o for o in recs if o["source"] != "open" and o["status"] not in (None, "open")
+                        and o["status_ts"] is not None), key=lambda o: o["status_ts"])
+        if final and final[0]["status_ts"] < alive_ms:
+            continue
+        if live:
+            o = live[0]
+            out.append({"order": o, "ref_ms": o["status_ts"], "rem": o["rem"]})
+        elif final:
+            out.append({"order": final[0], "ref_ms": final[0]["status_ts"], "rem": final[0]["rem"]})
+        else:
+            out.append({"order": recs[0], "ref_ms": None, "rem": recs[0]["sz"]})
+    return out

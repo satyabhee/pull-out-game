@@ -132,3 +132,68 @@ def test_cli_uses_facts_by_default_and_reports_them(tmp_path):
     assert "oid_facts,True" in s and "facts:exact,1" in s
     vr.main([str(window), "--hl-data", str(hl), "--no-oid-facts", "--out", str(tmp_path / "n")])
     assert "oid_facts" not in (tmp_path / "n" / "summary.csv").read_text()
+
+
+def level_users(r, side, px):
+    lv = r.engine.books[0].side(side).get(BTC.px_to_ticks(px))
+    return [(nd.order.user, BTC.lots_to_sz(nd.remaining)) for nd in lv] if lv is not None else []
+
+
+def prewindow_book(tmp_path, open_answer=(), ws_rows=()):
+    """Snapshot bid 60000 x 0.005; A cancels real oid 5 in-window. Facts say what oid 5 was."""
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 50, [("60000", "0.005")], [("60100", "0.001")])
+    w.block([cancel_tx(A, "0xa1", 0, 0, 5)], dt_ms=500)
+    window, hl = w.write()
+    if open_answer:
+        (window / "open_orders.json").write_text(json.dumps([{"user": A, "answered_at": (T0 + 5000) / 1000,
+                                                               "answer": list(open_answer)}]))
+    if ws_rows:
+        hour = next(p for p in hl.glob("*/*") if p.is_dir())
+        (hour / "user_orders.jsonl").write_text("".join(json.dumps(x) + "\n" for x in ws_rows))
+    return w, window, hl
+
+
+def oo(oid, px="60000.0", sz="0.002", ts=T0 - 10_000):
+    return {"coin": "BTC", "side": "B", "limitPx": px, "sz": sz, "origSz": sz, "oid": oid, "timestamp": ts}
+
+
+def test_a_prewindow_order_takes_its_share_of_the_placeholder_and_its_cancel_finds_it(tmp_path):
+    w, window, hl = prewindow_book(tmp_path, ws_rows=[
+        {"recv_ms": T0 + 500, "msg": {"user": A, "data": [{"order": oo(5), "status": "canceled",
+                                                             "statusTimestamp": T0 + 500}]}}])
+    off = Replay(window, hl, listing, oid_facts=True)
+    list(off)
+    assert level_users(off, Side.BUY, "60000") == [("placeholder", "0.005")]       # the cancel could not land
+    on = Replay(window, hl, listing, oid_facts=True, name_prewindow=True)
+    assert level_users(on, Side.BUY, "60000") == [("placeholder", "0.003"), (A.lower(), "0.002")]
+    list(on)
+    assert on.resolver.stats["resolved_named"] == 1
+    assert level_users(on, Side.BUY, "60000") == [("placeholder", "0.003")]
+
+
+def test_named_orders_queue_by_real_oid_and_anonymous_rest_can_go_behind(tmp_path):
+    w, window, hl = prewindow_book(tmp_path, open_answer=[oo(9, sz="0.001"), oo(4, sz="0.001")])
+    r = Replay(window, hl, listing, oid_facts=True, name_prewindow=True, named_anon="back")
+    assert r.named == {4: r.named[4], 9: r.named[9]} and r.named[4] < r.named[9]
+    assert level_users(r, Side.BUY, "60000") == [(A.lower(), "0.001"), (A.lower(), "0.001"), ("placeholder", "0.003")]
+
+
+def test_gone_before_the_snapshot_is_not_named_and_deeper_prices_are_added_outright(tmp_path):
+    w, window, hl = prewindow_book(tmp_path, open_answer=[oo(7, px="59000.0")], ws_rows=[
+        {"recv_ms": T0 - 60, "msg": {"user": A, "data": [{"order": oo(5), "status": "canceled",
+                                                            "statusTimestamp": T0 - 60}]}}])
+    r = Replay(window, hl, listing, oid_facts=True, name_prewindow=True)
+    assert 5 not in r.named and level_users(r, Side.BUY, "60000") == [("placeholder", "0.005")]
+    assert level_users(r, Side.BUY, "59000") == [(A.lower(), "0.002")] and r.name_stats["named_deep"] == 1
+
+
+def test_a_price_inside_the_snapshot_range_it_does_not_show_is_a_conflict(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 50, [("60000", "0.005"), ("59990", "0.001")], [("60100", "0.001")])
+    w.block([cancel_tx(A, "0xa1", 0, 0, 5)], dt_ms=500)
+    window, hl = w.write()
+    (window / "open_orders.json").write_text(json.dumps([{"user": A, "answered_at": (T0 + 5000) / 1000,
+                                                           "answer": [oo(3, px="59995.0")]}]))
+    r = Replay(window, hl, listing, oid_facts=True, name_prewindow=True)
+    assert r.named == {} and r.name_stats["named_conflict"] == 1
