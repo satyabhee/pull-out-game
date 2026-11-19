@@ -838,9 +838,11 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="with facts: pre-window orders the facts show resting at the seed snapshot become their real "
                          "owner's orders (real oid, queue by oid). Off by default: neutral on 46 Mac chunks (G1 -0.3, "
                          "full recall +0.3 points)")
-    ap.add_argument("--deep-book", action="store_true",
+    ap.add_argument("--deep-book", action=argparse.BooleanOptionalAction, default=True,
                     help="liquidity past the full snapshot's 20 levels from the coarse book (book_*_sf4), split over "
-                         "prices by what was observable, used only by orders whose limit reaches past the last level")
+                         "prices by what was observable, used only by orders whose limit reaches past the last level. "
+                         "Default ON (approved by Satya Nov 19 as an exception to 'never add liquidity from "
+                         "snapshots'; 74 Mac chunks: G1 59.0% -> 66.6%, one tx changed); --no-deep-book turns it off")
     ap.add_argument("--learn-keep-known", action="store_true",
                     help="trade_learn's sweep and queue rules remove placeholders only, never an order we saw placed")
     ap.add_argument("--named-anon", choices=("front", "back"), default="front",
@@ -890,7 +892,7 @@ def options_tag(a) -> str:
                     "-nofacts" if a.no_oid_facts else "",
                     "-name" if a.name_prewindow and not a.no_oid_facts else "",
                     "-anonback" if a.named_anon == "back" else "",
-                    "-deep" if a.deep_book else "",
+                    "-nodeep" if not a.deep_book else "",
                     "-learnkeep" if a.learn_keep_known else ""])
 
 
