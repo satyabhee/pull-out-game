@@ -12,7 +12,10 @@ optional extra streams (environment variables):
                        20 levels per side reach much deeper than the full-precision book (own connection: the
                        messages do not say which aggregation they are)
   user_orders.jsonl    TRACK_USERS=6 (default; 0 = off): orderUpdates (every placement / cancel / fill / reject of
-  user_fills.jsonl     that user, with oid) and userFills for the top makers by BTC/ETH maker notional, re-picked
+  user_fills.jsonl     that user, with oid) and userFills. TRACK_BY=cancels (default): the users with the most int-oid
+                       cancels in capture.py's last 30 chunks (cancellers.json, used if < 1 h old; their cancels are
+                       what the replay cannot resolve without exact oids); else / TRACK_BY=makers: the top makers by
+                       BTC/ETH maker notional. Re-picked
   tracked_users.jsonl  every TRACK_EVERY_S=1800 s (first pick after TRACK_WARMUP_S=600 s, or TRACK_USER_LIST=a,b at
                        start). One connection per user, because orderUpdates messages carry no user; the IP allows
                        10 connections, so api + rpc + book_sf + 6 users = 9. tracked_users.jsonl logs each set with
@@ -31,6 +34,8 @@ L2_SIGFIGS = os.environ.get("L2_SIGFIGS", "4")
 TRACK_USERS = int(os.environ.get("TRACK_USERS", 6))
 TRACK_EVERY_S = float(os.environ.get("TRACK_EVERY_S", 1800))
 TRACK_WARMUP_S = float(os.environ.get("TRACK_WARMUP_S", 600))
+TRACK_BY = os.environ.get("TRACK_BY", "cancels")          # cancels (capture's cancellers.json) | makers
+CANCELLERS_FILE = os.environ.get("CANCELLERS_FILE", "cancellers.json")
 TRACK_USER_LIST = [u.strip().lower() for u in os.environ.get("TRACK_USER_LIST", "").split(",") if u.strip()]
 ROOT = "hl_data"
 API_WS = "wss://api.hyperliquid.xyz/ws"
@@ -140,19 +145,39 @@ def route_api(m, trades, books, bbos, other, tally=None):
         other.write(m)
 
 
+def pick_users(tally, n, by=None, path=None, now=None, max_age_s=3600):
+    """Users to stream: top int-oid cancellers from cancellers.json when fresh (TRACK_BY=cancels), else top makers.
+    The maker tally is reset either way, so it always covers the last period."""
+    by = TRACK_BY if by is None else by
+    makers = tally.pick(n)
+    if by == "cancels":
+        try:
+            d = json.load(open(path or CANCELLERS_FILE))
+            if (now if now is not None else time.time()) * 1000 - d["time"] <= max_age_s * 1000:
+                top = [u for u, _ in sorted(d["counts"].items(), key=lambda x: (-x[1], x[0]))][:n]
+                if top:
+                    return top
+        except Exception:
+            pass
+    return makers
+
+
 async def track_users(tally, orders, fills, tracked, other, n=None, every_s=None, warmup_s=None, initial=None,
-                      start=None, sleep=None):
+                      start=None, sleep=None, picker=None):
     """Keep one orderUpdates+userFills connection per tracked user; re-pick the set every `every_s`."""
     n = TRACK_USERS if n is None else n
     every_s = TRACK_EVERY_S if every_s is None else every_s
     sleep = sleep or asyncio.sleep
     start = start or (lambda u: asyncio.ensure_future(
         stream(API_WS, user_subscriptions(u), lambda m: route_user(m, u, orders, fills, other))))
+    picker = picker or (lambda k: pick_users(tally, k))
     tasks = {}
     users = list(initial if initial is not None else TRACK_USER_LIST)[:n]
+    if not users and TRACK_BY == "cancels" and picker is not None and initial is None:
+        users = picker(n) if os.path.exists(CANCELLERS_FILE) else []
     if not users:
         await sleep(TRACK_WARMUP_S if warmup_s is None else warmup_s)
-        users = tally.pick(n)
+        users = picker(n)
     while True:
         for u in [u for u in tasks if u not in users]:
             tasks.pop(u).cancel()
@@ -161,7 +186,7 @@ async def track_users(tally, orders, fills, tracked, other, n=None, every_s=None
                 tasks[u] = start(u)
         tracked.write({"time": int(time.time() * 1000), "users": sorted(tasks)})
         await sleep(every_s)
-        users = tally.pick(n) or users
+        users = picker(n) or users
 
 
 async def main():

@@ -96,3 +96,17 @@ def test_track_users_swaps_connections_and_logs_each_set():
     assert [t.u for t in started] == ["0xa", "0xb", "0xc"]
     assert started[0].cancelled and not started[1].cancelled
     assert [m["users"] for m in tracked.got] == [["0xa", "0xb"], ["0xb", "0xc"], ["0xb", "0xc"]]
+
+
+def test_pick_users_prefers_fresh_cancellers_and_falls_back_to_makers(tmp_path):
+    import json
+    t = record_hl.MakerTally()
+    t.feed([{"side": "B", "px": "1", "sz": "1", "users": ["0xt", "0xmaker"]}])
+    p = tmp_path / "cancellers.json"
+    p.write_text(json.dumps({"time": 1_000_000, "counts": {"0xc1": 5, "0xc2": 9, "0xc3": 9}}))
+    assert record_hl.pick_users(t, 2, by="cancels", path=p, now=1000) == ["0xc2", "0xc3"]
+    t.feed([{"side": "B", "px": "1", "sz": "1", "users": ["0xt", "0xmaker"]}])
+    assert record_hl.pick_users(t, 2, by="cancels", path=p, now=1000 + 7200) == ["0xmaker"]    # stale file
+    assert record_hl.pick_users(t, 2, by="cancels", path=tmp_path / "none.json") == []
+    t.feed([{"side": "B", "px": "1", "sz": "1", "users": ["0xt", "0xmaker"]}])
+    assert record_hl.pick_users(t, 2, by="makers", path=p, now=1000) == ["0xmaker"]

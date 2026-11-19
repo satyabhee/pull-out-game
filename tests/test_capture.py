@@ -347,3 +347,21 @@ def test_budget_waits_when_a_minute_is_full():
     b.take(20)                                            # 60 > 50: waits until the first entry is a minute old
     assert slept and now[0] >= 60
     assert info.weight_of("userFillsByTime", [{}] * 45) == 22 and info.weight_of("orderStatus") == 2
+
+
+def test_canceller_tally_rolls_over_recent_chunks(tmp_path):
+    t = cap.CancellerTally(path=str(tmp_path / "c.json"), keep=2)
+    t.add({"0xa": 5})
+    t.add({"0xb": 3, "0xa": 1})
+    assert t.add({"0xb": 4}) == {"0xb": 7, "0xa": 1}                  # the first chunk dropped out
+    assert json.loads((tmp_path / "c.json").read_text())["chunks"] == 2
+
+
+def test_history_skips_users_already_streamed_and_meta_keeps_cancellers(tmp_home):
+    calls = []
+    w = cap.Writer(lookup=lambda u, o: {}, info_gap_s=0, budget=FakeBudget(),
+                   calls={"historicalOrders": lambda u: calls.append(u) or []})
+    meta = {"kind": "chunk"}
+    cap.capture(StubFetcher(), 10, 12, meta, writer=w, state={}, warmup=0, max_anchors=0,
+                extras={"hist_users": 1, "tracked": lambda: ["0xu"]})
+    assert calls == [] and meta["int_cancel_users"] == {"0xu": 3}

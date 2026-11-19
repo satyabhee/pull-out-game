@@ -359,7 +359,9 @@ def ask_extras(writer, extras, meta, cancels):
         trades = extras["trades"](t0, t1 + 1000) if extras.get("trades") else []
         for u in busiest_users(trades, nf):
             writer.ask_info("userFillsByTime", u, (t0 - 1000, t1 + 5000), {"t0": t0, "t1": t1})
-    for u, _ in sorted(cancels.items(), key=lambda x: (-x[1], x[0]))[:extras.get("hist_users", 0)]:
+    skip = set(extras["tracked"]()) if extras.get("tracked") else set()   # their orders stream live already
+    ranked = [u for u, _ in sorted(cancels.items(), key=lambda x: (-x[1], x[0])) if u not in skip]
+    for u in ranked[:extras.get("hist_users", 0)]:
         writer.ask_info("historicalOrders", u, (), {"int_cancels": cancels[u]})
 
 
@@ -448,6 +450,7 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
         if i % 300 == 0 and i:
             meta["blocks_on_disk"] = len(glob.glob(os.path.join(d, "*.json.gz")))
             save_json(wpath, meta); save_json(apath, old + writer.snapshot())
+    meta["int_cancel_users"] = dict(sorted(cancels.items(), key=lambda x: (-x[1], x[0]))[:30])
     if extras and status is None:
         ask_extras(writer, extras, meta, cancels)
     writer.drain()                                         # every block on disk, every lookup answered
@@ -564,7 +567,33 @@ def recent_headers():
 
 
 def chunk_extras():
-    return {"fill_users": CHUNK_FILL_USERS, "hist_users": CHUNK_HIST_USERS, "trades": recorder_trades}
+    return {"fill_users": CHUNK_FILL_USERS, "hist_users": CHUNK_HIST_USERS, "trades": recorder_trades,
+            "tracked": tracked_now}
+
+
+def tracked_now():
+    """Users the recorder streams live right now (last line of the current hour's tracked_users.jsonl)."""
+    p = os.path.join(HOME, "hl_data", time.strftime("%Y-%m-%d/%H", time.gmtime()), "tracked_users.jsonl")
+    if not os.path.exists(p):
+        return []
+    rows = tail_lines(p, 16384)
+    return rows[-1]["msg"]["users"] if rows else []
+
+
+class CancellerTally:
+    """int-oid cancel counts per user over the last `keep` chunks -> cancellers.json, which the recorder reads to
+    pick the users it streams (orderUpdates gives the exact oid of every order they place)."""
+
+    def __init__(self, path=None, keep=30):
+        self.path = path or os.path.join(HOME, "cancellers.json")
+        self.recent = collections.deque(maxlen=keep)
+
+    def add(self, counts):
+        self.recent.append(collections.Counter(counts or {}))
+        tot = sum(self.recent, collections.Counter())
+        top = dict(sorted(tot.items(), key=lambda x: (-x[1], x[0]))[:50])
+        save_json(self.path, {"time": int(time.time() * 1000), "chunks": len(self.recent), "counts": top})
+        return top
 
 
 def ask_open_orders(writer, snap_ms, trades=None, n=None):
@@ -580,8 +609,9 @@ def ask_open_orders(writer, snap_ms, trades=None, n=None):
     return users
 
 
-def run_chunks(fetcher, state, writer):
+def run_chunks(fetcher, state, writer, cancellers=None):
     last_snap, last_start = 0, 0.0
+    cancellers = cancellers or CancellerTally()
     while True:
         pct = disk_pct()
         if pct > 85:
@@ -602,6 +632,7 @@ def run_chunks(fetcher, state, writer):
         ask_open_orders(writer, snap)
         status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=warmup, max_anchors=CHUNK_ANCHORS,
                          extras=chunk_extras())
+        cancellers.add(meta.get("int_cancel_users"))
         save_json(STATE, state)
         if status == "archived_cap":
             if ONCE:
