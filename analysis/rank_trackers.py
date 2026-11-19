@@ -6,7 +6,14 @@ ghost (guard) or no_candidate (what tracking would buy for the others). Duplicat
 target already went, on chain too), pre-window targets and cancels the estimate resolves count nothing.
 Counting resolved_exact keeps a tracked user ranked: their failures vanish once tracked, their need does not.
 
-Writes {"time" (ms), "chunks", "counts" {user: score}} for collect/record_hl.py (CANCELLERS_FILE, TRACK_BY=cancels).
+Contested slots (--contested-slots K, default 0): the first K places go to the makers with the most per-tx miss
+on CONTESTED scored txs (a real maker also cancels / modifies / posts ALO on that asset in that block:
+analysis/contested) over the latest --contested-chunks chunks; each tx's miss (1 - matched / real notional) is
+split over its makers (real, and engine makers other than placeholders). The other places follow the cancel
+score. Per-chunk results are cached (--cache), so each round replays only new chunks.
+
+Writes {"time" (ms), "chunks", "counts" {user: rank score}, "cancel_scores", "contested_scores"} for
+collect/record_hl.py (CANCELLERS_FILE, TRACK_BY=cancels): the recorder takes the top of "counts".
 
 usage: python -m analysis.rank_trackers <windows dir> --hl-data H --out trackers.json [--chunks 6] [--every 600]
        [replay options as validate_replay]
@@ -22,7 +29,9 @@ from collections import Counter
 from pathlib import Path
 
 from analysis import validate_replay as vr
-from engine_py.types import Cancel, Modify
+from analysis.contested import ASSET_OF, block_actors
+from engine_py.matching import PLACEHOLDER
+from engine_py.types import ASSETS, Cancel, Modify
 
 COUNTED = ("resolved_exact", "ambiguous", "ghost", "no_candidate")
 
@@ -66,25 +75,69 @@ def recent_chunks(windows_dir, n):
     return [d for _, d in sorted(out)[-n:]]
 
 
-def rank(windows_dir, hl_data, policy, kw, n):
-    score, parts, used = Counter(), Counter(), []
-    for d in recent_chunks(windows_dir, n):
-        try:
-            vr.run(d, hl_data, policy, quiet=True, observer_cls=_Obs, **kw)
-        except Exception as e:                      # one bad chunk must not stop the ranking
-            print(f"{d.name}: {e!r}", file=sys.stderr)
+def chunk_scores(d, hl_data, policy, kw) -> dict:
+    """{"cancel": {user: n}, "parts": {reason: n}, "contested": {user: miss weight}} for one chunk."""
+    res, rows = vr.run(d, hl_data, policy, quiet=True, observer_cls=_Obs, **kw)
+    obs = _Obs.last
+    byhash = {r["hash"]: r for r in rows}
+    contested, actors = Counter(), {}
+    for rec in obs.txs.values():
+        r = byhash.get(rec.hash)
+        if r is None or r["warmup"] or r["status"] not in ("match", "mismatch") or r["real_notional"] <= 0:
             continue
-        score.update(_Obs.last.score)
-        parts.update(_Obs.last.parts)
-        used.append(d.name)
-    return score, parts, used
+        if rec.block not in actors:
+            p = Path(d) / f"{rec.block}.json.gz"
+            actors[rec.block] = block_actors(p) if p.exists() else {}
+        acts = actors[rec.block].get(rec.asset, set())
+        real = {m for _, _, m in rec.real}
+        if not any(m[:10] in acts for m in real):
+            continue
+        makers = real | {m for _, _, m, _ in rec.engine if m != PLACEHOLDER}
+        miss = 1 - r["matched_notional"] / r["real_notional"]
+        for m in makers:
+            contested[m] += miss / len(makers)
+    return {"cancel": dict(obs.score), "parts": dict(obs.parts), "contested": dict(contested)}
 
 
-def write(path, score, used, now_ms=None):
+def rank(windows_dir, hl_data, policy, kw, n, contested_n=0, cache=None):
+    """Cancel score over the latest n chunks, contested score over the latest contested_n."""
+    cache = cache if cache is not None else {}
+    names = recent_chunks(windows_dir, max(n, contested_n))
+    for d in names:
+        if d.name not in cache:
+            try:
+                cache[d.name] = chunk_scores(d, hl_data, policy, kw)
+            except Exception as e:                  # one bad chunk must not stop the ranking
+                print(f"{d.name}: {e!r}", file=sys.stderr)
+    score, parts, contested, used = Counter(), Counter(), Counter(), []
+    for i, d in enumerate(reversed(names)):         # newest first
+        c = cache.get(d.name)
+        if c is None:
+            continue
+        if i < n:
+            score.update(c["cancel"])
+            parts.update(c["parts"])
+            used.append(d.name)
+        if i < contested_n:
+            contested.update(c["contested"])
+    return score, parts, used, contested
+
+
+def order(score: Counter, contested: Counter, k: int, total: int = 50) -> list:
+    """Users in tracking order: the top k contested makers, then the cancel ranking."""
+    out = [u for u, v in contested.most_common() if v > 0][:k]
+    out += [u for u, _ in score.most_common() if u not in out]
+    return out[:total]
+
+
+def write(path, score, used, now_ms=None, contested=None, k=0):
+    users = order(score, contested or Counter(), k)
     tmp = f"{path}.tmp"
     with open(tmp, "w") as f:
         json.dump({"time": int(now_ms if now_ms is not None else time.time() * 1000), "chunks": used,
-                   "counts": dict(score.most_common(50))}, f)
+                   "counts": {u: len(users) - i for i, u in enumerate(users)},
+                   "cancel_scores": dict(score.most_common(50)),
+                   "contested_scores": {u: round(v, 4) for u, v in (contested or Counter()).most_common(50)}}, f)
     os.replace(tmp, path)
 
 
@@ -94,17 +147,33 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--chunks", type=int, default=6)
     ap.add_argument("--every", type=float, default=0, help="seconds between rankings; 0 = once")
+    ap.add_argument("--contested-slots", type=int, default=0)
+    ap.add_argument("--contested-chunks", type=int, default=40)
+    ap.add_argument("--cache", help="json file caching per-chunk scores")
     vr.add_replay_args(ap)
     a = ap.parse_args(argv)
     kw = vr.replay_kwargs(a)
+    cache = {}
+    if a.cache and os.path.exists(a.cache):
+        try:
+            cache = json.load(open(a.cache))
+        except ValueError:
+            cache = {}
     while True:
         t = time.time()
-        score, parts, used = rank(a.windows_dir, a.hl_data, a.policy, kw, a.chunks)
+        cn = a.contested_chunks if a.contested_slots else 0
+        score, parts, used, contested = rank(a.windows_dir, a.hl_data, a.policy, kw, a.chunks, cn, cache)
+        if a.cache:
+            keep = {d.name for d in recent_chunks(a.windows_dir, max(a.chunks, cn))}
+            cache = {k: v for k, v in cache.items() if k in keep}
+            with open(a.cache + ".tmp", "w") as f:
+                json.dump(cache, f)
+            os.replace(a.cache + ".tmp", a.cache)
         if score:
-            write(a.out, score, used)
-        top = ", ".join(f"{u[:10]} {v}" for u, v in score.most_common(8))
+            write(a.out, score, used, contested=contested, k=a.contested_slots)
+        top = ", ".join(f"{u[:10]}" for u in order(score, contested, a.contested_slots)[:6])
         print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC {len(used)} chunks "
-              f"{dict(parts)} top: {top} ({time.time() - t:.0f} s)", flush=True)
+              f"{dict(parts)} tracking: {top} ({time.time() - t:.0f} s)", flush=True)
         if not a.every:
             return
         time.sleep(max(a.every - (time.time() - t), 30))
