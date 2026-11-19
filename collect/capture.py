@@ -34,7 +34,14 @@ Settings (environment variables):
                        OPEN_LEAD_MS before the predicted next snapshot, which then becomes the chunk's snapshot, so
                        the answers show what rested just before scoring starts
   OPEN_LEAD_MS=1500    (0 = old behaviour: asked after the chunk is planned, through the writer queue)
-  CHUNK_HIST_USERS=1   chunks: historicalOrders of the users with the most int-oid cancels (hist_orders.json)
+  CHUNK_HIST_USERS=1   chunks: historicalOrders of the users with the most int-oid cancels (hist_orders.json), asked
+                       after the chunk's blocks are fetched (minutes late: a busy user's last 2000 orders may no
+                       longer reach back to the chunk)
+  HIST_END_USERS=6     chunks: historicalOrders (~120 weight each, reserved up front so they queue under the
+                       budget instead of bursting) asked all at once as soon as the chunk's last block exists (its
+                       history then always covers the chunk), for the ranker's users (TRACKERS_FILE: contested
+                       makers first, then its cancel ranking) other than those the recorder streams live
+  TRACKERS_FILE=trackers.json  the ranker's output (analysis/rank_trackers.py)
   INFO_WEIGHT_PER_MIN=600  weight budget for all info lookups (IP limit 1200/min; collect/info.py)
   MAX_AGE_MIN=30       never request a block estimated older than this
   FRESH_MIN=20         on restart, finish a partial window only if its oldest missing block is younger
@@ -62,6 +69,8 @@ CHUNK_FILL_USERS = int(os.environ.get("CHUNK_FILL_USERS", 6))
 CHUNK_OPEN_USERS = int(os.environ.get("CHUNK_OPEN_USERS", 5))
 OPEN_LEAD_MS = int(os.environ.get("OPEN_LEAD_MS", 1500))
 CHUNK_HIST_USERS = int(os.environ.get("CHUNK_HIST_USERS", 1))
+HIST_END_USERS = int(os.environ.get("HIST_END_USERS", 6))
+TRACKERS_FILE = os.environ.get("TRACKERS_FILE", "trackers.json")
 INFO_FILES = {"userFillsByTime": "fills.json", "frontendOpenOrders": "open_orders.json",
               "historicalOrders": "hist_orders.json"}
 FRESH_MIN = float(os.environ.get("FRESH_MIN", 20))
@@ -194,13 +203,14 @@ class Writer:
         """Ask `kind` for every user at once (one thread each, weight booked as usual) and wait for the answers;
         stored like ask_info's. Returns the latest answer time (s)."""
         def one(u):
-            self.budget.take(info.weight_of(kind))
+            reserved = info.expected_weight(kind)
+            self.budget.take(reserved)
             t = time.time()
             try:
                 r = self.calls[kind](u)
             except Exception as e:
                 r = {"error": repr(e)}
-            self.budget.add(info.weight_of(kind, r) - info.weight_of(kind))
+            self.budget.add(info.weight_of(kind, r) - reserved)
             with self.lock:
                 self.info[kind].append({**(extra or {}), "user": u, "kind": kind, "args": [], "asked_at": t,
                                         "answered_at": time.time(), "answer": r})
@@ -671,6 +681,41 @@ def prefetch_open_orders(writer, last_snap, period_ms, lead_ms=None, now=time.ti
     return int(writer.ask_info_now("frontendOpenOrders", users, {"prefetch": True}) * 1000)
 
 
+def hist_end_users(n, path=None, exclude=(), now=None, max_age_s=3600):
+    """Users for the end-of-chunk historicalOrders: the ranker's contested makers, then its cancel ranking, then
+    the rest of its order; fresh file only; minus `exclude` (streamed live already)."""
+    try:
+        d = json.load(open(path or os.path.join(HOME, TRACKERS_FILE)))
+    except (OSError, ValueError):
+        return []
+    if (now if now is not None else time.time()) * 1000 - d.get("time", 0) > max_age_s * 1000:
+        return []
+    skip = {u.lower() for u in exclude}
+    out = []
+    for group in ("contested_scores", "cancel_scores", "counts"):
+        for u in d.get(group, {}):
+            if u.lower() not in skip and u not in out:
+                out.append(u)
+    return out[:n]
+
+
+def ask_hist_at_end(writer, end_height, users, headers=None, now=time.time, sleep=time.sleep, max_wait_s=20.0,
+                    settle_s=0.5):
+    """Wait until the chunk's last block exists (recorder headers), then ask historicalOrders for every user at
+    once. Returns the answer time (s) or None."""
+    if not users:
+        return None
+    headers = headers or recent_headers
+    t_end = now() + max_wait_s
+    while not any(h >= end_height for h, _ in headers()):
+        if now() > t_end:
+            log(f"block {end_height} not seen within {max_wait_s:.0f} s; asking historicalOrders anyway")
+            break
+        sleep(0.2)
+    sleep(settle_s)
+    return writer.ask_info_now("historicalOrders", users, {"at_chunk_end": True, "end_height": end_height})
+
+
 def run_chunks(fetcher, state, writer, cancellers=None):
     last_snap, last_start = 0, 0.0
     cancellers = cancellers or CancellerTally()
@@ -711,6 +756,10 @@ def run_chunks(fetcher, state, writer, cancellers=None):
             answered = None
         else:
             ask_open_orders(writer, snap)
+        if HIST_END_USERS:
+            hu = hist_end_users(HIST_END_USERS, exclude=tracked_now())
+            ask_hist_at_end(writer, end, hu)
+            meta["hist_end_users"] = len(hu)
         status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=warmup, max_anchors=CHUNK_ANCHORS,
                          extras=chunk_extras())
         cancellers.add(meta.get("int_cancel_users"))

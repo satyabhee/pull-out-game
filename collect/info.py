@@ -25,6 +25,14 @@ def post(body, timeout=30):
         return json.loads(r.read())
 
 
+EXPECTED = {"historicalOrders": 120}         # 2000 orders returned: 20 + 2000 / 20; booked BEFORE the call
+
+
+def expected_weight(kind):
+    """Weight to reserve before a call: the most it usually costs, so parallel calls queue instead of bursting."""
+    return EXPECTED.get(kind, weight_of(kind))
+
+
 def weight_of(kind, answer=None):
     w = BASE_WEIGHT.get(kind, 20)
     if kind in PER_20_ITEMS and isinstance(answer, list):

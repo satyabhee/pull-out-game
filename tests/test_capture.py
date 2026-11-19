@@ -382,3 +382,29 @@ def test_open_orders_are_prefetched_just_before_the_predicted_snapshot():
     assert slept == [pytest.approx(5.5)]                  # 995 s + 12 s - 1.5 s = 1005.5 s
     assert [u for u, _ in asked] == ["0x" + "b" * 40] and got is not None
     assert w.take_info()["frontendOpenOrders"][0]["prefetch"] is True
+
+
+def test_hist_end_users_take_contested_first_skip_live_and_stale_files(tmp_path):
+    import json as _json
+    import collect.capture as cap
+    p = tmp_path / "t.json"
+    p.write_text(_json.dumps({"time": 1_000_000, "contested_scores": {"0xc1": 2, "0xc2": 1},
+                              "cancel_scores": {"0xa1": 9, "0xc1": 5}, "counts": {"0xz": 1}}))
+    assert cap.hist_end_users(3, p, exclude=["0xC2"], now=1000.5) == ["0xc1", "0xa1", "0xz"]
+    assert cap.hist_end_users(3, p, now=1_000_000 / 1000 + 4000) == []          # older than an hour
+
+
+def test_hist_is_asked_once_the_last_block_exists():
+    import collect.capture as cap
+    clock = {"t": 0.0}
+    seen = {"h": 99}
+    def sleep(s):
+        clock["t"] += s
+        seen["h"] += 1                                    # one new block per wait
+    asked = []
+    w = cap.Writer(calls={"historicalOrders": lambda u: (asked.append((u, seen["h"])), [])[1]},
+                   budget=cap.info.Budget(per_min=10_000))
+    cap.ask_hist_at_end(w, 102, ["0xa", "0xb"], headers=lambda: [(seen["h"], 0)], now=lambda: clock["t"],
+                        sleep=sleep)
+    assert sorted(u for u, _ in asked) == ["0xa", "0xb"] and min(h for _, h in asked) >= 102
+    assert all(r["at_chunk_end"] for r in w.take_info()["historicalOrders"])
