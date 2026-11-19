@@ -403,7 +403,8 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         outside_other_txs=False, other_position="end", placeholder_ttl_ms=None,
         placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False,
         trade_learn=None, oid_guard=None, refill_position="front", oid_facts=False,
-        name_prewindow=False, named_anon="front", deep_book=False):
+        name_prewindow=False, named_anon="front", deep_book=False,
+        learn_keep_known=False):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
@@ -414,7 +415,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 other_position=other_position, placeholder_ttl_ms=placeholder_ttl_ms,
                 placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap,
                 reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, oid_guard=oid_guard, refill_position=refill_position, oid_facts=oid_facts,
-                name_prewindow=name_prewindow and oid_facts, named_anon=named_anon, deep_book=deep_book, engine=engine if engine is not None else Engine(stp=stp))
+                name_prewindow=name_prewindow and oid_facts, named_anon=named_anon, deep_book=deep_book, learn_keep_known=learn_keep_known, engine=engine if engine is not None else Engine(stp=stp))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -775,6 +776,8 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     ap.add_argument("--deep-book", action="store_true",
                     help="liquidity past the full snapshot's 20 levels from the coarse book (book_*_sf4), split over "
                          "prices by what was observable, used only by orders whose limit reaches past the last level")
+    ap.add_argument("--learn-keep-known", action="store_true",
+                    help="trade_learn's sweep and queue rules remove placeholders only, never an order we saw placed")
     ap.add_argument("--named-anon", choices=("front", "back"), default="front",
                     help="where the anonymous rest of a level with named pre-window orders queues (default front)")
     ap.add_argument("--wildcard-pre-reseed-known", action="store_true",
@@ -797,7 +800,7 @@ def replay_kwargs(a) -> dict:
                 oid_guard=a.oid_guard, refill_position=a.refill_position,
                 oid_facts=not a.no_resolver and not a.no_oid_facts,
                 name_prewindow=a.name_prewindow, named_anon=a.named_anon,
-                deep_book=a.deep_book)
+                deep_book=a.deep_book, learn_keep_known=a.learn_keep_known)
 
 
 def options_tag(a) -> str:
@@ -822,7 +825,8 @@ def options_tag(a) -> str:
                     "-nofacts" if a.no_oid_facts else "",
                     "-name" if a.name_prewindow and not a.no_oid_facts else "",
                     "-anonback" if a.named_anon == "back" else "",
-                    "-deep" if a.deep_book else ""])
+                    "-deep" if a.deep_book else "",
+                    "-learnkeep" if a.learn_keep_known else ""])
 
 
 def main(argv=None):

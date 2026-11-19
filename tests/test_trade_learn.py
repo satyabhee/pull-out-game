@@ -170,3 +170,11 @@ def test_cli_refill_default_is_back_and_front_is_reported(tmp_path):
     vr.main([str(window), "--hl-data", str(hl), "--reseed", "--keep-known", "--refill-position", "front",
              "--out", str(tmp_path / "f")])
     assert "refill_position" not in (tmp_path / "f" / "summary.csv").read_text()
+
+
+def test_learn_keep_known_leaves_orders_we_saw_placed(tmp_path):
+    window, hl = sweep_window(tmp_path)
+    r = Replay(window, hl, listing, trade_learn="sweep", learn_keep_known=True)
+    list(r)
+    assert level(r, Side.SELL, "60005") == [(B, lots("0.002"))]       # kept: it may still rest on chain
+    assert r.learn_stats["swept_kept_known:BTC"] == 1 and r.learn_stats["swept_known_lots:BTC"] == 0

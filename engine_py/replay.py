@@ -161,7 +161,7 @@ class Replay:
                  placeholder_cap: str | None = None, reseed_keep_known: bool = False,
                  trade_learn: str | None = None, oid_guard: str | None = None, refill_position: str = "front",
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
-                 deep_book: bool = False, deep_lookback_ms: int = 600_000):
+                 deep_book: bool = False, deep_lookback_ms: int = 600_000, learn_keep_known: bool = False):
         """anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
@@ -241,6 +241,8 @@ class Replay:
         (a non-ALO buy above the last ask / sell below the last bid), as placeholders behind any known order at
         each price; what that order leaves is taken out again right after it. Nothing else ever sees it.
         `deep_stats` counts.
+        learn_keep_known=True: trade_learn's sweep and queue rules remove placeholders only, never a known order
+        (one we saw placed): such an order may still rest on chain (its owner's later cancel names it).
         oid_guard (int-oid resolver preset; None/"ghost" = data/oids defaults): "ratio25" / "ratio50"
         (ratio guard, ghost off), "cap3000" (max_tol 3000, ghost off), "none" (old rule: ghost and
         joint layers off).
@@ -293,6 +295,7 @@ class Replay:
         self.trade_learn = trade_learn
         self._rules = self.parse_trade_learn(trade_learn)
         self._name_clip = "name-clip" in self._rules
+        self.learn_keep_known = learn_keep_known
         if oid_guard not in OID_GUARDS:
             raise ValueError(f"unknown oid_guard {oid_guard!r}")
         self.oid_guard = oid_guard
@@ -703,6 +706,9 @@ class Replay:
             for nd in nodes[:cut]:
                 if nd.order.user in makers:
                     continue                       # a filled maker's own older order: leave it
+                if self.learn_keep_known and nd.order.user != PLACEHOLDER:
+                    self.learn_stats[f"queue_kept_known:{coin}"] += 1
+                    continue
                 kind = "placeholder" if nd.order.user == PLACEHOLDER else "known"
                 self.learn_stats[f"queue_{kind}_orders:{coin}"] += 1
                 self.learn_stats[f"queue_{kind}_lots:{coin}"] += nd.remaining
@@ -725,6 +731,9 @@ class Replay:
                 better = [px for px in levels.keys() if (px > w if side is Side.BUY else px < w)]
                 for px in better:
                     for nd in list(levels[px]):
+                        if self.learn_keep_known and nd.order.user != PLACEHOLDER:
+                            self.learn_stats[f"swept_kept_known:{coin}"] += 1
+                            continue
                         kind = "placeholder" if nd.order.user == PLACEHOLDER else "known"
                         self.learn_stats[f"swept_{kind}_orders:{coin}"] += 1
                         self.learn_stats[f"swept_{kind}_lots:{coin}"] += nd.remaining
