@@ -38,3 +38,6 @@ report/validate/
 
 # prompts handed to other Claude sessions
 handoff/
+
+# local Claude skills (copied from K-Dense scientific-agent-skills, adapted)
+.claude/skills/
