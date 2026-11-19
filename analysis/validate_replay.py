@@ -97,7 +97,27 @@ def priority_policy(actions):
                                           a.tx_index, a.item_index))
 
 
-POLICIES = {"listing": listing, "class": class_policy, "priority": priority_policy}
+def anti_policy(actions):
+    """Identification control (deliberately wrong): class_policy reversed, GTC/IOC takers before cancels before
+    the rest; proposer order inside a class."""
+    cls = _tx_classes(actions)
+    return sorted(actions, key=lambda a: (-cls[a.tx_index], a.tx_index, a.item_index))
+
+
+def shuffle_policy(actions):
+    """Identification control: txs in a random order (seeded by block height, so runs repeat), items kept in
+    order inside a tx."""
+    import random
+    if not actions:
+        return []
+    txs = sorted({a.tx_index for a in actions})
+    random.Random(actions[0].block).shuffle(txs)
+    rank = {t: i for i, t in enumerate(txs)}
+    return sorted(actions, key=lambda a: (rank[a.tx_index], a.item_index))
+
+
+POLICIES = {"listing": listing, "class": class_policy, "priority": priority_policy, "anti": anti_policy,
+            "shuffle": shuffle_policy}
 
 # CLI default (validate_replay / validate_chunks): correct the book from each applied tx's real trades
 # (engine_py/replay.Replay trade_learn; measured in handoff/integrate_result.md). run() and Replay stay off.

@@ -91,6 +91,13 @@ def test_class_policy_runs_alo_then_cancels_then_takers_in_listing_order():
     assert sorted(map(id, out)) == sorted(map(id, a)) and [x.tx_index for x in a] == [0, 1, 2, 3, 4]   # pure
 
 
+def test_identification_controls_anti_reverses_classes_and_shuffle_is_repeatable():
+    a = [act("ioc", 0), act("cancel", 1), act("alo", 2, tif=Tif.ALO), act("cancel", 3), act("gtc", 4, tif=Tif.GTC)]
+    assert [x.tx_index for x in vr.anti_policy(a)] == [0, 4, 1, 3, 2]
+    s1, s2 = vr.shuffle_policy(a), vr.shuffle_policy(a)
+    assert [x.tx_index for x in s1] == [x.tx_index for x in s2] and sorted(x.tx_index for x in s1) == [0, 1, 2, 3, 4]
+
+
 def test_a_tx_with_any_gtc_or_ioc_item_is_a_taker_tx():
     a = [act("alo", 0, item=0, tif=Tif.ALO), act("ioc", 0, item=1), act("cancel", 1)]
     assert [(x.tx_index, x.item_index) for x in vr.class_policy(a)] == [(1, 0), (0, 0), (0, 1)]
