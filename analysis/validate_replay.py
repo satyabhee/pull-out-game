@@ -172,6 +172,48 @@ def load_alo_status(hl_data, heights: range | None = None, t0_ms: int | None = N
     return out
 
 
+def stream_order_truth(rp, hl_data) -> dict[tuple[int, str, int], dict]:
+    """Truth for placements of users the recorder tracked (orderUpdates: user_orders.jsonl), in load_alo_status's
+    form. Each Place / Modify of the window joins its order's statuses by (user, asset, cloid), else by (user,
+    asset, side, px, original size) with the order timestamp within 1 s of the block. badAloPxRejected ->
+    rejected_alo; any other *Rejected -> rejected_other; open / filled / canceled / ... -> accepted.
+    MEASUREMENT ONLY: it feeds the wrong-ALO flags and the confusion table, never the engine."""
+    from data import oid_facts
+    facts = oid_facts.load(rp.window_dir, hl_data)
+    by_oid: dict[int, list] = defaultdict(list)
+    for o in facts.orders:
+        if o["source"] == "ws" and o["status"]:
+            by_oid[o["oid"]].append(o)
+    if not by_oid:
+        return {}
+    by_cloid, by_shape = {}, defaultdict(list)
+    for oid, recs in by_oid.items():
+        o = recs[0]
+        sts = [r["status"] for r in recs]
+        rej = next((x for x in sts if x.endswith("Rejected")), None)
+        truth = ("rejected_alo" if rej == "badAloPxRejected" else "rejected_other") if rej else "accepted"
+        v = {"truth": truth, "status": rej or sts[0], "source": "user_orders"}
+        spec = ASSETS[o["asset"]]
+        if o["cloid"]:
+            by_cloid[(o["user"], o["asset"], o["cloid"])] = v
+        by_shape[(o["user"], o["asset"], o["buy"], spec.px_to_ticks(o["px"]), spec.sz_to_lots(o["sz"]))].append(
+            (o["timestamp"], v))
+    out = {}
+    for b in rp.blocks:
+        for a in b.actions:
+            if not isinstance(a, (Place, Modify)):
+                continue
+            p = a.new if isinstance(a, Modify) else a
+            v = by_cloid.get((a.user, p.asset, p.cloid)) if p.cloid else None
+            if v is None:
+                cands = [x for t, x in by_shape.get((a.user, p.asset, p.side is Side.BUY, p.px, p.sz), ())
+                         if abs(t - b.time_ms) <= 1000]
+                v = cands[0] if len(cands) == 1 else None
+            if v is not None:
+                out[(a.block, a.hash, a.item_index)] = v
+    return out
+
+
 # ------------------------------------------------------------------ per-tx record + rules
 
 @dataclass
@@ -442,6 +484,9 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         if tr.hash != ZERO_HASH:
             real_by_hash[tr.hash].append(tr)
     alo_truth = load_alo_status(hl_data, heights, rp.t0, rp.t1)
+    if oid_facts:
+        for k, v in stream_order_truth(rp, hl_data).items():
+            alo_truth.setdefault(k, v)                  # a probe answer (orderStatus) wins over the stream
     obs = (observer_cls or ValidateObserver)(real_by_hash, alo_truth)
     obs.wildcard_pre_reseed_known = wildcard_pre_reseed_known
     rp.observer = obs

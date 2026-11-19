@@ -197,3 +197,21 @@ def test_a_price_inside_the_snapshot_range_it_does_not_show_is_a_conflict(tmp_pa
                                                            "answer": [oo(3, px="59995.0")]}]))
     r = Replay(window, hl, listing, oid_facts=True, name_prewindow=True)
     assert r.named == {} and r.name_stats["named_conflict"] == 1
+
+
+def test_stream_order_truth_joins_tracked_statuses_by_cloid_and_by_shape(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 50, [], [("60100", "0.001")])
+    h = w.block([place_tx(A, "0xa1", 0, order(px="60000", cloid="0x01"), order(px="59990"))], dt_ms=0)
+    window, hl = w.write()
+    ts = w.time_of(h)
+    hour = next(p for p in hl.glob("*/*") if p.is_dir())
+    o = lambda px, oid, c=None: {"coin": "BTC", "side": "B", "limitPx": px, "sz": "0.001", "origSz": "0.001",
+                                  "oid": oid, "timestamp": ts, "cloid": c}
+    rows = [{"recv_ms": ts, "msg": {"user": A, "data": [
+        {"order": o("60000.0", 1, "0x01"), "status": "badAloPxRejected", "statusTimestamp": ts},
+        {"order": o("59990.0", 2), "status": "open", "statusTimestamp": ts}]}}]
+    (hour / "user_orders.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows))
+    r = Replay(window, hl, listing, oid_facts=True)
+    t = vr.stream_order_truth(r, hl)
+    assert {k[2]: v["truth"] for k, v in t.items()} == {0: "rejected_alo", 1: "accepted"}
