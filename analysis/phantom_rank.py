@@ -31,6 +31,36 @@ from engine_py.replay import COINS, iter_bbo
 from engine_py.types import Side
 
 
+STATE_CAP = 200_000
+
+
+def exact_removal(sizes: list[int], k: int, d: int):
+    """A set of exactly k indices whose sizes sum to exactly d, preferring the oldest (lowest indices: smallest index
+    sum). Returns (indices, ways) with ways = number of distinct index sets found (capped at 2), or (None, 0) when
+    none exists, or (None, -1) when the search is too big."""
+    dp = [dict() for _ in range(k + 1)]          # count -> {sum: (index_sum, ways, mask)}
+    dp[0][0] = (0, 1, 0)
+    for i, sz in enumerate(sizes):
+        for c in range(min(i, k - 1), -1, -1):
+            for tot, (score, ways, mask) in list(dp[c].items()):
+                t2 = tot + sz
+                if t2 > d:
+                    continue
+                cand = (score + i, ways, mask | (1 << i))
+                cur = dp[c + 1].get(t2)
+                if cur is None:
+                    dp[c + 1][t2] = cand
+                else:
+                    w = min(2, cur[1] + ways)
+                    dp[c + 1][t2] = (cand[0], w, cand[2]) if cand[0] < cur[0] else (cur[0], w, cur[2])
+            if len(dp[c + 1]) > STATE_CAP:
+                return None, -1
+    hit = dp[k].get(d)
+    if hit is None:
+        return None, 0
+    return [i for i in range(len(sizes)) if hit[2] >> i & 1], hit[1]
+
+
 class _Obs(vr.ValidateObserver):
     last = None
 
@@ -123,6 +153,17 @@ class _Obs(vr.ValidateObserver):
                 self.out["max_orders_one_user"] += users.most_common(1)[0][1]
                 self.out["distinct_users"] += len(users)
                 self.out["chain_n"] += lv[2]
+                idx, ways = exact_removal([nd.remaining for nd in nodes], kx, sum(nd.remaining for nd in nodes) - lv[1])
+                self.out["exact:levels"] += 1
+                self.out["exact:" + ("too_big" if ways < 0 else "none" if ways == 0 else "unique" if ways == 1
+                                     else "several")] += 1
+                if idx is not None:
+                    for name, picks in (("exact", [nodes[i] for i in idx]), ("oldest_same_levels", nodes[:kx])):
+                        for nd in picks:
+                            t = truth(nd)
+                            if t is not None:
+                                self.out[f"{name}:picked_with_truth"] += 1
+                                self.out[f"{name}:picked_phantom"] += t == "phantom"
                 for nd in nodes:
                     t = truth(nd)
                     if t is not None:
@@ -166,7 +207,11 @@ def main(argv=None):
           f"(near the cancel's oid: {t['flagged_near'] / L:.1f})")
     print(f"orders there with ground truth: {t['truth_orders']}; phantom base rate "
           f"{t['truth_phantom'] / max(t['truth_orders'], 1):.3f}")
-    for name in ("oldest", "newest", "evidence", "evidence_then_oldest", "near_then_oldest"):
+    L2 = max(t["exact:levels"], 1)
+    print(f"exact-sum search on {t['exact:levels']} over-full levels: unique {t['exact:unique'] / L2:.3f}, several "
+          f"{t['exact:several'] / L2:.3f}, none {t['exact:none'] / L2:.3f}, too big {t['exact:too_big'] / L2:.3f}")
+    for name in ("oldest", "newest", "evidence", "evidence_then_oldest", "near_then_oldest", "exact",
+                 "oldest_same_levels"):
         n = t[f"{name}:picked_with_truth"]
         print(f"  {name:9} victims with truth {n:5d}; phantom precision {t[f'{name}:picked_phantom'] / max(n, 1):.3f}")
 

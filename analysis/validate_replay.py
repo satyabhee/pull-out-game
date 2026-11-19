@@ -121,7 +121,7 @@ POLICIES = {"listing": listing, "class": class_policy, "priority": priority_poli
 
 # CLI default (validate_replay / validate_chunks): correct the book from each applied tx's real trades
 # (engine_py/replay.Replay trade_learn; measured in handoff/integrate_result.md). run() and Replay stay off.
-DEFAULT_TRADE_LEARN = "sweep,queue,name-clip"
+DEFAULT_TRADE_LEARN = "sweep,queue"   # name-clip dropped Nov 19: 74 chunks, 17 txs better, 0 worse (+2.8 pts per-tx, all txs)
 # CLI default for keep-known refills: missing snapshot size behind known orders (chunks: recall_full 23.0% -> 26.8%)
 DEFAULT_REFILL_POSITION = "back"
 

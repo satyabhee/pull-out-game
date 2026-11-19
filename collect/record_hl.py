@@ -27,7 +27,7 @@ Fetch complete blocks later with fetch_blocks.py for the time windows you need.
 Files roll over every hour into hl_data/YYYY-MM-DD/HH/ and are gzipped when closed.
 Usage:  python3 record_hl.py BTC ETH      (Mac: caffeinate -i python3 record_hl.py BTC ETH)
 """
-import asyncio, gzip, json, os, shutil, sys, time
+import asyncio, gzip, json, os, random, shutil, sys, time
 
 COINS = sys.argv[1:] or ["BTC"]
 L2_SIGFIGS = os.environ.get("L2_SIGFIGS", "4")
@@ -36,6 +36,10 @@ TRACK_EVERY_S = float(os.environ.get("TRACK_EVERY_S", 1800))
 TRACK_WARMUP_S = float(os.environ.get("TRACK_WARMUP_S", 600))
 TRACK_BY = os.environ.get("TRACK_BY", "cancels")          # cancels (capture's cancellers.json) | makers
 CANCELLERS_FILE = os.environ.get("CANCELLERS_FILE", "cancellers.json")
+# Randomized tracking (an experiment): at each re-pick a seeded coin flip picks the arm; "contested" = the file's
+# "counts" order (the ranker's contested makers first), "cancels" = its "cancel_scores" order. Logged per pick.
+TRACK_ARMS = [a for a in os.environ.get("TRACK_ARMS", "").split(",") if a]
+LAST_ARM = {"arm": None}
 TRACK_USER_LIST = [u.strip().lower() for u in os.environ.get("TRACK_USER_LIST", "").split(",") if u.strip()]
 ROOT = "hl_data"
 API_WS = "wss://api.hyperliquid.xyz/ws"
@@ -153,8 +157,14 @@ def pick_users(tally, n, by=None, path=None, now=None, max_age_s=3600):
     if by == "cancels":
         try:
             d = json.load(open(path or CANCELLERS_FILE))
-            if (now if now is not None else time.time()) * 1000 - d["time"] <= max_age_s * 1000:
-                top = [u for u, _ in sorted(d["counts"].items(), key=lambda x: (-x[1], x[0]))][:n]
+            t = now if now is not None else time.time()
+            if t * 1000 - d["time"] <= max_age_s * 1000:
+                key = "counts"
+                if TRACK_ARMS:
+                    arm = random.Random(int(t // 60)).choice(TRACK_ARMS)
+                    LAST_ARM["arm"] = arm
+                    key = "cancel_scores" if arm == "cancels" and d.get("cancel_scores") else "counts"
+                top = [u for u, _ in sorted(d[key].items(), key=lambda x: (-x[1], x[0]))][:n]
                 if top:
                     return top
         except Exception:
@@ -184,7 +194,10 @@ async def track_users(tally, orders, fills, tracked, other, n=None, every_s=None
         for u in users:
             if u not in tasks:
                 tasks[u] = start(u)
-        tracked.write({"time": int(time.time() * 1000), "users": sorted(tasks)})
+        rec = {"time": int(time.time() * 1000), "users": sorted(tasks)}
+        if LAST_ARM["arm"] is not None:
+            rec["arm"] = LAST_ARM["arm"]
+        tracked.write(rec)
         await sleep(every_s)
         users = picker(n) or users
 

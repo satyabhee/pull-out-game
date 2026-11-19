@@ -117,6 +117,8 @@ def classify(obs, rp, rec, queue):
         y = next((m for m in rm if m not in em), None)
         x = next((e for e in em if e != PLACEHOLDER and e not in rm), None)
         if y is None:
+            if x is not None:
+                obs.detail = (x, px)
             return "F3 order" if x is None else "F1 X ahead, other"
         if y not in users:
             if obs.first_quote.get((y, rec.asset, side, px), rec.seq) < rec.seq:
@@ -144,6 +146,7 @@ def classify(obs, rp, rec, queue):
                 return "F1 stale (cancel)"
             if xs > ys > 0:
                 return "F3 order"
+            obs.detail = (x, px)
             return "F1 X ahead, other"
         return "F3 order"
     return "match"
@@ -163,7 +166,13 @@ def one(job):
         return o
     res, rows = vr.run(window, hl_data, policy, quiet=True, observer_cls=factory, **kw)
     obs = _Obs.last
-    out = {"modes": Counter(), "modes_w": Counter(), "touch": Counter(), "n": 0}
+    out = {"modes": Counter(), "modes_w": Counter(), "touch": Counter(), "n": 0, "cascade": Counter(),
+           "cascade_w": Counter()}
+    real_trades, maker_trades = defaultdict(list), defaultdict(list)
+    for tr in iter_trades(hl_data, COINS, t0 - 120_000, t1):
+        if tr.hash != ZERO_HASH:
+            real_trades[tr.hash].append(tr)
+        maker_trades[(tr.maker, tr.asset, tr.taker_side.opposite, tr.px)].append(tr)
     byhash = {r["hash"]: r for r in rows}
     bbo = {}
     for coin in COINS:
@@ -181,7 +190,19 @@ def one(job):
             continue
         miss = 1 - r["matched_notional"] / r["real_notional"]
         out["n"] += 1
+        obs.detail = None
         mode = classify(obs, obs._rpref, rec, obs.snap.get(h, {})) if h in obs.snap else "no snapshot"
+        if mode == "F1 X ahead, other" and obs.detail is not None:
+            x, xpx = obs.detail
+            bt = obs._btime.get(rec.block)
+            first_tid = min((t.tid for t in real_trades.get(h, [])), default=None)
+            hits = [t for t in maker_trades.get((x, rec.asset, rec.side.opposite, xpx), ())
+                    if bt - 60_000 <= t.time_ms <= bt and t.hash != h]
+            same = [t for t in hits if t.time_ms == bt and (first_tid is None or t.tid < first_tid)]
+            where = ("same block, earlier tx" if same else
+                     "earlier block" if any(t.time_ms < bt for t in hits) else "no real fill of X there")
+            out["cascade"][where] += 1
+            out["cascade_w"][where] += miss
         out["modes"][mode] += 1
         out["modes_w"][mode] += miss
         side = rec.side.opposite
@@ -218,9 +239,10 @@ def main(argv=None):
     jobs = [(str(w), a.hl_data, a.policy, kw) for w in windows_of(a.windows)]
     with Pool(a.jobs) as pool:
         outs = pool.map(one, jobs)
-    tot = {"modes": Counter(), "modes_w": Counter(), "touch": Counter(), "n": 0}
+    tot = {"modes": Counter(), "modes_w": Counter(), "touch": Counter(), "n": 0, "cascade": Counter(),
+           "cascade_w": Counter()}
     for o in outs:
-        for k in ("modes", "modes_w", "touch"):
+        for k in ("modes", "modes_w", "touch", "cascade", "cascade_w"):
             tot[k].update(o[k])
         tot["n"] += o["n"]
     W = sum(tot["modes_w"].values())
@@ -228,6 +250,11 @@ def main(argv=None):
     print(f"  {'first divergence':34} {'txs':>4} {'share of miss':>13}")
     for mode in sorted(tot["modes"], key=lambda m: -tot["modes_w"][m]):
         print(f"  {mode:34} {tot['modes'][mode]:4d} {tot['modes_w'][mode] / max(W, 1e-9):13.3f}")
+    if tot["cascade"]:
+        cw = sum(tot["cascade_w"].values())
+        print("\n'F1 X ahead, other': where the chain had consumed X's order at that price before this tx (60 s back):")
+        for k, n in tot["cascade"].most_common():
+            print(f"  {k:28} {n:4d} txs  {tot['cascade_w'][k] / max(cw, 1e-9):.3f} of that miss")
     t = tot["touch"]
     if t["blocks"]:
         pm = max(t["px_match"], 1)

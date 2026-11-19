@@ -110,3 +110,16 @@ def test_pick_users_prefers_fresh_cancellers_and_falls_back_to_makers(tmp_path):
     assert record_hl.pick_users(t, 2, by="cancels", path=tmp_path / "none.json") == []
     t.feed([{"side": "B", "px": "1", "sz": "1", "users": ["0xt", "0xmaker"]}])
     assert record_hl.pick_users(t, 2, by="makers", path=p, now=1000) == ["0xmaker"]
+
+
+def test_randomized_tracking_picks_an_arm_and_its_list(tmp_path, monkeypatch):
+    import json as _json
+    import record_hl as rh
+    p = tmp_path / "t.json"
+    p.write_text(_json.dumps({"time": 0, "counts": {"0xm": 3, "0xc": 2}, "cancel_scores": {"0xc": 9, "0xz": 1}}))
+    monkeypatch.setattr(rh, "TRACK_ARMS", ["contested", "cancels"])
+    seen = {}
+    for minute in range(40):
+        users = rh.pick_users(rh.MakerTally(), 1, by="cancels", path=p, now=minute * 60)
+        seen[rh.LAST_ARM["arm"]] = users
+    assert seen == {"contested": ["0xm"], "cancels": ["0xc"]}

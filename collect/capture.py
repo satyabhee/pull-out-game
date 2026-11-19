@@ -48,7 +48,7 @@ Settings (environment variables):
   ONCE=1               capture one window/chunk and exit (for testing)
 Needs the hl-recorder service: block headers and book snapshots come from its files.
 """
-import collections, datetime, glob, gzip, json, os, queue, shutil, sys, threading, time, urllib.request
+import collections, datetime, glob, gzip, json, os, queue, random, shutil, sys, threading, time, urllib.request
 from fetch_blocks import DEFAULT_INTERVAL, ArchivedCap, Fetcher, NotYet, TooOld, last_line, recorder_head, save
 import info
 
@@ -71,6 +71,7 @@ OPEN_LEAD_MS = int(os.environ.get("OPEN_LEAD_MS", 1500))
 CHUNK_HIST_USERS = int(os.environ.get("CHUNK_HIST_USERS", 1))
 HIST_END_USERS = int(os.environ.get("HIST_END_USERS", 6))
 TRACKERS_FILE = os.environ.get("TRACKERS_FILE", "trackers.json")
+HIST_END_RANDOM = os.environ.get("HIST_END_RANDOM") == "1"   # experiment: per-chunk coin flip (seeded by the snapshot)
 INFO_FILES = {"userFillsByTime": "fills.json", "frontendOpenOrders": "open_orders.json",
               "historicalOrders": "hist_orders.json"}
 FRESH_MIN = float(os.environ.get("FRESH_MIN", 20))
@@ -756,7 +757,10 @@ def run_chunks(fetcher, state, writer, cancellers=None):
             answered = None
         else:
             ask_open_orders(writer, snap)
-        if HIST_END_USERS:
+        hist_on = HIST_END_USERS and (not HIST_END_RANDOM or random.Random(snap).random() < 0.5)
+        if HIST_END_RANDOM:
+            meta["arm_hist_end"] = bool(hist_on)
+        if hist_on:
             hu = hist_end_users(HIST_END_USERS, exclude=tracked_now())
             ask_hist_at_end(writer, end, hu)
             meta["hist_end_users"] = len(hu)
