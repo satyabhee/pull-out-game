@@ -618,7 +618,7 @@ def tracked_now():
     if not os.path.exists(p):
         return []
     rows = tail_lines(p, 16384)
-    return rows[-1]["msg"]["users"] if rows else []
+    return (rows[-1]["msg"]["users"] + rows[-1]["msg"].get("shared", [])) if rows else []
 
 
 class CancellerTally:

@@ -123,3 +123,37 @@ def test_randomized_tracking_picks_an_arm_and_its_list(tmp_path, monkeypatch):
         users = rh.pick_users(rh.MakerTally(), 1, by="cancels", path=p, now=minute * 60)
         seen[rh.LAST_ARM["arm"]] = users
     assert seen == {"contested": ["0xm"], "cancels": ["0xc"]}
+
+
+def test_users_past_the_dedicated_ones_share_one_connection(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(record_hl, "TRACK_DEDICATED", 2)
+
+    class Task:
+        def __init__(self, u):
+            self.u, self.cancelled = u, False
+
+        def cancel(self):
+            self.cancelled = True
+
+    started, shared, tracked = [], [], FakeSink()
+    rounds = []
+
+    async def sleep(s):
+        rounds.append(s)
+        if len(rounds) >= 1:
+            raise asyncio.CancelledError
+    try:
+        asyncio.run(record_hl.track_users(record_hl.MakerTally(), FakeSink(), FakeSink(), tracked, FakeSink(), n=4,
+                                          initial=["0xa", "0xb", "0xc", "0xd"], start=lambda u: started.append(u) or Task(u),
+                                          start_shared=lambda us: shared.append(us) or Task(us), sleep=sleep))
+    except asyncio.CancelledError:
+        pass
+    assert started == ["0xa", "0xb"] and shared == [("0xc", "0xd")]
+    assert tracked.got[-1]["users"] == ["0xa", "0xb"] and tracked.got[-1]["shared"] == ["0xc", "0xd"]
+    orders, fills = FakeSink(), FakeSink()
+    record_hl.route_shared({"channel": "orderUpdates", "data": [{"order": {}}]}, ("0xc", "0xd"), orders, fills, FakeSink())
+    record_hl.route_shared({"channel": "userFills", "data": {"user": "0xd", "fills": []}}, ("0xc", "0xd"), orders, fills,
+                           FakeSink())
+    assert orders.got[0]["user"] == "" and orders.got[0]["shared"] == ["0xc", "0xd"]
+    assert fills.got[0]["user"] == "0xd"

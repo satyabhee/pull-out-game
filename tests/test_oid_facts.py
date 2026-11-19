@@ -228,3 +228,22 @@ def test_fact_sources_can_be_left_out_for_ablations(tmp_path):
     r = Replay(window, hl, listing, oid_facts=True, facts_exclude=("hist",))
     list(r)
     assert r.resolver.stats.get("resolved_exact", 0) == 0          # the only fact was left out
+
+
+def test_shared_connection_updates_are_attributed_by_their_placement(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 50, [], [])
+    h = w.block([place_tx(A, "0xa1", 0, order(px="60000", cloid="0x0a")),
+                 place_tx(B, "0xb1", 0, order(px="59990"))], dt_ms=0)
+    window, hl = w.write()
+    ts = w.time_of(h)
+    hour = next(p for p in hl.glob("*/*") if p.is_dir())
+    o = lambda px, oid, c=None: {"coin": "BTC", "side": "B", "limitPx": px, "sz": "0.001", "origSz": "0.001",
+                                  "oid": oid, "timestamp": ts, "cloid": c}
+    rows = [{"recv_ms": ts, "msg": {"user": "", "shared": [A, B], "data": [
+        {"order": o("60000.0", 1, "0x0a"), "status": "open", "statusTimestamp": ts},     # by cloid -> A
+        {"order": o("59990.0", 2), "status": "open", "statusTimestamp": ts},             # by shape -> B
+        {"order": o("12345.0", 3), "status": "open", "statusTimestamp": ts}]}}]          # no placement: dropped
+    (hour / "user_orders.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows))
+    f = oid_facts.load(window, hl)
+    assert sorted((x["oid"], x["user"]) for x in f.orders) == [(1, A.lower()), (2, B.lower())]

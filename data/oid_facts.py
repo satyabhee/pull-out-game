@@ -66,6 +66,50 @@ def _fill(f: dict, user: str, source: str) -> dict | None:
         return None
 
 
+def _placements(window_dir: Path) -> tuple[dict, dict]:
+    """Every BTC/ETH limit placement (order / modify / batchModify items) of the window's blocks:
+    (coin, cloid) -> {users}, (coin, side, px, sz, block time) -> {users}; prices and sizes as Decimal."""
+    from decimal import Decimal
+    by_cloid, by_shape = {}, {}
+    for _, path in _block_files(window_dir):
+        b = read_block(path)
+        t = b["blockTime"]
+        for tx in b.get("txs", []):
+            if tx.get("error"):
+                continue
+            a, u = tx.get("action", {}), tx.get("user", "").lower()
+            k = a.get("type")
+            items = (a.get("orders", []) if k == "order" else [a.get("order", {})] if k == "modify"
+                     else [x.get("order", {}) for x in a.get("modifies", [])] if k == "batchModify" else [])
+            for o in items:
+                coin = {0: "BTC", 1: "ETH"}.get(o.get("a"))
+                if coin is None or "limit" not in o.get("t", {}):
+                    continue
+                by_shape.setdefault((coin, "B" if o.get("b") else "A", Decimal(o["p"]), Decimal(o["s"]), t),
+                                    set()).add(u)
+                if o.get("c"):
+                    by_cloid.setdefault((coin, o["c"]), set()).add(u)
+    return by_cloid, by_shape
+
+
+def attribute(o: dict, candidates, index) -> str | None:
+    """The one user among `candidates` (lower-case) whose placement this order update is, or None."""
+    from decimal import Decimal
+    by_cloid, by_shape = index
+    cands = set(candidates)
+    us = set()
+    if o.get("cloid"):
+        us = by_cloid.get((o.get("coin"), o["cloid"]), set()) & cands
+    if not us:
+        try:
+            key = (o.get("coin"), o.get("side"), Decimal(str(o["limitPx"])), Decimal(str(o.get("origSz", o.get("sz")))),
+                   int(o["timestamp"]))
+        except (KeyError, ValueError, ArithmeticError):
+            return None
+        us = by_shape.get(key, set()) & cands
+    return next(iter(us)) if len(us) == 1 else None
+
+
 def _window_range(window_dir: Path):
     files = _block_files(window_dir)
     if not files:
@@ -106,6 +150,7 @@ def load(window_dir, hl_data=None, recorder_margin_ms: int = 60_000, exclude=())
                         o["status_ts"] = int(a * 1000) if isinstance(a, (int, float)) else None
                     if o:
                         facts.orders.append(o)
+    index = None
     if hl_data is not None:
         t0, t1 = _window_range(window_dir)
         if t0 is not None:
@@ -114,8 +159,13 @@ def load(window_dir, hl_data=None, recorder_margin_ms: int = 60_000, exclude=())
                 for r in _records(path, lo, hi):
                     m = r.get("msg") or {}
                     for x in m.get("data") or []:
-                        o = _order((x or {}).get("order", {}), m.get("user", ""), "ws", (x or {}).get("status"),
-                                   (x or {}).get("statusTimestamp"))
+                        raw, user = (x or {}).get("order", {}), m.get("user", "")
+                        if not user and m.get("shared"):          # shared connection: attribute by placement
+                            index = index if index is not None else _placements(window_dir)
+                            user = attribute(raw, [u.lower() for u in m["shared"]], index) or ""
+                            if not user:
+                                continue
+                        o = _order(raw, user, "ws", (x or {}).get("status"), (x or {}).get("statusTimestamp"))
                         if o:
                             facts.orders.append(o)
             for path in ([] if "ws_fills" in exclude else _hour_files(Path(hl_data), "user_fills", lo, hi)):

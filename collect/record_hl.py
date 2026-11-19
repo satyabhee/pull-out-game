@@ -32,6 +32,10 @@ import asyncio, gzip, json, os, random, shutil, sys, time
 COINS = sys.argv[1:] or ["BTC"]
 L2_SIGFIGS = os.environ.get("L2_SIGFIGS", "4")
 TRACK_USERS = int(os.environ.get("TRACK_USERS", 6))
+# users past the first TRACK_DEDICATED share ONE extra connection (the ws limit is 10 connections and 10 unique
+# users per IP); orderUpdates carry no user, so those are written with user "" and the candidate list ("shared"),
+# and data/oid_facts attributes them by joining to the window's placements
+TRACK_DEDICATED = int(os.environ.get("TRACK_DEDICATED", 6))
 TRACK_EVERY_S = float(os.environ.get("TRACK_EVERY_S", 1800))
 TRACK_WARMUP_S = float(os.environ.get("TRACK_WARMUP_S", 600))
 TRACK_BY = os.environ.get("TRACK_BY", "cancels")          # cancels (capture's cancellers.json) | makers
@@ -131,6 +135,19 @@ def route_user(m, user, orders, fills, other):
         other.write({"user": user, "msg": m})
 
 
+def route_shared(m, users, orders, fills, other):
+    """One message of the shared connection: orderUpdates without a user (candidates listed), userFills with theirs."""
+    if not isinstance(m, dict) or m.get("channel") in ("subscriptionResponse", "pong"):
+        return
+    ch, d = m.get("channel"), m.get("data")
+    if ch == "orderUpdates":
+        orders.write({"user": "", "shared": list(users), "data": d})
+    elif ch == "userFills":
+        fills.write({"user": (d or {}).get("user", "") if isinstance(d, dict) else "", "data": d})
+    else:
+        other.write({"user": "", "shared": list(users), "msg": m})
+
+
 def route_api(m, trades, books, bbos, other, tally=None):
     """Send one api-ws message to its sink (dicts keyed by coin); anything unexpected goes to `other`."""
     if not isinstance(m, dict) or m.get("channel") == "subscriptionResponse":
@@ -173,7 +190,7 @@ def pick_users(tally, n, by=None, path=None, now=None, max_age_s=3600):
 
 
 async def track_users(tally, orders, fills, tracked, other, n=None, every_s=None, warmup_s=None, initial=None,
-                      start=None, sleep=None, picker=None):
+                      start=None, sleep=None, picker=None, start_shared=None):
     """Keep one orderUpdates+userFills connection per tracked user; re-pick the set every `every_s`."""
     n = TRACK_USERS if n is None else n
     every_s = TRACK_EVERY_S if every_s is None else every_s
@@ -188,13 +205,22 @@ async def track_users(tally, orders, fills, tracked, other, n=None, every_s=None
     if not users:
         await sleep(TRACK_WARMUP_S if warmup_s is None else warmup_s)
         users = picker(n)
+    start_shared = start_shared or (lambda us: asyncio.ensure_future(
+        stream(API_WS, [x for u in us for x in user_subscriptions(u)],
+               lambda m: route_shared(m, us, orders, fills, other))))
+    shared_key, shared_task = (), None
     while True:
-        for u in [u for u in tasks if u not in users]:
+        own, rest = users[:TRACK_DEDICATED], tuple(sorted(users[TRACK_DEDICATED:]))
+        for u in [u for u in tasks if u not in own]:
             tasks.pop(u).cancel()
-        for u in users:
+        for u in own:
             if u not in tasks:
                 tasks[u] = start(u)
-        rec = {"time": int(time.time() * 1000), "users": sorted(tasks)}
+        if rest != shared_key:
+            if shared_task is not None:
+                shared_task.cancel()
+            shared_key, shared_task = rest, (start_shared(rest) if rest else None)
+        rec = {"time": int(time.time() * 1000), "users": sorted(tasks), **({"shared": list(rest)} if rest else {})}
         if LAST_ARM["arm"] is not None:
             rec["arm"] = LAST_ARM["arm"]
         tracked.write(rec)
