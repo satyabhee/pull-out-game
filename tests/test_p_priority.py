@@ -62,3 +62,33 @@ def test_fill_follows_p_order():
 def test_bad_mode():
     with pytest.raises(ValueError):
         Engine(p_priority="sometimes")
+
+
+def test_known_never_jumps_placeholders_but_jumps_in_window_p0():
+    eng = Engine(p_priority="known")
+    eng.seed(0, Side.SELL, 100, 5)
+    eng.apply(place("0xa", Side.SELL, 100, 1))            # in window, no grouping.p -> p 0
+    eng.apply(place("0xb", Side.SELL, 100, 1, p=9))
+    assert queue(eng, 100) == ["placeholder", "0xb", "0xa"]
+
+
+def test_known_does_not_jump_orders_rested_without_p_meta():
+    eng = Engine(p_priority="known")
+    named = eng._new_order("0xn", 0, Side.SELL, 100, 1, Tif.GTC, None)
+    eng._rest(named, 1)                                    # named pre-window order (replay._rest_named path)
+    eng.apply(place("0xb", Side.SELL, 100, 1, p=9))
+    assert queue(eng, 100) == ["0xn", "0xb"]
+
+
+def test_window_mode_unchanged_for_p0_orders():
+    eng = run(500, [(0, place("0xa", Side.SELL, 100, 1, p=0)), (100, place("0xb", Side.SELL, 100, 1, p=9))])
+    assert queue(eng, 100) == ["0xa", "0xb"]
+
+
+def test_evict_arrival_trims_oldest_arrival_not_queue_head():
+    for flag, left in ((False, ["0xa"]), (True, ["0xb"])):
+        eng = Engine(p_priority="always", evict_arrival=flag)
+        eng.apply(place("0xa", Side.SELL, 100, 1, p=1))
+        eng.apply(place("0xb", Side.SELL, 100, 1, p=9))    # queue: b, a; arrival: a, b
+        eng.reconcile(0, [], [(100, 1)], known="oldest")
+        assert queue(eng, 100) == left

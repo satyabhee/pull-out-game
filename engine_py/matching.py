@@ -43,14 +43,23 @@ class CrossedBookError(BookError):
 
 class Engine:
     def __init__(self, stp: str = "cancel_taker", resolve_oid: Resolver | None = None,
-                 check_every_action: bool = False, p_priority: str | int | None = None):
+                 check_every_action: bool = False, p_priority: str | int | None = None,
+                 evict_arrival: bool = False):
         """p_priority (G1, measured by analysis/p_priority.py): at one price a resting order with a higher
         grouping.p is served first. None = pure price-time (default). "always" = queue by (p desc, arrival).
         int W = a new order goes ahead of a lower-p order only if that order arrived at most W ms earlier
         (block time; set block_time_ms before applying a block). Orders without p (placeholders, named
-        pre-window orders, actions without grouping) count as p = 0 and, under W, are never jumped."""
-        if not (p_priority is None or p_priority == "always" or (isinstance(p_priority, int) and p_priority >= 0)):
-            raise ValueError(f"p_priority must be None, 'always' or ms >= 0, not {p_priority!r}")
+        pre-window orders, actions without grouping) count as p = 0 and, under W, are never jumped.
+        "known" (Nov 20 overnight) = p order only among orders placed in the window through this engine (an
+        in-window order without grouping.p counts as p = 0 and can be jumped); placeholders and orders named
+        from outside evidence (pre-window liquidity whose p we never saw) are never jumped.
+        evict_arrival (off by default): reconcile(known="oldest"|"newest") picks known orders by arrival
+        (Order.seq) instead of queue position. Under p_priority the queue head is the highest-p order, not
+        the oldest one, so queue order would trim the freshest high-p orders first."""
+        if not (p_priority is None or p_priority in ("always", "known")
+                or (isinstance(p_priority, int) and p_priority >= 0)):
+            raise ValueError(f"p_priority must be None, 'always', 'known' or ms >= 0, not {p_priority!r}")
+        self.evict_arrival = evict_arrival
         self.p_priority = p_priority
         self.p_meta: dict[int, tuple[int, int]] = {}         # engine oid -> (p, block time ms)
         self.block_time_ms = 0
@@ -152,6 +161,8 @@ class Engine:
                 if known is None or gap == 0:
                     continue
                 nodes = [n for n in level if n.order.user != PLACEHOLDER]
+                if self.evict_arrival:
+                    nodes.sort(key=lambda n: n.order.seq)
                 for node in (nodes if known == "oldest" else reversed(nodes)):
                     if gap == 0:
                         break
@@ -233,7 +244,7 @@ class Engine:
 
     def _p_arg(self, p: Place) -> tuple:
         """Extra _rest argument only when p_priority is on (subclasses overriding _rest stay compatible)."""
-        return (p.priority,) if self.p_priority is not None else ()
+        return (p.priority or 0,) if self.p_priority is not None else ()   # None (no grouping.p) -> 0
 
     def _rest(self, order: Order, remaining: int, p: int | None = None) -> None:
         jumps = None
@@ -244,9 +255,11 @@ class Engine:
                 m = meta.get(node.order.oid)
                 if window == "always":
                     return p > (m[0] if m else 0)
-                return m is not None and p > m[0] and t - m[1] <= window
-        if self.p_priority is not None and p and order.user != PLACEHOLDER:
-            self.p_meta[order.oid] = (p, self.block_time_ms)
+                if window == "known":
+                    return m is not None and p > m[0]
+                return m is not None and m[0] > 0 and p > m[0] and t - m[1] <= window
+        if self.p_priority is not None and order.user != PLACEHOLDER and p is not None and (p or self.p_priority == "known"):
+            self.p_meta[order.oid] = (p, self.block_time_ms)     # p None = rested from outside evidence
         self.books[order.asset].add(order, remaining, jumps=jumps)
         if order.user != PLACEHOLDER:
             self.by_user.setdefault(order.user, {})[order.oid] = None

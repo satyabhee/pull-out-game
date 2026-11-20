@@ -89,6 +89,7 @@ def main(argv=None):
         ref = per_tx(rows[a.ref], field)
         for sname, keys in (("contested", [k for k, c in scopes["contested"].items() if c]),
                             ("contested (real makers)", [k for k, c in scopes["contested (real makers)"].items() if c]),
+                            ("uncontested", [k for k, c in scopes["contested"].items() if not c]),
                             ("all scored", list(ref))):
             res = [paired(ref, per_tx(rows[v], field), keys, a.boot) for v in others]
             adj = holm([r["p"] for r in res])
