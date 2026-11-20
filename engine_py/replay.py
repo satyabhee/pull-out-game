@@ -886,6 +886,7 @@ class Replay:
         self.observer.before_action(self, block, action)
         before = self.engine.next_oid
         self._block = block
+        self.engine.block_time_ms = block.time_ms
         deep = self._deep_in(action) if self.deep_book else None
         gated = self._apply_gated(action) if self.touch is not None else None
         fills, rejects = gated if gated is not None else self.engine.apply(action)

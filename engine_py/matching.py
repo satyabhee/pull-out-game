@@ -43,7 +43,17 @@ class CrossedBookError(BookError):
 
 class Engine:
     def __init__(self, stp: str = "cancel_taker", resolve_oid: Resolver | None = None,
-                 check_every_action: bool = False):
+                 check_every_action: bool = False, p_priority: str | int | None = None):
+        """p_priority (G1, measured by analysis/p_priority.py): at one price a resting order with a higher
+        grouping.p is served first. None = pure price-time (default). "always" = queue by (p desc, arrival).
+        int W = a new order goes ahead of a lower-p order only if that order arrived at most W ms earlier
+        (block time; set block_time_ms before applying a block). Orders without p (placeholders, named
+        pre-window orders, actions without grouping) count as p = 0 and, under W, are never jumped."""
+        if not (p_priority is None or p_priority == "always" or (isinstance(p_priority, int) and p_priority >= 0)):
+            raise ValueError(f"p_priority must be None, 'always' or ms >= 0, not {p_priority!r}")
+        self.p_priority = p_priority
+        self.p_meta: dict[int, tuple[int, int]] = {}         # engine oid -> (p, block time ms)
+        self.block_time_ms = 0
         if stp not in ("cancel_taker", "expire_maker"):
             raise ValueError(f"unknown self-trade policy {stp!r}")
         self.stp = stp
@@ -221,8 +231,23 @@ class Engine:
         self.next_seq += 1
         return order
 
-    def _rest(self, order: Order, remaining: int) -> None:
-        self.books[order.asset].add(order, remaining)
+    def _p_arg(self, p: Place) -> tuple:
+        """Extra _rest argument only when p_priority is on (subclasses overriding _rest stay compatible)."""
+        return (p.priority,) if self.p_priority is not None else ()
+
+    def _rest(self, order: Order, remaining: int, p: int | None = None) -> None:
+        jumps = None
+        if self.p_priority is not None and p:
+            t, window, meta = self.block_time_ms, self.p_priority, self.p_meta
+
+            def jumps(node, p=p, t=t, window=window, meta=meta):
+                m = meta.get(node.order.oid)
+                if window == "always":
+                    return p > (m[0] if m else 0)
+                return m is not None and p > m[0] and t - m[1] <= window
+        if self.p_priority is not None and p and order.user != PLACEHOLDER:
+            self.p_meta[order.oid] = (p, self.block_time_ms)
+        self.books[order.asset].add(order, remaining, jumps=jumps)
         if order.user != PLACEHOLDER:
             self.by_user.setdefault(order.user, {})[order.oid] = None
             if order.cloid is not None:
@@ -234,6 +259,7 @@ class Engine:
     def _forget(self, order: Order) -> None:
         if order.user == PLACEHOLDER:
             return
+        self.p_meta.pop(order.oid, None)
         mine = self.by_user.get(order.user)
         if mine is not None:
             mine.pop(order.oid, None)
@@ -279,7 +305,7 @@ class Engine:
         if p.tif is Tif.ALO:
             if self._crosses(p.side, p.px, best_opp):
                 return [], [Reject(source, RejectReason.ALO_WOULD_CROSS)]
-            self._rest(self._new_order(p.user, p.asset, p.side, p.px, p.sz, p.tif, p.cloid), p.sz)
+            self._rest(self._new_order(p.user, p.asset, p.side, p.px, p.sz, p.tif, p.cloid), p.sz, *self._p_arg(p))
             return [], []
 
         taker = self._new_order(p.user, p.asset, p.side, p.px, p.sz, p.tif, p.cloid)
@@ -307,7 +333,7 @@ class Engine:
                 self._forget(maker)
 
         if remaining > 0 and p.tif is Tif.GTC:
-            self._rest(taker, remaining)
+            self._rest(taker, remaining, *self._p_arg(p))
         return fills, rejects
 
     def _cancel_cloid(self, source, user, asset, cloid) -> list[Reject]:
