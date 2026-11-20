@@ -152,6 +152,19 @@ def main(argv=None):
     ap.add_argument("--cache", help="json file caching per-chunk scores")
     vr.add_replay_args(ap)
     a = ap.parse_args(argv)
+    if a.every:
+        # Each round runs in a fresh child process: replay caches (decoded blocks, recorder files, estimators)
+        # are module-level and grew to ~10 GB over a day in one long-lived process. A child returns it all.
+        import subprocess
+        args = list(sys.argv[1:] if argv is None else argv)
+        child = [x for i, x in enumerate(args)
+                 if not (x.startswith("--every") or (i > 0 and args[i - 1] == "--every"))]
+        while True:
+            t = time.time()
+            rc = subprocess.run([sys.executable, "-m", "analysis.rank_trackers", *child]).returncode
+            if rc:
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC round failed (exit {rc})", flush=True)
+            time.sleep(max(a.every - (time.time() - t), 30))
     kw = vr.replay_kwargs(a)
     cache = {}
     if a.cache and os.path.exists(a.cache):
@@ -159,7 +172,7 @@ def main(argv=None):
             cache = json.load(open(a.cache))
         except ValueError:
             cache = {}
-    while True:
+    if True:
         t = time.time()
         cn = a.contested_chunks if a.contested_slots else 0
         score, parts, used, contested = rank(a.windows_dir, a.hl_data, a.policy, kw, a.chunks, cn, cache)
@@ -174,9 +187,7 @@ def main(argv=None):
         top = ", ".join(f"{u[:10]}" for u in order(score, contested, a.contested_slots)[:6])
         print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC {len(used)} chunks "
               f"{dict(parts)} tracking: {top} ({time.time() - t:.0f} s)", flush=True)
-        if not a.every:
-            return
-        time.sleep(max(a.every - (time.time() - t), 30))
+        return
 
 
 if __name__ == "__main__":

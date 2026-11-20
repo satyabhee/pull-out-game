@@ -161,7 +161,8 @@ class OidEstimator:
         return out[::-1]
 
     @classmethod
-    def from_window(cls, window_dir, anchors, count_errored: bool = False, facts=None) -> "OidEstimator":
+    def from_window(cls, window_dir, anchors, count_errored: bool = False, facts=None,
+                    all_refs: dict | None = None) -> "OidEstimator":
         """anchors: a list in either format:
         - {"oid", "height", "tx", "item"}                      (checks/g0_check.py, g0_anchors.json)
         - {"user", "oid", "answer": orderStatus response}      (collect/capture.py, anchors.json)
@@ -172,7 +173,10 @@ class OidEstimator:
         (crossed) is located by its tx hash at the one item of that tx on its asset and side whose limit allows the
         fill price. Located facts become anchors and `exact` entries (real oid -> position); every fact also goes
         into `oid_px` (real oid -> user, asset, side, price). Anchors that disagree are dropped (consistent())
-        instead of failing."""
+        instead of failing.
+        all_refs: data/oid_facts.stream_orders_all output; located on every coin, they become anchors only."""
+        from data.oid_facts import _norm, locate_all
+        all_places: list = []
         counts: dict[Pos, int] = {}
         groups: dict = {}
         block_groups: dict = {}
@@ -230,6 +234,10 @@ class OidEstimator:
                     if len(g) >= 2:
                         groups.setdefault(ukey, []).append(g)
                 for i, item in enumerate(_order_items(tx["action"])):
+                    if all_refs:
+                        u = tx["user"].lower()
+                        all_places.append((k, u, item.get("c"), (u, _norm(item.get("p")), _norm(item.get("s"))),
+                                           int(tx["time"])))
                     if item.get("a") in ASSETS:
                         counts[(height, t, i)] = k
                         placers.setdefault((tx["user"].lower(), item["a"]), []).append(k)
@@ -253,6 +261,8 @@ class OidEstimator:
         pts += [(counts[p], oid) for oid, p in exact.items()]
         exact.update({int(a["oid"]): (a["height"], a["tx"], a["item"]) for a in anchors
                       if "height" in a and (a["height"], a["tx"], a["item"]) in counts})
+        if all_refs:
+            pts += locate_all(all_places, all_refs)
         good = cls.consistent(pts)
         est = cls(counts, good, groups, block_groups, placers, exact if facts is not None else None, oid_px)
         est.dropped_anchors = len(set(pts)) - len(good)
@@ -264,7 +274,7 @@ class OidEstimator:
 
     @classmethod
     def from_files(cls, window_dir, anchor_file, facts: bool = False, hl_data=None, exclude=(),
-                   drop_kinds=()) -> "OidEstimator":
+                   drop_kinds=(), all_coins: bool = False) -> "OidEstimator":
         """from_window on the anchor file (None = no anchors), built once per process per (window, anchors, facts)
         and rebuilt when a block file, the anchor file or the facts change. The estimator is read-only, so it is
         shared. facts=True: also data/oid_facts.load(window_dir, hl_data)."""
@@ -278,13 +288,17 @@ class OidEstimator:
         sig = (tuple(sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns) for _, p in _block_files(window_dir))),
                st and st.st_size, st and st.st_mtime_ns, None if fx is None else fx.files_sig())
         key = (window_dir.resolve(), anchor_file and anchor_file.resolve(), bool(facts), tuple(sorted(exclude)),
-               tuple(sorted(drop_kinds)),
+               tuple(sorted(drop_kinds)), bool(all_coins),
                None if hl_data is None else str(Path(hl_data).resolve()))
         hit = _estimator_cache.get(key)
         if hit is None or hit[0] != sig:
             anchors = json.loads(anchor_file.read_text()) if anchor_file is not None else []
             anchors = [a for a in anchors if a.get("kind") not in drop_kinds]
-            hit = (sig, cls.from_window(window_dir, anchors, facts=fx))
+            refs = None
+            if all_coins and hl_data is not None:
+                from data import oid_facts
+                refs = oid_facts.stream_orders_all(window_dir, hl_data)
+            hit = (sig, cls.from_window(window_dir, anchors, facts=fx, all_refs=refs))
             _estimator_cache[key] = hit
             while len(_estimator_cache) > _ESTIMATOR_CACHE_MAX:
                 _estimator_cache.popitem(last=False)
@@ -311,6 +325,17 @@ class OidEstimator:
                 lo, hi = (mid, hi) if a[mid][0] <= k else (lo, mid)
             (k0, o0), (k1, o1) = a[lo], a[hi]
         return o0 + (k - k0) * (o1 - o0) // (k1 - k0)
+
+    def c_bounds(self, k: int) -> tuple[int | None, int | None]:
+        """c(k) = oid - k never decreases (unseen events only add ids), so the anchors at or before k and after
+        k bound it: (lo, hi), None = unbounded on that side. An anchor AT k gives lo == hi."""
+        a = self.anchors
+        i = bisect_right(a, (k, 10**30))
+        lo = a[i - 1][1] - a[i - 1][0] if i > 0 else None
+        if i > 0 and a[i - 1][0] == k:
+            return lo, lo
+        hi = a[i][1] - a[i][0] if i < len(a) else None
+        return lo, hi
 
     def estimate(self, pos: Pos) -> int | None:
         k = self.counts.get(pos)
@@ -342,12 +367,15 @@ class OidResolver:
                  joint_tx: bool = True, joint_block: bool = True, group_gap: int = 0,
                  pair_slack: int = 3, pair_lo: int = 2, pair_per_mille: int = 80, node_budget: int = 20000,
                  guard_mult: int = 2, ghost_guard: bool = True, max_tol: int | None = None,
-                 ratio_per_mille: int | None = None):
+                 ratio_per_mille: int | None = None, bracket: bool = False):
         """nearest_ratio > 0: when several orders are within tolerance, accept the nearest one only if
         every other is at least nearest_ratio times farther (and >= base ids farther); 0 = never.
         joint_tx / joint_block: the two joint layers (module doc). group_gap: ids that may be missing
         between two items of one placement tx. pair_*: cross-tx spacing tolerance (module doc)."""
         self.joint_tx, self.joint_block, self.group_gap = joint_tx, joint_block, group_gap
+        self.bracket = bracket                          # monotone c(k) bracket rule (resolve before the tolerance rule)
+        self.k_engine: dict[int, int] = {}              # counted position -> engine oid created there
+        self.k_max = -1
         self.named: dict[int, int] = {}                 # real oid -> engine oid of a named pre-window order
         self.pair_slack, self.pair_lo, self.pair_per_mille = pair_slack, pair_lo, pair_per_mille
         self.node_budget, self.guard_mult = node_budget, guard_mult
@@ -381,6 +409,8 @@ class OidResolver:
         k = self.est.counts.get(pos)
         if k is None:
             return
+        self.k_engine[k] = engine_oid
+        self.k_max = max(self.k_max, k)
         e = self.est.estimate_count(k)
         if e is not None:
             tol = self.est.tolerance(k, self.base, self.per_mille)
@@ -430,6 +460,10 @@ class OidResolver:
                 self.stats["resolved"] += 1
                 self.last = oid
                 return oid
+        if self.bracket:
+            got = self._bracket(user, asset, hl_oid)
+            if got is not None:
+                return got or None
         book = self.engine.books[asset]
         hits = []
         for oid in self.engine.by_user.get(user, {}):
@@ -462,6 +496,35 @@ class OidResolver:
         self.stats["resolved"] += 1
         self.last = hits[0][1]
         return self.last
+
+    def _bracket(self, user: str, asset: int, hl_oid: int):
+        """Monotone bracket: the user's in-window placements on this asset (already processed) whose position k
+        admits c = hl_oid - k inside c_bounds(k). Exactly one -> that order if it still rests (engine oid), else 0
+        (target gone: never fall back to a guess). None -> no decision (zero or several placements fit)."""
+        ks = self.est.placers.get((user, asset))
+        if not ks or not self.est.anchors:
+            return None
+        ks = ks[:bisect_right(ks, self.k_max)]
+        fit = []
+        for k in ks:
+            lo, hi = self.est.c_bounds(k)
+            c = hl_oid - k
+            if (lo is None or c >= lo) and (hi is None or c <= hi):
+                fit.append(k)
+                if len(fit) > 1:
+                    break
+        if len(fit) != 1:
+            self.stats["bracket_ambiguous" if fit else "bracket_none"] += 1
+            return None
+        x = self.k_engine.get(fit[0])
+        if x is not None and x in self.engine.books[asset] and x in self.engine.by_user.get(user, {}):
+            self.stats["resolved_bracket"] += 1
+            self.stats["resolved"] += 1
+            self.last = x
+            return x
+        self.stats["bracket_gone"] += 1
+        self._last_reason = "bracket_gone"
+        return 0
 
     def _refused(self, user: str, asset: int, hl_oid: int, x: int, count: bool = True) -> bool:
         """Final per-order guards on a resolution to engine order x: ratio, then ghost."""

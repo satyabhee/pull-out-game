@@ -466,7 +466,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False,
         trade_learn=None, oid_guard=None, refill_position="front", oid_facts=False,
         name_prewindow=False, named_anon="front", deep_book=False,
-        learn_keep_known=False, facts_exclude=(), use_bbo=True, anchor_drop_kinds=()):
+        learn_keep_known=False, facts_exclude=(), use_bbo=True, anchor_drop_kinds=(), oid_bracket=False):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
@@ -478,7 +478,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap,
                 reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, oid_guard=oid_guard, refill_position=refill_position, oid_facts=oid_facts,
                 name_prewindow=name_prewindow and oid_facts, named_anon=named_anon, deep_book=deep_book, learn_keep_known=learn_keep_known, facts_exclude=facts_exclude,
-                use_bbo=use_bbo, anchor_drop_kinds=anchor_drop_kinds, engine=engine if engine is not None else Engine(stp=stp))
+                use_bbo=use_bbo, anchor_drop_kinds=anchor_drop_kinds, oid_bracket=oid_bracket, engine=engine if engine is not None else Engine(stp=stp))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -799,6 +799,8 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     ap.add_argument("--alo-gate", choices=["touch"], help="G1 fix #1: admit ALOs against the real touch")
     ap.add_argument("--gate-max-age-ms", type=int, help="gate abstains when the touch is older than this")
     ap.add_argument("--evict-known", choices=["oldest", "newest"], help="G1 fix #2: rule 8 evicts known orders")
+    ap.add_argument("--oid-bracket", action="store_true",
+                    help="reference points from tracked users' orders on every coin + monotone oid bracket rule")
     ap.add_argument("--nearest-ratio", type=int, default=0,
                     help="resolver: accept the nearest of several candidates if all others are this many times farther")
     ap.add_argument("--reseed", action="store_true", help="G1 #3: rebuild each book from every snapshot")
@@ -875,7 +877,7 @@ def replay_kwargs(a) -> dict:
                 name_prewindow=a.name_prewindow, named_anon=a.named_anon,
                 deep_book=a.deep_book, learn_keep_known=a.learn_keep_known,
                 facts_exclude=tuple(x for x in a.facts_exclude.split(",") if x), use_bbo=not a.no_bbo,
-                anchor_drop_kinds=("target",) if a.no_target_lookups else ())
+                anchor_drop_kinds=("target",) if a.no_target_lookups else (), oid_bracket=a.oid_bracket)
 
 
 def options_tag(a) -> str:
@@ -904,7 +906,7 @@ def options_tag(a) -> str:
                     "-learnkeep" if a.learn_keep_known else "",
                     f"-fx{a.facts_exclude.replace(',', '+')}" if a.facts_exclude else "",
                     "-nobbo" if a.no_bbo else "",
-                    "-notargets" if a.no_target_lookups else ""])
+                    "-notargets" if a.no_target_lookups else "", "-bracket" if a.oid_bracket else ""])
 
 
 def main(argv=None):

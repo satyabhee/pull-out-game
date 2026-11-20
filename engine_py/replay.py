@@ -74,7 +74,7 @@ class RealTouch:
         ev = [(s.time_ms, self.SNAP, s.asset, 0, s.bids[0][0] if s.bids else None,
                s.asks[0][0] if s.asks else None) for s in snapshots]
         ev += [(t, self.BBO, a, 0, b, k) for t, a, b, k in bbos]      # b, k = (px, sz, n) | None
-        ev += [(t.time_ms, self.TRADE, t.asset, t.tid, t.taker_side, t.px) for t in trades]
+        ev += [(t.time_ms, self.TRADE, t.asset, t.seq, t.taker_side, t.px) for t in trades]
         ev.sort(key=lambda e: e[:4])
         self.events = ev
         self.i = 0
@@ -162,8 +162,11 @@ class Replay:
                  trade_learn: str | None = None, oid_guard: str | None = None, refill_position: str = "front",
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
                  deep_book: bool = False, deep_lookback_ms: int = 600_000, learn_keep_known: bool = False,
-                 facts_exclude: tuple = (), use_bbo: bool = True, anchor_drop_kinds: tuple = ()):
-        """anchors: path to an anchors file; None = the window's anchors.json if present.
+                 facts_exclude: tuple = (), use_bbo: bool = True, anchor_drop_kinds: tuple = (),
+                 oid_bracket: bool = False):
+        """oid_bracket: reference points from the tracked users' orders on every coin + the monotone c(k) bracket
+        rule in the resolver (data/oids.py).
+        anchors: path to an anchors file; None = the window's anchors.json if present.
         check_permutation=False only for measurement runs whose policy drops or rewrites actions.
         alo_gate="touch" (G1 fix #1): ALOs are admitted or rejected against RealTouch, not our
         book; an admitted ALO that crosses our book evicts what it crosses (it cannot have been
@@ -343,8 +346,10 @@ class Replay:
             anchors = self.window_dir / "anchors.json"
         if use_resolver and oid_facts:
             est = OidEstimator.from_files(self.window_dir, anchors, facts=True, hl_data=self.hl_data,
-                                          exclude=self.facts_exclude, drop_kinds=self.anchor_drop_kinds)
-            self.resolver = OidResolver(self.engine, est, nearest_ratio=nearest_ratio, **OID_GUARDS[oid_guard])
+                                          exclude=self.facts_exclude, drop_kinds=self.anchor_drop_kinds,
+                                          all_coins=oid_bracket)
+            self.resolver = OidResolver(self.engine, est, nearest_ratio=nearest_ratio, bracket=oid_bracket,
+                                        **OID_GUARDS[oid_guard])
             self.resolver.named = self.named
             self.engine.resolve_oid = self.resolver
         elif use_resolver and anchors is not None:
@@ -750,7 +755,7 @@ class Replay:
                 level = levels.get(w)
                 if level is None:
                     continue
-                maker = max((t for t in trs if t.px == w), key=lambda t: t.tid).maker
+                maker = max((t for t in trs if t.px == w), key=lambda t: t.seq).maker
                 nodes = list(level)
                 if any(nd.order.user == maker for nd in nodes) or nodes[0].order.user != PLACEHOLDER:
                     continue

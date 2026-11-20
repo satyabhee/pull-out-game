@@ -57,7 +57,7 @@ def test_other_at_tx_index_sets_the_source_tx_index_and_keeps_zero_hash_at_the_e
     (blk,) = list(iter_window(window, hl, st, outside_other_txs=True, other_at_tx_index=True))
     of = [a for a in blk.actions if isinstance(a, OutsideFill)]
     assert [(a.hash, a.tx_index, a.item_index, a.tid) for a in of] == [
-        (ZERO, 3, 0, 1), ("0xg1", 1, 0, 3), ("0xg1", 1, 1, 9)]
+        (ZERO, 3, 0, 1), ("0xg1", 1, 0, 9), ("0xg1", 1, 1, 3)]        # stream order, not tid order
     assert st["outside_fill_other_tx"] == 1 and st["action:OutsideFill"] == 3
     (blk_default,) = list(iter_window(window, hl, outside_other_txs=True))
     assert [a.tx_index for a in blk_default.actions if isinstance(a, OutsideFill)] == [3, 3, 3]

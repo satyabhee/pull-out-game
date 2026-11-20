@@ -195,10 +195,10 @@ def one(job):
         if mode == "F1 X ahead, other" and obs.detail is not None:
             x, xpx = obs.detail
             bt = obs._btime.get(rec.block)
-            first_tid = min((t.tid for t in real_trades.get(h, [])), default=None)
+            first_seq = min((t.seq for t in real_trades.get(h, [])), default=None)
             hits = [t for t in maker_trades.get((x, rec.asset, rec.side.opposite, xpx), ())
                     if bt - 60_000 <= t.time_ms <= bt and t.hash != h]
-            same = [t for t in hits if t.time_ms == bt and (first_tid is None or t.tid < first_tid)]
+            same = [t for t in hits if t.time_ms == bt and (first_seq is None or t.seq < first_seq)]
             where = ("same block, earlier tx" if same else
                      "earlier block" if any(t.time_ms < bt for t in hits) else "no real fill of X there")
             out["cascade"][where] += 1

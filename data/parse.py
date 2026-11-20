@@ -202,12 +202,12 @@ def iter_window(window_dir, hl_data=None, stats: Stats | None = None,
             if not decoded and tx["hash"] in by_hash:
                 stats["outside_fill_other_tx"] += 1
                 if other_at_tx_index:
-                    for k, tr in enumerate(sorted(by_hash.pop(tx["hash"]), key=lambda t: t.tid)):
+                    for k, tr in enumerate(sorted(by_hash.pop(tx["hash"]), key=lambda t: t.seq)):
                         at_index.append(tr.as_outside_fill(height, i, k))
                 else:
                     other += by_hash.pop(tx["hash"])
 
-        trades = sorted(outside.pop(b["blockTime"], []) + other, key=lambda t: t.tid)
+        trades = sorted(outside.pop(b["blockTime"], []) + other, key=lambda t: t.seq)
         for k, tr in enumerate(trades):
             actions.append(tr.as_outside_fill(height, len(b["txs"]), k))
             stats["action:OutsideFill"] += 1
@@ -399,6 +399,7 @@ class Trade:
     tid: int
     buyer: str
     seller: str
+    seq: int = 0          # position in the recorder stream: real fill order. tids are random, never order by them
 
     @property
     def taker(self) -> str:
@@ -416,9 +417,12 @@ class Trade:
 
 
 def iter_trades(hl_data, coins, t0_ms: int, t1_ms: int) -> Iterator[Trade]:
-    """Recorded trades with t0 <= time <= t1, deduplicated by tid, in (time, tid) order."""
+    """Recorded trades with t0 <= time <= t1, deduplicated by tid, in (time, stream) order.
+    Stream order (`seq`) is the order the recorder received them, which within a tx is the real fill order;
+    tids are random numbers and carry no order."""
     hl_data = Path(hl_data)
     seen: dict[int, Trade] = {}
+    n = 0
     for coin in coins:
         asset = COIN_TO_ASSET[coin]
         spec = ASSETS[asset]
@@ -427,12 +431,15 @@ def iter_trades(hl_data, coins, t0_ms: int, t1_ms: int) -> Iterator[Trade]:
                 for x in rec["msg"]["data"]:
                     if not (t0_ms <= x["time"] <= t1_ms) or x["coin"] != coin:
                         continue
+                    if x["tid"] in seen:
+                        continue
+                    n += 1
                     seen[x["tid"]] = Trade(
                         asset=asset, taker_side=Side(x["side"]),
                         px=spec.px_to_ticks(x["px"]), sz=spec.sz_to_lots(x["sz"]),
                         time_ms=x["time"], hash=x["hash"], tid=x["tid"],
-                        buyer=x["users"][0].lower(), seller=x["users"][1].lower())
-    yield from sorted(seen.values(), key=lambda t: (t.time_ms, t.tid))
+                        buyer=x["users"][0].lower(), seller=x["users"][1].lower(), seq=n)
+    yield from sorted(seen.values(), key=lambda t: (t.time_ms, t.seq))
 
 
 @dataclass(frozen=True)

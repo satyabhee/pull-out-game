@@ -164,7 +164,7 @@ def test_zero_hash_trades_become_outside_fills_at_block_end(tmp_path):
     place, of1, of2 = block.actions
     assert isinstance(place, Place)
     assert all(isinstance(a, OutsideFill) for a in (of1, of2))
-    assert (of1.tid, of2.tid) == (3, 9)                            # ordered by tid
+    assert (of1.tid, of2.tid) == (9, 3)                            # stream order (tids are random, not order)
     assert of1.tx_index == 1 and (of1.item_index, of2.item_index) == (0, 1)
     assert of1.user == MAKER and of1.maker_user == TAKER           # side B: taker is users[0]
 

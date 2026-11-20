@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 
 from data.parse import _block_files, _hour_files, _records, read_block
@@ -118,6 +119,63 @@ def _window_range(window_dir: Path):
 
 
 SOURCES = ("fills", "hist", "open", "ws_orders", "ws_fills")
+
+
+def _norm(x) -> str:
+    try:
+        return format(Decimal(str(x)).normalize(), "f")
+    except (ArithmeticError, ValueError):
+        return str(x)
+
+
+def stream_orders_all(window_dir, hl_data, recorder_margin_ms: int = 60_000) -> dict:
+    """Reference points on EVERY coin: real oid -> (user or '', cloid, (user, px, origSz, timestamp)) for the
+    tracked users' orderUpdates placed inside the window's time range (+- 5 s). Shared-connection updates carry
+    no user ('' : located by shape without user, or by cloid)."""
+    window_dir = Path(window_dir)
+    t0, t1 = _window_range(window_dir)
+    out: dict = {}
+    if t0 is None or hl_data is None:
+        return out
+    lo, hi = t0 - recorder_margin_ms, t1 + recorder_margin_ms
+    for path in _hour_files(Path(hl_data), "user_orders", lo, hi):
+        for r in _records(path, lo, hi):
+            m = r.get("msg") or {}
+            user = (m.get("user") or "").lower()
+            for x in m.get("data") or []:
+                o = (x or {}).get("order") or {}
+                if "oid" not in o:
+                    continue
+                try:
+                    ts = int(o.get("timestamp", 0))
+                except (TypeError, ValueError):
+                    continue
+                if ts < t0 - 5_000 or ts > t1 + 5_000:
+                    continue
+                out[int(o["oid"])] = (user, o.get("cloid"),
+                                      (user, _norm(o.get("limitPx")), _norm(o.get("origSz", o.get("sz")))), ts)
+    return out
+
+
+def locate_all(places: list, refs: dict) -> list:
+    """places: (k, user, cloid, (user, px, sz), time) for every counted item (any asset).
+    refs: stream_orders_all output. Returns (k, oid) for refs that match exactly one item."""
+    by_cloid: dict = {}
+    by_shape: dict = {}
+    by_shape_nouser: dict = {}
+    for k, user, cloid, shape, t in places:
+        if cloid:
+            by_cloid.setdefault((cloid, t), []).append(k)
+        by_shape.setdefault((shape, t), []).append(k)
+        by_shape_nouser.setdefault((shape[1:], t), []).append(k)
+    out = []
+    for oid, (user, cloid, shape, t) in refs.items():
+        hits = by_cloid.get((cloid, t)) if cloid else None
+        if not hits:
+            hits = by_shape.get((shape, t)) if user else by_shape_nouser.get((shape[1:], t))
+        if hits and len(hits) == 1:
+            out.append((hits[0], oid))
+    return out
 
 
 def load(window_dir, hl_data=None, recorder_margin_ms: int = 60_000, exclude=()) -> OidFacts:
