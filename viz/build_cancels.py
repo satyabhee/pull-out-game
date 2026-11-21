@@ -1,4 +1,4 @@
-"""Inline viz/cancels_tab.js (+ its CSS) into viz/index.html and add the "Cancel matching" tab. Idempotent.
+"""Inline viz/cancels_tab.js (+ its CSS) into viz/index.html: 8 "Cancel matching" scenes appended to the Explainer. Idempotent.
 
 usage: python -m viz.build_cancels
 """
@@ -56,15 +56,8 @@ CSS = """
 """
 
 PATCHES = [
-    ('useState(()=>location.hash.startsWith("#case-")?location.hash.slice(6):"explainer")',
-     'useState(()=>location.hash==="#cancels"?"cancels":location.hash.startsWith("#case-")?location.hash.slice(6):"explainer")'),
-    ('if(o!=="explainer"){const x="#case-"+o;',
-     'if(o!=="explainer"){const x=o==="cancels"?"#cancels":"#case-"+o;'),
-    ('onClick:()=>l("explainer")},"Explainer"),',
-     'onClick:()=>l("explainer")},"Explainer"),React.createElement("button",{role:"tab","aria-selected":o==="cancels",'
-     'className:o==="cancels"?"on":"",onClick:()=>l("cancels")},"Cancel matching"),'),
-    ('c?React.createElement(CaseView,{cs:c}):React.createElement(App,null)',
-     'o==="cancels"&&window.CancelView?React.createElement(window.CancelView):c?React.createElement(CaseView,{cs:c}):React.createElement(App,null)'),
+    ('"Unknown, being measured now: the combined effect of today\'s coverage changes. No estimate."]}];function readHash(){',
+     '"Unknown, being measured now: the combined effect of today\'s coverage changes. No estimate."]}].concat(window.CANCEL_SCENES||[]);function readHash(){'),
 ]
 
 

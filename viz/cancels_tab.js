@@ -1,4 +1,4 @@
-/* "Cancel matching" tab: abstract, stepwise diagrams of how the replay matches a contested cancel to a maker,
+/* "Cancel matching" explainer scenes: abstract, stepwise diagrams of how the replay matches a contested cancel to a maker,
    and every traced way it fails. Data: analysis/cancel_trace.py over held66 (55 cases), Nov 20.
    Inlined into viz/index.html between the CANCELS markers by viz/build_cancels.py. */
 (function () {
@@ -221,62 +221,48 @@
       }));
   }
 
-  function Stage({ sc, step }) {
-    const s = sc.steps[step], showPipe = sc.show.pipe, showReplay = sc.show.replay;
-    const qy = showPipe ? 316 : 170;
-    return h("svg", { viewBox: `0 0 960 ${showPipe ? 400 : 260}`, className: "cx-svg", role: "img", "aria-label": sc.title },
-      h(Block, { items: s.block, at: s.at }),
-      showPipe ? h(Pipe, { states: s.pipe || [], failNote: s.failNote, find: s.find && !s.failNote }) : null,
-      h(Queue, { x: 40, y: qy, items: s.chain, label: "CHAIN · queue at the price", fill: s.chainFill }),
-      showReplay ? h(Queue, { x: 520, y: qy, items: s.replay || [], label: "REPLAY · same queue", fill: s.replayFill }) : null);
+  // one step of a scene, drawn into the explainer's 1200 x 600 stage (same design as the standalone tab had)
+  function Bar({ cur }) {
+    const W = 960, x0 = 120, y = 34;
+    let x = x0;
+    return h("g", null,
+      h("text", { x: x0, y: y - 10, className: "cx-lbl" }, `${TOTAL} TRACED MISSES · maker the replay credited cancelled in the same block`),
+      FAILS.map(f => {
+        const w = (W * f.count) / TOTAL - 3, g = h("g", { key: f.id },
+          h("rect", { x, y, width: w, height: 22, rx: 4, fill: K.cancel, fillOpacity: f.id === cur ? 0.34 : 0.08,
+                      stroke: K.cancel, strokeOpacity: f.id === cur ? 1 : 0.5, style: tr() }),
+          h("text", { x: x + w / 2, y: y + 15, className: "cx-ts", textAnchor: "middle", fill: f.id === cur ? K.ink : K.cancel }, f.count));
+        x += w + 3; return g;
+      }));
   }
 
-  function Breakdown({ cur, go }) {
-    let acc = 0;
-    return h("div", { className: "cx-bd" },
-      h("div", { className: "cx-bar" }, FAILS.map(s => {
-        const w = (100 * s.count) / TOTAL; acc += w;
-        return h("button", { key: s.id, className: "cx-seg" + (cur === s.id ? " on" : ""), style: { flexBasis: w + "%" },
-                             onClick: () => go(s.id), title: `${s.chip}: ${s.count} of ${TOTAL}` }, s.count);
-      })),
-      h("p", { className: "cx-bdcap" }, `${TOTAL} traced misses where the maker the replay credited cancelled in the same block (66 held-out chunks). Click a segment.`));
+  function Draw({ sc, step }) {
+    const s = sc.steps[Math.min(step, sc.steps.length - 1)], showPipe = sc.show.pipe, showReplay = sc.show.replay;
+    const qy = showPipe ? 316 : 170, dy = sc.count || sc.id === "process" ? 110 : showPipe ? 95 : 170;
+    return h("g", null,
+      sc.count || sc.id === "process" ? h(Bar, { cur: sc.id }) : null,
+      h("g", { transform: `translate(120, ${dy})` },
+        h(Block, { items: s.block, at: s.at }),
+        showPipe ? h(Pipe, { states: s.pipe || [], failNote: s.failNote, find: s.find && !s.failNote }) : null,
+        h(Queue, { x: 40, y: qy, items: s.chain, label: "CHAIN · queue at the price", fill: s.chainFill }),
+        showReplay ? h(Queue, { x: 520, y: qy, items: s.replay || [], label: "REPLAY · same queue", fill: s.replayFill }) : null));
   }
 
-  function CancelView() {
-    const [si, setSi] = useState(0), [step, setStep] = useState(0);
-    const sc = scenes[si], last = sc.steps.length - 1;
-    const go = id => { setSi(scenes.findIndex(s => s.id === id)); setStep(0); };
-    useEffect(() => {
-      const k = e => {
-        if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
-        if (e.key === "ArrowRight") { if (step < last) setStep(step + 1); else if (si < scenes.length - 1) { setSi(si + 1); setStep(0); } }
-        if (e.key === "ArrowLeft") { if (step > 0) setStep(step - 1); else if (si > 0) { setSi(si - 1); setStep(scenes[si - 1].steps.length - 1); } }
-      };
-      window.addEventListener("keydown", k); return () => window.removeEventListener("keydown", k);
-    }, [si, step, last]);
-    return h("div", { className: "cx" },
-      h("header", { className: "cx-head" },
-        h("h1", null, "Matching contested cancels"),
-        h("p", null, "How the replay decides which order a cancel removes, and the six ways it ends up crediting the wrong maker.")),
-      h("nav", { className: "cx-chips", "aria-label": "Scenes" }, scenes.map((s, i) =>
-        h("button", { key: s.id, className: "cx-chip" + (i === si ? " on" : "") + (s.count ? " f" : ""), onClick: () => { setSi(i); setStep(0); } },
-          s.count ? h("span", { className: "cx-n" }, s.count) : null, s.chip))),
-      FAILS.some(f => f.id === sc.id) || sc.id === "process" ? h(Breakdown, { cur: sc.id, go }) : null,
-      h("h2", { className: "cx-title" }, sc.title, sc.count ? h("span", { className: "cx-cnt" }, ` · ${sc.count} of ${TOTAL}`) : null),
-      h("div", { className: "cx-stage" }, h(Stage, { sc, step })),
-      h("div", { className: "cx-foot" },
-        h("p", { className: "cx-cap", "aria-live": "polite" }, sc.steps[step].cap),
-        h("div", { className: "cx-ctl" },
-          h("button", { onClick: () => setStep(Math.max(0, step - 1)), disabled: step === 0 }, "← Back"),
-          h("span", { className: "cx-dots" }, sc.steps.map((_, i) => h("i", { key: i, className: i === step ? "on" : "", onClick: () => setStep(i) }))),
-          h("button", { className: "pri", onClick: () => step < last ? setStep(step + 1) : si < scenes.length - 1 && (setSi(si + 1), setStep(0)) },
-            step < last ? "Next step →" : si < scenes.length - 1 ? "Next scene →" : "Done"))),
-      h("div", { className: "cx-legend" },
-        h("span", null, h("i", { style: { borderColor: K.M } }), "M · maker the replay credits"),
-        h("span", null, h("i", { style: { borderColor: K.R } }), "R · maker the chain credits"),
-        h("span", null, h("i", { style: { borderColor: K.N } }), "other makers"),
-        h("span", null, h("i", { style: { borderColor: K.M, borderStyle: "dashed" } }), "order the replay no longer holds"),
-        h("span", { className: "cx-src" }, "Data: analysis/cancel_trace.py, held66, commit 'user_orders: parse without caching'")));
-  }
-  window.CancelView = CancelView;
+  const WHY = {
+    what: "Contested trades are where in-block ordering decides who fills, so they are the trades the project's counterfactual depends on.",
+    process: "Every step has to land on the same order the chain used, or a different maker gets the fill.",
+    after: "These 21 are the cancels-first effect itself: listing order lets the taker in before the cancel.",
+    other: "The cancel was right; what breaks is where the maker's new order sits in the queue.",
+    gone: "The cancel is fine; the replay's book had already drifted before this block.",
+    wrongid: "Order ids aren't public for orders placed in the window, so an estimate can land on the wrong order.",
+    rejected: "A wrong admission decision earlier shows up later as an unmatched cancel.",
+    exactgone: "Same root cause as the drifted cloid case, reached through the id path.",
+  };
+  window.CANCEL_SCENES = scenes.map(sc => ({
+    t: sc.count ? `${sc.title} (${sc.count} of ${TOTAL})` : sc.title,
+    C: ({ s }) => h(Draw, { sc, step: s }),
+    why: WHY[sc.id],
+    steps: sc.steps.map(x => x.cap),
+  }));
+
 })();
