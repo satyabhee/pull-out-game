@@ -312,15 +312,32 @@ _FILE_CACHE_MAX = 32
 
 
 class _RecorderFile:
-    """One recorder file read once: raw lines, their receive times, and lines parsed so far."""
+    """One recorder file read once: raw lines, their receive times, and lines parsed so far.
+    span=(lo, hi): keep only lines whose receive time is in [lo, hi] (and lines without one), so a ranged read
+    holds minutes of an hour file, not all of it (an hour of user_orders is ~0.8 GB of text). span=None: every line."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, span: tuple[int, int] | None = None):
+        self.span = span
+        lo, hi = span if span is not None else (None, None)
+        self.lines, self.recv = [], []
         with _open_text(path) as f:
-            self.lines = [ln for ln in (x.strip() for x in f) if ln]
-        self.recv: list[int | None] = [self._recv(ln) for ln in self.lines]
+            for x in f:
+                ln = x.strip()
+                if not ln:
+                    continue
+                r = self._recv(ln)
+                if span is not None and r is not None and not lo <= r <= hi:
+                    continue
+                self.lines.append(ln)
+                self.recv.append(r)
         known = [r for r in self.recv if r is not None]
         self.sorted = len(known) == len(self.recv) and all(a <= b for a, b in zip(known, known[1:]))
         self.parsed: dict[int, dict | None] = {}
+
+    def covers(self, lo: int | None, hi: int | None) -> bool:
+        if self.span is None:
+            return True
+        return lo is not None and self.span[0] <= lo and hi <= self.span[1]
 
     @staticmethod
     def _recv(line: str) -> int | None:
@@ -349,6 +366,9 @@ class _RecorderFile:
         return [i for i, r in enumerate(self.recv) if r is None or lo <= r <= hi]
 
 
+SPAN_PAD_MS = 120_000          # a ranged load keeps this much extra on each side (neighbouring reads hit the cache)
+
+
 _file_cache: "OrderedDict[Path, tuple[tuple[int, int], _RecorderFile]]" = OrderedDict()
 
 
@@ -358,15 +378,16 @@ def clear_caches() -> None:
     _window_cache.clear()
 
 
-def _recorder_file(path: Path) -> _RecorderFile:
-    """Per-process cache keyed by path; reloaded when the file's size or mtime changes (the open hour)."""
+def _recorder_file(path: Path, lo: int | None = None, hi: int | None = None) -> _RecorderFile:
+    """Per-process cache keyed by path; reloaded when the file's size or mtime changes (the open hour) or the
+    cached span does not cover [lo, hi] (lo None = the whole file)."""
     st = path.stat()
     sig = (st.st_size, st.st_mtime_ns)
     hit = _file_cache.get(path)
-    if hit is not None and hit[0] == sig:
+    if hit is not None and hit[0] == sig and hit[1].covers(lo, hi):
         _file_cache.move_to_end(path)
         return hit[1]
-    rf = _RecorderFile(path)
+    rf = _RecorderFile(path, None if lo is None else (lo - SPAN_PAD_MS, hi + SPAN_PAD_MS))
     _file_cache[path] = (sig, rf)
     _file_cache.move_to_end(path)
     while len(_file_cache) > _FILE_CACHE_MAX:
@@ -378,9 +399,9 @@ def _records(path: Path, t0_ms: int | None = None, t1_ms: int | None = None) -> 
     """Parsed lines of one recorder file in file order; with t0/t1, only lines whose receive time is in
     [t0 - RECV_SKEW_MS, t1 + RECV_LAG_MS] (lines without a receive time are always kept).
     The dicts are shared through the cache: callers must not modify them."""
-    rf = _recorder_file(path)
     lo = None if t0_ms is None else t0_ms - RECV_SKEW_MS
     hi = None if t1_ms is None else t1_ms + RECV_LAG_MS
+    rf = _recorder_file(path, lo, None if lo is None else hi)
     for i in rf.indices(lo, hi):
         rec = rf.get(i)
         if rec is not None:
