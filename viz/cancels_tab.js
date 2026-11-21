@@ -81,14 +81,17 @@
   }
 
   scenes.push(fail({
-    id: "after", chip: "Cancel after the taker", title: "The block lists the cancel after the taker", count: 21, failAt: 0, after: "ok",
-    block: [["a", "M", "c2"], ["t", "T"], ["c", "M", "c1"]],
-    chain0: [["m1", "M", "c1"], ["r", "R"]], replay0: [["m1", "M", "c1"], ["r", "R"]],
-    input: "M's order c1 rests at the head. The block lists the taker before M's cancel.",
-    run: [{ stage: 0, at: 1, cap: "1 · Order. Listing order runs the taker first, while c1 is still at the head." }],
-    chainEnd: [["r", "R", "", "hit"], ["m2", "M", "c2"]], replayEnd: [["m1", "M", "c1", "hit"], ["r", "R"], ["m2", "M", "c2"]],
-    outcome: "The replay fills M's c1. On chain R got the fill, which is what happens if cancels run before takers inside a block, the rule this project studies. Steps 2 to 4 work, but too late. A cancels-first order of actions (the class policy) would apply M's cancel first.",
-    failNote: "wrong order of actions",
+    id: "after", chip: "Cancel after the taker", title: "The block lists the cancel after the taker", count: 21, failAt: 4,
+    block: [["t", "T"], ["c", "M", "c9"]],
+    chain0: [["r", "R"], ["m1", "M", "c1"]], replay0: [["m1", "M", "c1"], ["r", "R"]],
+    input: "M's order c1 rests at the price. The block lists the taker, then a cancel from M naming another of M's orders, c9. On chain R is ahead of c1; in the replay c1 is ahead of R.",
+    run: [
+      { stage: 0, at: 0, cap: "1 · Order. The taker runs first. It looks like a cancel-ordering problem, but the cancel names c9, not c1." },
+      { stage: 3, at: 0, cap: "2 to 4 · Running M's cancel first would remove c9 and leave c1 where it is. In 20 of the 21 traced cases the late cancel names a different order than the one that filled." },
+    ],
+    chainEnd: [["r", "R", "", "hit"], ["m1", "M", "c1"]], replayEnd: [["m1", "M", "c1", "hit"], ["r", "R"]],
+    outcome: "The replay fills c1 because c1 is at the head of its queue; on chain R was ahead. Cancel matching isn't what fails here. What fails is queue position, the same as the next scene.",
+    failNote: "M ahead of R in the queue",
   }));
 
   scenes.push(fail({
@@ -251,7 +254,7 @@
   const WHY = {
     what: "Contested trades are where in-block ordering decides who fills, so they are the trades the project's counterfactual depends on.",
     process: "Every step has to land on the same order the chain used, or a different maker gets the fill.",
-    after: "These 21 are the cancels-first effect itself: listing order lets the taker in before the cancel.",
+    after: "Running cancels first would not change these: the late cancel names another order. The fix has to come from queue position.",
     other: "The cancel was right; what breaks is where the maker's new order sits in the queue.",
     gone: "The cancel is fine; the replay's book had already drifted before this block.",
     wrongid: "Order ids aren't public for orders placed in the window, so an estimate can land on the wrong order.",
