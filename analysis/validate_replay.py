@@ -469,7 +469,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         trade_learn=None, trade_learn_at="tx", oid_guard=None, refill_position="front", oid_facts=False,
         name_prewindow=False, named_anon="front", deep_book=False,
         learn_keep_known=False, facts_exclude=(), use_bbo=True, anchor_drop_kinds=(), oid_bracket=False, p_priority=None,
-        evict_arrival=False):
+        evict_arrival=False, taker_reject=None):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     # A replay holds millions of long-lived objects (oid facts, books, placed actions); CPython's full collections
     # re-scan all of them and were ~65% of a chunk's runtime. Young generations still collect cycles; outputs are
@@ -486,7 +486,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap,
                 reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, trade_learn_at=trade_learn_at, oid_guard=oid_guard, refill_position=refill_position, oid_facts=oid_facts,
                 name_prewindow=name_prewindow and oid_facts, named_anon=named_anon, deep_book=deep_book, learn_keep_known=learn_keep_known, facts_exclude=facts_exclude,
-                use_bbo=use_bbo, anchor_drop_kinds=anchor_drop_kinds, oid_bracket=oid_bracket, engine=engine if engine is not None else Engine(stp=stp, p_priority=p_priority, evict_arrival=evict_arrival))
+                use_bbo=use_bbo, anchor_drop_kinds=anchor_drop_kinds, oid_bracket=oid_bracket, taker_reject=taker_reject, engine=engine if engine is not None else Engine(stp=stp, p_priority=p_priority, evict_arrival=evict_arrival))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -845,6 +845,9 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="keep-known: missing snapshot size goes ahead of known orders (front) or behind them")
     ap.add_argument("--oid-guard", choices=["ghost", "ratio25", "ratio50", "cap3000", "none"],
                     help="int-oid resolver preset (default ghost = data/oids defaults; none = old rule)")
+    ap.add_argument("--taker-reject", metavar="RULES", default=None,
+                    help="treat IOC takers as rejected by the chain (comma list): min10 = notional under 10 USD; "
+                         "learn = the user's last engine-filled IOC had no real trade (until a real fill)")
     ap.add_argument("--trade-learn-at", choices=["tx", "block-end"], default="tx",
                     help="when trade_learn corrections run: after each tx (default) or once at the end of the block, in "
                          "listing order (same position under every ordering policy; use for counterfactuals)")
@@ -904,7 +907,7 @@ def replay_kwargs(a) -> dict:
                 deep_book=a.deep_book, learn_keep_known=a.learn_keep_known,
                 facts_exclude=tuple(x for x in a.facts_exclude.split(",") if x), use_bbo=not a.no_bbo,
                 anchor_drop_kinds=("target",) if a.no_target_lookups else (), oid_bracket=a.oid_bracket,
-                p_priority=a.p_priority, evict_arrival=a.evict_arrival)
+                p_priority=a.p_priority, evict_arrival=a.evict_arrival, taker_reject=a.taker_reject)
 
 
 def options_tag(a) -> str:
@@ -940,7 +943,8 @@ def options_tag(a) -> str:
                     "-nobbo" if a.no_bbo else "",
                     "-notargets" if a.no_target_lookups else "", "-bracket" if a.oid_bracket else "",
                     f"-p{a.p_priority}" if a.p_priority is not None else "",
-                    "-evarr" if a.evict_arrival else ""])
+                    "-evarr" if a.evict_arrival else "",
+                    f"-trej{a.taker_reject.replace(',', '+')}" if a.taker_reject else ""])
 
 
 def main(argv=None):

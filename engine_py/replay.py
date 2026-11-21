@@ -23,6 +23,7 @@ Analyses that need more than the yielded tuple subclass `Observer`; every hook i
 from __future__ import annotations
 
 import bisect
+from decimal import Decimal
 import json
 import heapq
 from collections import Counter
@@ -203,7 +204,7 @@ class Replay:
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
                  deep_book: bool = False, deep_lookback_ms: int = 600_000, learn_keep_known: bool = False,
                  facts_exclude: tuple = (), use_bbo: bool = True, anchor_drop_kinds: tuple = (),
-                 oid_bracket: bool = False):
+                 oid_bracket: bool = False, taker_reject: str | None = None):
         """oid_bracket: reference points from the tracked users' orders on every coin + the monotone c(k) bracket
         rule in the resolver (data/oids.py).
         anchors: path to an anchors file; None = the window's anchors.json if present.
@@ -365,8 +366,15 @@ class Replay:
             raise ValueError(f"unknown refill_position {refill_position!r}")
         self.refill_position = refill_position
         self.learn_stats: Counter = Counter()
+        self.taker_reject = frozenset(x for x in (taker_reject or "").split(",") if x)
+        bad = self.taker_reject - {"min10", "learn"}
+        if bad:
+            raise ValueError(f"unknown taker_reject rules {sorted(bad)}")
+        self.taker_stats: Counter = Counter()
+        self._taker_blocked: set[str] = set()    # learn: users whose last engine-filled IOC had no real fill
+        self._blk_ioc: dict[str, tuple[str, bool]] = {}   # this block: hash -> (user, engine filled or skipped)
         self._real_trades: dict[str, list] = {}
-        if self._rules:
+        if self._rules or "learn" in self.taker_reject:
             for tr in iter_trades(self.hl_data, COINS, self.t0, self.t1):
                 if tr.hash != ZERO_HASH:
                     self._real_trades.setdefault(tr.hash, []).append(tr)
@@ -788,6 +796,31 @@ class Replay:
                 self.learn_stats[f"queue_{kind}_lots:{coin}"] += nd.remaining
                 eng._remove(nd.order.oid)
 
+    def _taker_skip(self, p: Place) -> str | None:
+        """taker_reject: why this IOC is treated as rejected by the chain (None = apply it).
+        min10: notional (limit px x size) under 10 USD, Hyperliquid's minimum order value.
+        learn: the user's last IOC that filled in the engine had no real trade (and no real fill since)."""
+        if "min10" in self.taker_reject:
+            a = ASSETS[p.asset]
+            if Decimal(a.ticks_to_px(p.px)) * Decimal(a.lots_to_sz(p.sz)) < 10:
+                return "skip_min10"
+        if "learn" in self.taker_reject and p.user in self._taker_blocked:
+            return "skip_learn"
+        return None
+
+    def _taker_learn(self) -> None:
+        """taker_reject learn, once per block from that block's real trades (policy-independent): a real fill
+        for a user's tx unblocks the user; an engine-filled (or skipped) IOC with no real trade blocks them."""
+        for h, (user, _) in sorted(self._blk_ioc.items()):
+            if self._real_trades.get(h):
+                if user in self._taker_blocked:
+                    self.taker_stats["unblock"] += 1
+                self._taker_blocked.discard(user)
+            elif user not in self._taker_blocked:
+                self._taker_blocked.add(user)
+                self.taker_stats["block"] += 1
+        self._blk_ioc.clear()
+
     def _learn(self, tx_hash: str) -> None:
         """trade_learn: correct the book from this tx's real trades (see __init__)."""
         trades = self._real_trades.get(tx_hash)
@@ -998,6 +1031,12 @@ class Replay:
 
     def _apply(self, block: Block, action: Action) -> tuple[list[Fill], list[Reject]]:
         self.observer.before_action(self, block, action)
+        if self.taker_reject and isinstance(action, Place) and action.tif is Tif.IOC:
+            skip = self._taker_skip(action)
+            if skip:
+                self.taker_stats[skip] += 1
+                self._blk_ioc[action.hash] = (action.user, True)
+                return [], []
         before = self.engine.next_oid
         self._block = block
         self.engine.block_time_ms = block.time_ms
@@ -1014,6 +1053,8 @@ class Replay:
                 self.resolver.note(action, created)
             if self.placeholder_queue == "behind":
                 self._placeholders_behind(created, action.asset)
+        if self.taker_reject and isinstance(action, Place) and action.tif is Tif.IOC and fills:
+            self._blk_ioc[action.hash] = (action.user, True)
         if isinstance(action, OutsideFill):
             self.outside_fill_log.append((block.height, action.tid, action.sz - sum(f.sz for f in fills)))
         self.observer.after_action(self, block, action, fills, rejects, created)
@@ -1058,6 +1099,8 @@ class Replay:
                     if a.hash not in done:
                         done.add(a.hash)
                         self._learn(a.hash)
+            if "learn" in self.taker_reject:
+                self._taker_learn()
             eng.end_block(b.height, b.time_ms)
             minute = self.minute(b.time_ms)
             self.observer.after_block(self, b, minute)
