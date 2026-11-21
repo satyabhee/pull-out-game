@@ -824,7 +824,7 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="with --reseed: keep known orders at each snapshot, refill missing size at the front")
     ap.add_argument("--skip-lead-in", action="store_true", help="lead-in chunks: replay only the scored part")
     ap.add_argument("--lead-in-keep", type=int, default=None, help="measurement: replay only the last N lead-in blocks")
-    ap.add_argument("--touch-evict", choices=["oldest", "newest"], default="oldest",
+    ap.add_argument("--touch-evict", choices=["oldest", "newest", "ledger"], default="oldest",
                     help="touch reconcile: which known orders go first when our touch level exceeds bbo")
     ap.add_argument("--snapshot-shift", type=int, default=0, help="triage H4: apply snapshots k blocks later (<0 earlier)")
     ap.add_argument("--outside-position", choices=["end", "start"], default="end", help="triage H7")

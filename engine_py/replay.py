@@ -382,7 +382,7 @@ class Replay:
         if touch_refill not in (None, "front", "back"):
             raise ValueError(f"unknown touch_refill {touch_refill!r}")
         self.touch_refill = touch_refill
-        if touch_evict not in ("oldest", "newest"):
+        if touch_evict not in ("oldest", "newest", "ledger"):
             raise ValueError(f"unknown touch_evict {touch_evict!r}")
         self.touch_evict = touch_evict
         self.touch_reconcile, self.touch_n_cap = touch_reconcile or touch_refill is not None, touch_n_cap
@@ -877,8 +877,10 @@ class Replay:
                 continue
             _, bid, ask = latest
             bids, asks = [bid[:2]] if bid else [], [ask[:2]] if ask else []
-            res = eng.reconcile(asset, bids, asks, known=self.touch_evict)
             name = ASSETS[asset].name
+            if self.touch_evict == "ledger":
+                bids, asks = self._ledger_touch(asset, Side.BUY, bid, name), self._ledger_touch(asset, Side.SELL, ask, name)
+            res = eng.reconcile(asset, bids, asks, known="oldest" if self.touch_evict == "ledger" else self.touch_evict)
             if self.touch_refill is not None:
                 first = eng.next_oid
                 res.update(eng.refill(asset, bids, asks))
@@ -909,6 +911,47 @@ class Replay:
                             eng.evict(nd.order.oid)
                             self.touch_reconciled[(name, "n_capped")] += 1
                             extra -= 1
+
+    LEDGER_MAX_K = 3          # most orders the ledger rule removes from one touch level per block
+    LEDGER_MAX_ORDERS = 60
+
+    def _ledger_touch(self, asset: int, side: Side, lvl, name: str) -> list:
+        """touch_evict="ledger": the bbo gives the touch level's exact size and order count (px, sz, n). If our level
+        there holds only known orders, k = (ours - n) > 0 of them must be gone; when exactly one set of k orders sums
+        to the size excess, remove that set (and only then). Returns the level to hand to reconcile: the real one for
+        better prices (everything better than the touch goes), but never trimming the touch level itself further."""
+        if lvl is None:
+            return []
+        px, sz, n = lvl
+        level = self.engine.books[asset].side(side).get(px)
+        if level is None:
+            return [(px, sz)]
+        nodes = list(level)
+        st = self.touch_reconciled
+        if any(nd.order.user == PLACEHOLDER for nd in nodes):
+            st[(name, "ledger_skip_placeholder")] += 1
+            return [(px, max(sz, level.total))]
+        k, excess = len(nodes) - n, level.total - sz
+        if k <= 0 or excess <= 0:
+            st[(name, "ledger_nothing" if k == 0 and excess == 0 else "ledger_short")] += 1
+            return [(px, max(sz, level.total))]
+        if k > self.LEDGER_MAX_K or len(nodes) > self.LEDGER_MAX_ORDERS:
+            st[(name, "ledger_too_many")] += 1
+            return [(px, max(sz, level.total))]
+        from itertools import combinations
+        sols = []
+        for combo in combinations(range(len(nodes)), k):
+            if sum(nodes[i].remaining for i in combo) == excess:
+                sols.append(combo)
+                if len(sols) > 1:
+                    break
+        if len(sols) != 1:
+            st[(name, "ledger_none" if not sols else "ledger_ambiguous")] += 1
+            return [(px, max(sz, level.total))]
+        for i in sols[0]:
+            self.engine.evict(nodes[i].order.oid)
+        st[(name, "ledger_evicted")] += k
+        return [(px, sz)]
 
     def _apply(self, block: Block, action: Action) -> tuple[list[Fill], list[Reject]]:
         self.observer.before_action(self, block, action)

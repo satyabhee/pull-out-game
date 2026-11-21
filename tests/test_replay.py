@@ -416,3 +416,31 @@ def test_touch_evict_newest_keeps_the_older_known_order(tmp_path):
     r = Replay(*w.write(), listing, touch_reconcile=True, touch_evict="newest")
     list(r)
     assert [nd.order.user for nd in r.engine.books[0].side(Side.BUY)[ticks("60000")]] == [M]
+
+
+def test_touch_evict_ledger_removes_the_unique_order_set_that_fits_bbo(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 10, [], [("60020", "0.001")])
+    w.block([place_tx(M, "0xm1", 0, order(px="60000", sz="0.001")),
+             place_tx(N_, "0xn1", 0, order(px="60000", sz="0.002")),
+             place_tx(M, "0xm2", 0, order(px="60000", sz="0.003"))], dt_ms=0)
+    w.bbo("BTC", T0 + 50, ("60000", "0.004", 2), ("60020", "0.001", 1))   # the 0.002 order is gone
+    w.block([], dt_ms=100)
+    r = Replay(*w.write(), listing, touch_reconcile=True, touch_evict="ledger")
+    list(r)
+    lv = r.engine.books[0].side(Side.BUY)[ticks("60000")]
+    assert [(nd.order.user, nd.remaining) for nd in lv] == [(M, lots("0.001")), (M, lots("0.003"))]
+    assert r.touch_reconciled[("BTC", "ledger_evicted")] == 1
+
+
+def test_touch_evict_ledger_abstains_when_ambiguous(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 10, [], [("60020", "0.001")])
+    w.block([place_tx(M, "0xm1", 0, order(px="60000", sz="0.001")),
+             place_tx(N_, "0xn1", 0, order(px="60000", sz="0.001"))], dt_ms=0)
+    w.bbo("BTC", T0 + 50, ("60000", "0.001", 1), ("60020", "0.001", 1))   # either could be gone
+    w.block([], dt_ms=100)
+    r = Replay(*w.write(), listing, touch_reconcile=True, touch_evict="ledger")
+    list(r)
+    assert r.engine.books[0].side(Side.BUY)[ticks("60000")].total == lots("0.002")
+    assert r.touch_reconciled[("BTC", "ledger_ambiguous")] >= 1
