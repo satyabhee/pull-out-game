@@ -8,6 +8,8 @@ Per block it records the EXTERNAL inputs the corrections read (audit P2-P7, over
   learn  : the set of (tx hash, real trade tids) trade_learn corrects from in that block - mid-block real trades
 and, separately, POLICY-DEPENDENT facts that are expected to differ (not part of the input digest):
   learn_order: the order in which trade_learn corrections run inside the block.
+With --trade-learn-at block-end it also requires: no book action after any correction in a block (no mid-block
+correction) and an identical correction order under every policy.
 Inputs must be byte-identical per block (sha256 of a canonical repr). Also reports, per policy, whether any
 non-outside action is ever applied after an outside fill in the same block (P6 cannot reach same-block takers).
 
@@ -83,6 +85,7 @@ def _learn(self, tx_hash):
     h = self.blocks[self.block_index].height
     CURRENT.inputs[h].setdefault("learn", set()).add((tx_hash, tuple(sorted(t.tid for t in trades))))
     CURRENT.learn_order[h].append(tx_hash)
+    CURRENT.seq[h].append("L")                          # a correction, in the block's apply sequence
     return _orig_learn(self, tx_hash)
 
 
@@ -145,12 +148,19 @@ def main(argv=None):
                 print(f"  FIRST DIFFS: {diff[:10]}")
             print(f"  trade_learn: blocks with corrections {learn_blocks}; blocks where correction ORDER differs "
                   f"{order_diff} (expected: policy-dependent)")
+            mid = {q: sum(1 for s in recs[q].seq.values() if "L" in s and "A" in s[s.index("L"):]) for q in (base, p)}
+            print(f"  trade_learn mid-block: blocks where a book action follows a correction "
+                  f"[{base}] {mid[base]} [{p}] {mid[p]}")
+            if kw.get("trade_learn_at") == "block-end" and (order_diff or mid[base] or mid[p]):
+                all_ok = False
+                print("  FAIL: --trade-learn-at block-end, but corrections are mid-block or their order depends on the policy")
         for p in pols:
             after = sum(1 for h, s in recs[p].seq.items() if "O" in s and "A" in s[s.index("O"):])
             with_out = sum(1 for s in recs[p].seq.values() if "O" in s)
             print(f"  P6 [{p}]: blocks with outside fills {with_out}; blocks where a book action follows an "
                   f"outside fill {after}")
-    print("RESULT", "PASS (inputs identical)" if all_ok else "FAIL (inputs differ)")
+    print("RESULT", "PASS (inputs identical" + (", corrections only at block end)" if kw.get("trade_learn_at") == "block-end" else ")")
+          if all_ok else "FAIL")
     return 0 if all_ok else 1
 
 
