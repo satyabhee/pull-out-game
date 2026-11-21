@@ -1,0 +1,229 @@
+"""Trace contested wrong-maker failures where the engine's maker cancelled in the same block (measurement only).
+
+For every target tx (contested, strict recall 0, right price, a different KNOWN maker than the chain), re-run its
+chunk and record, for each cancel the engine maker sent on that asset in that block before the taker:
+  - what it named (cloid / hl oid) and what the engine did with it (removed which order, or nothing and why);
+  - the order that took the fill instead (its cloid, when it was placed, by which action).
+Each case is classified by the step of the cancel -> order matching where it parts from the filled order.
+
+usage: python -m analysis.cancel_trace <validate_chunks variant dir> <ref variant dir> <chunk parent> --hl-data DIR
+       [replay flags as for validate_replay] [--out FILE.json]
+"""
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+from analysis import validate_replay as vr
+from analysis.contested import ASSET_OF, load
+from analysis.contested_paired import scope_of
+from engine_py.matching import PLACEHOLDER
+from engine_py.types import Cancel, CancelByCloid, Modify, Place
+
+
+def fills_of(field: str):
+    out = []
+    for part in field.split(";"):
+        b = part.strip().split()
+        if len(b) == 2 and "@" in b[0]:
+            sz, px = b[0].split("@")
+            out.append((float(px), float(sz), b[1][:10]))
+    return out
+
+
+def targets(var_dir: Path, ref_dir: Path, chunks: Path) -> list[dict]:
+    sc = scope_of(load(ref_dir), chunks, False)
+    rows = {(r["chunk"], r["hash"]): r for r in load(var_dir)}
+    out = []
+    for k, c in sc.items():
+        r = rows.get(k)
+        if not c or r is None or int(r["real_notional"]) <= 0 or int(r["matched_notional_full"]) > 0:
+            continue
+        real, eng = fills_of(r["real"]), fills_of(r["engine"])
+        if not eng or {e[0] for e in eng} != {x[0] for x in real} or all(e[2].startswith("placeholde") for e in eng):
+            continue
+        out.append({"chunk": r["chunk"], "hash": r["hash"], "block": int(r["block"]), "coin": r["coin"],
+                    "real": r["real"], "engine": r["engine"]})
+    return out
+
+
+class TraceObserver(vr.ValidateObserver):
+    targets: dict = {}          # hash -> target dict (set per chunk)
+    blocks: set = set()
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.placements = defaultdict(list)      # (user, asset, cloid) -> [(block, engine oid | None, tif)]
+        self.removed_by: dict[int, tuple] = {}   # engine oid -> (block, what removed it)
+        self.events = defaultdict(list)          # block -> [event dict] (cancels, fills) in apply order
+        self._patched = False
+        self._current = None
+
+    def _patch(self, rp):
+        eng = rp.engine
+        real_remove = eng._remove
+        obs = self
+
+        def _remove(oid):
+            a = obs._current
+            what = ("cancel_cloid" if isinstance(a, CancelByCloid) else "cancel_oid" if isinstance(a, Cancel)
+                    else "modify" if isinstance(a, Modify) else type(a).__name__ if a is not None else "between_actions")
+            obs.removed_by[oid] = (rp._block.height if getattr(rp, "_block", None) else None, what)
+            return real_remove(oid)
+        eng._remove = _remove
+        real_evict = eng.evict
+
+        def evict(oid):
+            out = real_evict(oid)
+            obs.removed_by[oid] = (getattr(getattr(rp, "_block", None), "height", None),
+                                   "evicted (gate / touch ledger / reconcile)")
+            return out
+        eng.evict = evict
+        self._patched = True
+
+    def before_action(self, rp, block, a):
+        if not self._patched:
+            self._patch(rp)
+        self._current = a
+        self._removed_before = set(self.removed_by)
+        super().before_action(rp, block, a)
+        if block.height not in self.blocks:
+            return
+        if isinstance(a, CancelByCloid) or (isinstance(a, Modify) and isinstance(a.target, str)):
+            cl = a.cloid if isinstance(a, CancelByCloid) else a.target
+            held = list(rp.engine.by_cloid.get((a.user, a.asset, cl), []))
+            self.events[block.height].append({"kind": "cancel_cloid", "user": a.user, "asset": a.asset,
+                                              "hash": a.hash, "cloid": cl, "held": held,
+                                              "seen": list(self.placements.get((a.user, a.asset, cl), []))})
+        elif isinstance(a, Cancel) or (isinstance(a, Modify) and isinstance(a.target, int)):
+            oid = a.oid if isinstance(a, Cancel) else a.target
+            self.events[block.height].append({"kind": "cancel_oid", "user": a.user, "asset": a.asset,
+                                              "hash": a.hash, "hl_oid": oid})
+
+    def after_action(self, rp, block, a, fills, rejects, created):
+        super().after_action(rp, block, a, fills, rejects, created)
+        self._current = None
+        p = a.new if isinstance(a, Modify) else a
+        if isinstance(p, Place) and p.cloid is not None:
+            self.placements[(a.user, p.asset, p.cloid)].append((block.height, created, p.tif.name))
+        if block.height not in self.blocks:
+            return
+        ev = self.events[block.height]
+        if ev and ev[-1]["hash"] == a.hash and ev[-1]["kind"].startswith("cancel") and "outcome" not in ev[-1]:
+            e = ev[-1]
+            e["removed"] = sorted(set(self.removed_by) - self._removed_before)
+            e["outcome"] = "removed" if not rejects else "nothing"
+            if e["kind"] == "cancel_oid" and rp.resolver is not None:
+                e["resolver"] = rp.resolver._last_reason or ("resolved" if rp.resolver.last is not None else None)
+                e["resolved_to"] = rp.resolver.last
+        if a.hash in self.targets and fills:
+            for f in fills:
+                if f.maker_user == PLACEHOLDER:
+                    continue
+                pl = rp.placed.get(f.maker_order)
+                by = rp.placed_by.get(f.maker_order)
+                ev.append({"kind": "fill", "hash": a.hash, "maker": f.maker_user, "engine_oid": f.maker_order,
+                           "cloid": getattr(pl, "cloid", None), "px": f.px,
+                           "placed_block": getattr(by, "block", None), "placed_hash": getattr(by, "hash", None),
+                           "placed_tif": pl.tif.name if pl is not None else None})
+
+    def _already(self, height, e):
+        seen = set()
+        for x in self.events[height]:
+            if x is e:
+                break
+            seen.update(x.get("removed", []))
+        return seen
+
+
+def classify(case: dict) -> tuple[str, str]:
+    """(scenario, step it fails at) for one traced target."""
+    fills = [e for e in case["events"] if e["kind"] == "fill"]
+    if not fills:
+        return "no engine fill traced", "-"
+    f = fills[0]
+    mine = [e for e in case["events"] if e["kind"].startswith("cancel") and e["user"] == f["maker"]
+            and e["asset"] == case["asset"] and e["pos"] < f["pos"]]
+    if not mine:
+        return "maker's cancel came after the taker", "1 order"
+    for e in mine:
+        if e["kind"] == "cancel_cloid" and f["cloid"] is not None and e["cloid"] == f["cloid"]:
+            return "cancel named the filled order's cloid but it survived", "3 remove"
+    if f["cloid"] is None and all(e["kind"] == "cancel_cloid" for e in mine):
+        if any(e["held"] for e in mine):
+            return "cloid cancel removed another order; the filled order has no cloid", "2 look up"
+        return "cloid cancel matched nothing; the filled order has no cloid", "2 look up"
+    cl = [e for e in mine if e["kind"] == "cancel_cloid"]
+    if cl and all(not e["held"] for e in cl):
+        seen = [s for e in cl for s in e["seen"]]
+        if not seen:
+            return "cloid never placed in the window (order predates it)", "2 look up"
+        if all(s[1] is None for s in seen):
+            return "cloid's placement was rejected by our engine", "2 look up"
+        return "cloid's order already gone from our book", "2 look up"
+    if cl and any(e["held"] for e in cl):
+        return "cloid cancel removed a different order of the maker", "4 which order"
+    oc = [e for e in mine if e["kind"] == "cancel_oid"]
+    reasons = Counter(e.get("resolver") for e in oc)
+    if any(e.get("resolved_to") not in (None, f["engine_oid"]) for e in oc):
+        return "oid cancel resolved to a different order", "3 resolve oid"
+    r = reasons.most_common(1)[0][0] if reasons else None
+    return f"oid cancel unresolved ({r})", "3 resolve oid"
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("var_dir")
+    ap.add_argument("ref_dir")
+    ap.add_argument("chunks")
+    ap.add_argument("--out", default=None)
+    vr.add_replay_args(ap)
+    a = ap.parse_args(argv)
+    tg = targets(Path(a.var_dir), Path(a.ref_dir), Path(a.chunks))
+    # keep the ones whose engine maker sent a cancel on that asset in that block
+    keep = []
+    for t in tg:
+        b = json.load(gzip.open(Path(a.chunks) / t["chunk"] / f"{t['block']}.json.gz"))["blockDetails"]
+        em = {e[2] for e in fills_of(t["engine"]) if not e[2].startswith("placeholde")}
+        asset = ASSET_OF[t["coin"]]
+        if any(x["user"].lower()[:10] in em and not x.get("error") and x["action"].get("type") in ("cancel", "cancelByCloid")
+               for x in b["txs"]):
+            t["asset"] = asset
+            keep.append(t)
+    print(f"{len(tg)} wrong-maker contested txs, {len(keep)} with the engine maker cancelling in the block", file=sys.stderr)
+    kw = vr.replay_kwargs(a)
+    cases = []
+    by_chunk = defaultdict(list)
+    for t in keep:
+        by_chunk[t["chunk"]].append(t)
+    for chunk, ts in sorted(by_chunk.items()):
+        TraceObserver.targets = {t["hash"]: t for t in ts}
+        TraceObserver.blocks = {t["block"] for t in ts}
+        holder = {}
+
+        class Obs(TraceObserver):
+            def __init__(self, *x, **y):
+                super().__init__(*x, **y)
+                holder["obs"] = self
+        vr.run(Path(a.chunks) / chunk, a.hl_data, a.policy, out_dir=None, quiet=True, observer_cls=Obs, **kw)
+        obs = holder["obs"]
+        for t in ts:
+            evs = obs.events.get(t["block"], [])
+            for i, e in enumerate(evs):
+                e["pos"] = i
+            case = {**t, "events": [{k: v for k, v in e.items() if not k.startswith("_")} for e in evs]}
+            case["scenario"], case["step"] = classify(case)
+            cases.append(case)
+    c = Counter((x["step"], x["scenario"]) for x in cases)
+    for (step, sc), n in sorted(c.items()):
+        print(f"{n:4d}  [{step}] {sc}")
+    if a.out:
+        Path(a.out).write_text(json.dumps(cases, indent=1, default=str))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

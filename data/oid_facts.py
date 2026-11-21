@@ -139,7 +139,7 @@ def stream_orders_all(window_dir, hl_data, recorder_margin_ms: int = 60_000) -> 
         return out
     lo, hi = t0 - recorder_margin_ms, t1 + recorder_margin_ms
     for path in _hour_files(Path(hl_data), "user_orders", lo, hi):
-        for r in _records(path, lo, hi):
+        for r in _records(path, lo, hi, keep_parsed=False):
             m = r.get("msg") or {}
             user = (m.get("user") or "").lower()
             for x in m.get("data") or []:
@@ -214,7 +214,7 @@ def load(window_dir, hl_data=None, recorder_margin_ms: int = 60_000, exclude=())
         if t0 is not None:
             lo, hi = t0 - recorder_margin_ms, t1 + recorder_margin_ms
             for path in ([] if "ws_orders" in exclude else _hour_files(Path(hl_data), "user_orders", lo, hi)):
-                for r in _records(path, lo, hi):
+                for r in _records(path, lo, hi, keep_parsed=False):
                     m = r.get("msg") or {}
                     for x in m.get("data") or []:
                         raw, user = (x or {}).get("order", {}), m.get("user", "")

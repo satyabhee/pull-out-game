@@ -349,14 +349,17 @@ class _RecorderFile:
         except ValueError:
             return None                                   # cut mid-number: the full parse will fail too
 
-    def get(self, i: int) -> dict | None:
-        if i not in self.parsed:
-            try:
-                self.parsed[i] = _loads(self.lines[i])
-            except json.JSONDecodeError:
-                # the open hour's last line can be cut mid-write; anything else is real
-                self.parsed[i] = None
-        return self.parsed[i]
+    def get(self, i: int, keep: bool = True) -> dict | None:
+        if i in self.parsed:
+            return self.parsed[i]
+        try:
+            rec = _loads(self.lines[i])
+        except json.JSONDecodeError:
+            # the open hour's last line can be cut mid-write; anything else is real
+            rec = None
+        if keep:
+            self.parsed[i] = rec
+        return rec
 
     def indices(self, lo: int | None, hi: int | None) -> range | list[int]:
         if lo is None:
@@ -395,15 +398,16 @@ def _recorder_file(path: Path, lo: int | None = None, hi: int | None = None) -> 
     return rf
 
 
-def _records(path: Path, t0_ms: int | None = None, t1_ms: int | None = None) -> Iterator[dict]:
+def _records(path: Path, t0_ms: int | None = None, t1_ms: int | None = None, keep_parsed: bool = True) -> Iterator[dict]:
     """Parsed lines of one recorder file in file order; with t0/t1, only lines whose receive time is in
     [t0 - RECV_SKEW_MS, t1 + RECV_LAG_MS] (lines without a receive time are always kept).
-    The dicts are shared through the cache: callers must not modify them."""
+    The dicts are shared through the cache: callers must not modify them. keep_parsed=False: parse without caching
+    the dicts (user_orders: ~1 GB of parsed messages per chunk that callers reduce to compact facts at once)."""
     lo = None if t0_ms is None else t0_ms - RECV_SKEW_MS
     hi = None if t1_ms is None else t1_ms + RECV_LAG_MS
     rf = _recorder_file(path, lo, None if lo is None else hi)
     for i in rf.indices(lo, hi):
-        rec = rf.get(i)
+        rec = rf.get(i, keep_parsed)
         if rec is not None:
             yield rec
 
