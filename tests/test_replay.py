@@ -444,3 +444,16 @@ def test_touch_evict_ledger_abstains_when_ambiguous(tmp_path):
     list(r)
     assert r.engine.books[0].side(Side.BUY)[ticks("60000")].total == lots("0.002")
     assert r.touch_reconciled[("BTC", "ledger_ambiguous")] >= 1
+
+
+def test_unique_subset_matches_brute_force():
+    import random
+    from itertools import combinations
+    from engine_py.replay import unique_subset
+    rnd = random.Random(7)
+    for _ in range(1500):
+        m = rnd.randint(0, 9)
+        sz = [rnd.randint(1, 6) for _ in range(m)]
+        k, tgt = rnd.randint(0, m), rnd.randint(0, sum(sz) + 1)
+        sols = [c for c in combinations(range(m), k) if sum(sz[i] for i in c) == tgt]
+        assert unique_subset(sz, k, tgt) == ("none" if not sols else "ambiguous" if len(sols) > 1 else sols[0])

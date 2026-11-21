@@ -147,6 +147,44 @@ class Observer:
         """reseed=True only: called before the asset's book is reconciled and rebuilt from `snapshot`."""
 
 
+def unique_subset(sizes: list[int], k: int, target: int, budget: int = 300_000):
+    """The one set of exactly k indices whose sizes sum to target (sizes > 0), as a sorted tuple; else "none",
+    "ambiguous", or "budget" (more than `budget` partial states). Exact DP over (count, sum) with ways capped at 2,
+    sums above the target pruned; searches the complement (len - k items summing to total - target) when smaller."""
+    m = len(sizes)
+    if not 0 <= k <= m:
+        return "none"
+    flip = m - k < k
+    kk, tt = (m - k, sum(sizes) - target) if flip else (k, target)
+    layers = [{(0, 0): 1}]
+    states = 1
+    for x in sizes:
+        prev = layers[-1]
+        cur = dict(prev)
+        for (c, sm), w in prev.items():
+            if c < kk and sm + x <= tt:
+                key = (c + 1, sm + x)
+                cur[key] = min(2, cur.get(key, 0) + w)
+        states += len(cur)
+        if states > budget:
+            return "budget"
+        layers.append(cur)
+    w = layers[-1].get((kk, tt), 0)
+    if w == 0:
+        return "none"
+    if w > 1:
+        return "ambiguous"
+    picked, c, sm = [], kk, tt                    # walk back: item i is in iff the state is unreachable without it
+    for i in range(m - 1, -1, -1):
+        if layers[i].get((c, sm), 0):
+            continue
+        picked.append(i)
+        c, sm = c - 1, sm - sizes[i]
+    chosen = set(picked)
+    out = sorted(set(range(m)) - chosen) if flip else sorted(chosen)
+    return tuple(out)
+
+
 class Replay:
     def __init__(self, window_dir, hl_data, policy: Policy, *, anchors=None, use_resolver: bool = True,
                  nearest_ratio: int = 0, check_permutation: bool = True, hasher: Hasher | None = None,
@@ -939,20 +977,11 @@ class Replay:
         if k > self.ledger_k or len(nodes) > self.LEDGER_MAX_ORDERS:
             st[(name, "ledger_too_many")] += 1
             return [(px, max(sz, level.total))]
-        from itertools import combinations
-        sols, tried = [], 0
-        for combo in combinations(range(len(nodes)), k):
-            tried += 1
-            if tried > self.LEDGER_BUDGET:
-                st[(name, "ledger_budget")] += 1
-                return [(px, max(sz, level.total))]
-            if sum(nodes[i].remaining for i in combo) == excess:
-                sols.append(combo)
-                if len(sols) > 1:
-                    break
-        if len(sols) != 1:
-            st[(name, "ledger_none" if not sols else "ledger_ambiguous")] += 1
+        got = unique_subset([nd.remaining for nd in nodes], k, excess, self.LEDGER_BUDGET)
+        if not isinstance(got, tuple):
+            st[(name, f"ledger_{got}")] += 1
             return [(px, max(sz, level.total))]
+        sols = [got]
         for i in sols[0]:
             self.engine.evict(nodes[i].order.oid)
         st[(name, "ledger_evicted")] += k
