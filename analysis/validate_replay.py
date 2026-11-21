@@ -879,7 +879,7 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
 
 
 def _p_priority_arg(v: str):
-    return v if v in ("always", "known") else int(v)
+    return v if v in ("always", "known", "knownpos") else int(v)
 
 
 def replay_kwargs(a) -> dict:

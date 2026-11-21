@@ -74,6 +74,15 @@ class TraceObserver(vr.ValidateObserver):
                     else "modify" if isinstance(a, Modify) else type(a).__name__ if a is not None else "between_actions")
             obs.removed_by[oid] = (rp._block.height if getattr(rp, "_block", None) else None, what)
             return real_remove(oid)
+        real_forget = eng._forget
+
+        def _forget(order):
+            if order.oid not in obs.removed_by:          # left the book by a full fill (reduce to 0), not a removal
+                a = obs._current
+                obs.removed_by[order.oid] = (getattr(getattr(rp, "_block", None), "height", None),
+                                             "filled" if a is not None else "end_block (schedule cancel / expiry)")
+            return real_forget(order)
+        eng._forget = _forget
         eng._remove = _remove
         real_evict = eng.evict
 
@@ -93,12 +102,32 @@ class TraceObserver(vr.ValidateObserver):
         super().before_action(rp, block, a)
         if block.height not in self.blocks:
             return
+        pl = a.new if isinstance(a, Modify) else a
+        if a.hash in self.targets and isinstance(pl, Place) and not any(e["kind"] == "queue" and e["hash"] == a.hash
+                                                                      for e in self.events[block.height]):
+            eng, q = rp.engine, []
+            for lv in eng.books[pl.asset].levels(pl.side.opposite):
+                if not ((lv.px <= pl.px) if pl.side.name == "BUY" else (lv.px >= pl.px)):
+                    break
+                for nd in lv:
+                    o = nd.order
+                    by = rp.placed_by.get(o.oid)
+                    m = eng.p_meta.get(o.oid)
+                    q.append({"px": lv.px, "user": o.user, "oid": o.oid, "lots": nd.remaining,
+                              "placed_block": getattr(by, "block", None), "placed_tx": getattr(by, "tx_index", None),
+                              "p": None if m is None else m[0], "placeholder": o.user == PLACEHOLDER})
+                if len(q) > 40:
+                    break
+            self.events[block.height].append({"kind": "queue", "hash": a.hash, "taker_p": pl.priority,
+                                              "taker_tx": a.tx_index, "queue": q})
         if isinstance(a, CancelByCloid) or (isinstance(a, Modify) and isinstance(a.target, str)):
             cl = a.cloid if isinstance(a, CancelByCloid) else a.target
             held = list(rp.engine.by_cloid.get((a.user, a.asset, cl), []))
             self.events[block.height].append({"kind": "cancel_cloid", "user": a.user, "asset": a.asset,
                                               "hash": a.hash, "cloid": cl, "held": held,
-                                              "seen": list(self.placements.get((a.user, a.asset, cl), []))})
+                                              "seen": list(self.placements.get((a.user, a.asset, cl), [])),
+                                              "seen_removed_by": [self.removed_by.get(x[1]) for x in
+                                                                  self.placements.get((a.user, a.asset, cl), []) if x[1] is not None]})
         elif isinstance(a, Cancel) or (isinstance(a, Modify) and isinstance(a.target, int)):
             oid = a.oid if isinstance(a, Cancel) else a.target
             self.events[block.height].append({"kind": "cancel_oid", "user": a.user, "asset": a.asset,
@@ -142,7 +171,7 @@ class TraceObserver(vr.ValidateObserver):
 
 def classify(case: dict) -> tuple[str, str]:
     """(scenario, step it fails at) for one traced target."""
-    fills = [e for e in case["events"] if e["kind"] == "fill"]
+    fills = [e for e in case["events"] if e["kind"] == "fill" and e["hash"] == case["hash"]]
     if not fills:
         return "no engine fill traced", "-"
     f = fills[0]
@@ -175,12 +204,36 @@ def classify(case: dict) -> tuple[str, str]:
     return f"oid cancel unresolved ({r})", "3 resolve oid"
 
 
+def _trace_chunk(job) -> list[dict]:
+    chunk, hl_data, policy, kw, ts = job
+    TraceObserver.targets = {t["hash"]: t for t in ts}
+    TraceObserver.blocks = {t["block"] for t in ts}
+    holder = {}
+
+    class Obs(TraceObserver):
+        def __init__(self, *x, **y):
+            super().__init__(*x, **y)
+            holder["obs"] = self
+    vr.run(Path(chunk), hl_data, policy, out_dir=None, quiet=True, observer_cls=Obs, **kw)
+    obs, out = holder["obs"], []
+    for t in ts:
+        evs = obs.events.get(t["block"], [])
+        for i, e in enumerate(evs):
+            e["pos"] = i
+        case = {**t, "events": [{k: v for k, v in e.items() if not k.startswith("_")} for e in evs]}
+        case["scenario"], case["step"] = classify(case)
+        out.append(case)
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("var_dir")
     ap.add_argument("ref_dir")
     ap.add_argument("chunks")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--jobs", type=int, default=1)
+    ap.add_argument("--all-wrong-maker", action="store_true", help="trace every wrong-maker target, not only those with a cancel")
     vr.add_replay_args(ap)
     a = ap.parse_args(argv)
     tg = targets(Path(a.var_dir), Path(a.ref_dir), Path(a.chunks))
@@ -194,30 +247,22 @@ def main(argv=None):
                for x in b["txs"]):
             t["asset"] = asset
             keep.append(t)
+    if a.all_wrong_maker:
+        for t in tg:
+            t["asset"] = ASSET_OF[t["coin"]]
+        keep = tg
     print(f"{len(tg)} wrong-maker contested txs, {len(keep)} with the engine maker cancelling in the block", file=sys.stderr)
     kw = vr.replay_kwargs(a)
-    cases = []
     by_chunk = defaultdict(list)
     for t in keep:
         by_chunk[t["chunk"]].append(t)
-    for chunk, ts in sorted(by_chunk.items()):
-        TraceObserver.targets = {t["hash"]: t for t in ts}
-        TraceObserver.blocks = {t["block"] for t in ts}
-        holder = {}
-
-        class Obs(TraceObserver):
-            def __init__(self, *x, **y):
-                super().__init__(*x, **y)
-                holder["obs"] = self
-        vr.run(Path(a.chunks) / chunk, a.hl_data, a.policy, out_dir=None, quiet=True, observer_cls=Obs, **kw)
-        obs = holder["obs"]
-        for t in ts:
-            evs = obs.events.get(t["block"], [])
-            for i, e in enumerate(evs):
-                e["pos"] = i
-            case = {**t, "events": [{k: v for k, v in e.items() if not k.startswith("_")} for e in evs]}
-            case["scenario"], case["step"] = classify(case)
-            cases.append(case)
+    jobs = [(str(Path(a.chunks) / ch), a.hl_data, a.policy, kw, ts) for ch, ts in sorted(by_chunk.items())]
+    if a.jobs > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=a.jobs) as ex:
+            cases = [c for out in ex.map(_trace_chunk, jobs) for c in out]
+    else:
+        cases = [c for j in jobs for c in _trace_chunk(j)]
     c = Counter((x["step"], x["scenario"]) for x in cases)
     for (step, sc), n in sorted(c.items()):
         print(f"{n:4d}  [{step}] {sc}")

@@ -92,3 +92,11 @@ def test_evict_arrival_trims_oldest_arrival_not_queue_head():
         eng.apply(place("0xb", Side.SELL, 100, 1, p=9))    # queue: b, a; arrival: a, b
         eng.reconcile(0, [], [(100, 1)], known="oldest")
         assert queue(eng, 100) == left
+
+
+def test_knownpos_never_jumps_p0_orders_but_jumps_lower_positive_p():
+    eng = Engine(p_priority="knownpos")
+    eng.apply(place("0xa", Side.SELL, 100, 1))            # no grouping.p -> p 0: keeps its place
+    eng.apply(place("0xb", Side.SELL, 100, 1, p=3))
+    eng.apply(place("0xc", Side.SELL, 100, 1, p=9))       # jumps b (3 < 9), not a (p 0)
+    assert queue(eng, 100) == ["0xa", "0xc", "0xb"]
