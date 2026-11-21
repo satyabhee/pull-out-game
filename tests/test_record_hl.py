@@ -157,3 +157,17 @@ def test_users_past_the_dedicated_ones_share_one_connection(monkeypatch):
                            FakeSink())
     assert orders.got[0]["user"] == "" and orders.got[0]["shared"] == ["0xc", "0xd"]
     assert fills.got[0]["user"] == "0xd"
+
+
+def test_fast_subscriptions_route_to_fast_sinks():
+    import collect.record_hl as r
+    subs = r.fast_subscriptions(["BTC", "ETH"])
+    assert subs == [{"type": "l2Book", "coin": "BTC", "fast": True}, {"type": "l2Book", "coin": "ETH", "fast": True}]
+
+    class S(list):
+        def write(self, m):
+            self.append(m)
+    fast, other = {"BTC": S()}, S()
+    m = {"channel": "l2Book", "data": {"coin": "BTC", "time": 1, "levels": [[{"px": "1", "sz": "1", "n": 1}], []]}}
+    r.route_api(m, {}, fast, {}, other)
+    assert fast["BTC"] == [m] and other == []

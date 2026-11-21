@@ -11,6 +11,9 @@ optional extra streams (environment variables):
   book_<COIN>_sf<N>.jsonl  L2_SIGFIGS=4 (default; "" = off): l2Book aggregated to N significant figures, so the
                        20 levels per side reach much deeper than the full-precision book (own connection: the
                        messages do not say which aggregation they are)
+  book_<COIN>_fast.jsonl   L2_FAST=1 (default; 0 = off): l2Book with fast=true, 5 levels per side WITH order
+                       counts n every ~0.5 s (the plain l2Book is ~12 s apart since the June 2026 feed change). Own
+                       connection, for the same reason as sf; uses the slot freed by TRACK_DEDICATED=5.
   user_orders.jsonl    TRACK_USERS=6 (default; 0 = off): orderUpdates (every placement / cancel / fill / reject of
   user_fills.jsonl     that user, with oid) and userFills. TRACK_BY=cancels (default): the users with the most int-oid
                        cancels in capture.py's last 30 chunks (cancellers.json, used if < 1 h old; their cancels are
@@ -18,7 +21,7 @@ optional extra streams (environment variables):
                        BTC/ETH maker notional. Re-picked
   tracked_users.jsonl  every TRACK_EVERY_S=1800 s (first pick after TRACK_WARMUP_S=600 s, or TRACK_USER_LIST=a,b at
                        start). One connection per user, because orderUpdates messages carry no user; the IP allows
-                       10 connections, so api + rpc + book_sf + 6 users = 9. tracked_users.jsonl logs each set with
+                       10 connections: api + rpc + book_sf + book_fast + 5 dedicated users + 1 shared (users 6-10) = 10. tracked_users.jsonl logs each set with
                        its start time: a user's stream is complete only while they are in the set.
 
 It does NOT record transactions: the live explorer tx feed is only a ~1-in-2000 sample.
@@ -31,11 +34,12 @@ import asyncio, gzip, json, os, random, shutil, sys, time
 
 COINS = sys.argv[1:] or ["BTC"]
 L2_SIGFIGS = os.environ.get("L2_SIGFIGS", "4")
+L2_FAST = os.environ.get("L2_FAST", "1") == "1"
 TRACK_USERS = int(os.environ.get("TRACK_USERS", 6))
 # users past the first TRACK_DEDICATED share ONE extra connection (the ws limit is 10 connections and 10 unique
 # users per IP); orderUpdates carry no user, so those are written with user "" and the candidate list ("shared"),
 # and data/oid_facts attributes them by joining to the window's placements
-TRACK_DEDICATED = int(os.environ.get("TRACK_DEDICATED", 6))
+TRACK_DEDICATED = int(os.environ.get("TRACK_DEDICATED", 5))
 TRACK_EVERY_S = float(os.environ.get("TRACK_EVERY_S", 1800))
 TRACK_WARMUP_S = float(os.environ.get("TRACK_WARMUP_S", 600))
 TRACK_BY = os.environ.get("TRACK_BY", "cancels")          # cancels (capture's cancellers.json) | makers
@@ -96,6 +100,10 @@ def api_subscriptions(coins):
 
 def sigfig_subscriptions(coins, n):
     return [{"type": "l2Book", "coin": c, "nSigFigs": int(n)} for c in coins]
+
+
+def fast_subscriptions(coins):
+    return [{"type": "l2Book", "coin": c, "fast": True} for c in coins]
 
 
 def user_subscriptions(user):
@@ -234,6 +242,7 @@ async def main():
     bbos = {c: Sink(f"bbo_{c}") for c in COINS}
     blocks, other = Sink("blocks"), Sink("other")
     sf_books = {c: Sink(f"book_{c}_sf{L2_SIGFIGS}") for c in COINS} if L2_SIGFIGS else {}
+    fast_books = {c: Sink(f"book_{c}_fast") for c in COINS} if L2_FAST else {}
     orders, fills, tracked = Sink("user_orders"), Sink("user_fills"), Sink("tracked_users")
     tally = MakerTally()
 
@@ -249,12 +258,15 @@ async def main():
     if sf_books:
         jobs.append(stream(API_WS, sigfig_subscriptions(COINS, L2_SIGFIGS),
                            lambda m: route_api(m, {}, sf_books, {}, other)))
+    if fast_books:
+        jobs.append(stream(API_WS, fast_subscriptions(COINS),
+                           lambda m: route_api(m, {}, fast_books, {}, other)))
     if TRACK_USERS:
         jobs.append(track_users(tally, orders, fills, tracked, other))
     try:
         await asyncio.gather(*jobs)
     finally:
-        for s in [*trades.values(), *books.values(), *bbos.values(), *sf_books.values(), blocks, other,
+        for s in [*trades.values(), *books.values(), *bbos.values(), *sf_books.values(), *fast_books.values(), blocks, other,
                   orders, fills, tracked]:
             s.close()
 
