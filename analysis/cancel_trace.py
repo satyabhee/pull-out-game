@@ -246,6 +246,9 @@ def _trace_chunk(job) -> list[dict]:
         case["scenario"], case["step"] = classify(case)
         case["r_fate"] = r_fate(obs, t)
         out.append(case)
+    del holder, obs
+    from analysis.validate_chunks import _free_chunk_caches
+    _free_chunk_caches()                      # same per-chunk cleanup as validate_chunks (Gate 1): flat RSS
     return out
 
 
