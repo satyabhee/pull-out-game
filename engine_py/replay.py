@@ -155,7 +155,7 @@ class Replay:
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
                  keep_known: bool = False, skip_lead_in: bool = False, lead_in_keep: int | None = None,
-                 touch_evict: str = "oldest",
+                 touch_evict: str = "oldest", ledger_k: int = 3,
                  snapshot_shift: int = 0, outside_position: str = "end", outside_other_txs: bool = False,
                  other_position: str = "end",
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
@@ -385,6 +385,7 @@ class Replay:
         if touch_evict not in ("oldest", "newest", "ledger"):
             raise ValueError(f"unknown touch_evict {touch_evict!r}")
         self.touch_evict = touch_evict
+        self.ledger_k = ledger_k          # touch_evict="ledger": most orders removed from one touch level (0 = none)
         self.touch_reconcile, self.touch_n_cap = touch_reconcile or touch_refill is not None, touch_n_cap
         touch_reconcile = self.touch_reconcile
         self.touch_reconciled: Counter = Counter()  # (coin, trimmed|drift|evicted|...|n_capped) -> lots/orders
@@ -912,7 +913,7 @@ class Replay:
                             self.touch_reconciled[(name, "n_capped")] += 1
                             extra -= 1
 
-    LEDGER_MAX_K = 3          # most orders the ledger rule removes from one touch level per block
+    LEDGER_BUDGET = 300_000   # combinations tried per touch level before abstaining
     LEDGER_MAX_ORDERS = 60
 
     def _ledger_touch(self, asset: int, side: Side, lvl, name: str) -> list:
@@ -935,12 +936,16 @@ class Replay:
         if k <= 0 or excess <= 0:
             st[(name, "ledger_nothing" if k == 0 and excess == 0 else "ledger_short")] += 1
             return [(px, max(sz, level.total))]
-        if k > self.LEDGER_MAX_K or len(nodes) > self.LEDGER_MAX_ORDERS:
+        if k > self.ledger_k or len(nodes) > self.LEDGER_MAX_ORDERS:
             st[(name, "ledger_too_many")] += 1
             return [(px, max(sz, level.total))]
         from itertools import combinations
-        sols = []
+        sols, tried = [], 0
         for combo in combinations(range(len(nodes)), k):
+            tried += 1
+            if tried > self.LEDGER_BUDGET:
+                st[(name, "ledger_budget")] += 1
+                return [(px, max(sz, level.total))]
             if sum(nodes[i].remaining for i in combo) == excess:
                 sols.append(combo)
                 if len(sols) > 1:
