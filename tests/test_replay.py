@@ -359,6 +359,34 @@ def test_touch_n_cap_evicts_extra_known_orders_oldest_first(tmp_path):
     assert r.touch_reconciled[("BTC", "n_capped")] == 1
 
 
+def test_touch_refill_adds_a_missing_touch_level(tmp_path):
+    # bbo after block 0: a better ask at 60008 that we never saw placed (rested before the window)
+    w = touch_window(tmp_path, ("60000", "0.003", 1), ("60008", "0.004", 2), [])
+    r = Replay(*w.write(), listing, touch_refill="front")
+    list(r)
+    level = r.engine.books[0].side(Side.SELL)[ticks("60008")]
+    assert [(nd.order.user, nd.remaining) for nd in level] == [(PLACEHOLDER, lots("0.004"))]
+    assert r.touch_reconciled[("BTC", "refilled")] == lots("0.004")
+    assert r.engine.books[0].side(Side.SELL)[ticks("60010")].total == lots("0.001")   # deeper level kept
+
+
+def test_touch_refill_tops_up_a_level_behind_known_orders(tmp_path):
+    w = touch_window(tmp_path, ("60000", "0.003", 1), ("60010", "0.003", 2),
+                     [place_tx(M, "0xm1", 0, order(buy=False, px="60010", sz="0.001", tif="Alo"))])
+    r = Replay(*w.write(), listing, touch_refill="back")
+    list(r)
+    level = r.engine.books[0].side(Side.SELL)[ticks("60010")]
+    assert level.total == lots("0.003") and [nd.order.user for nd in level][-1] == PLACEHOLDER
+    assert [nd.order.user for nd in level][:2] == [PLACEHOLDER, M]
+
+
+def test_touch_refill_bad_mode_fails_loudly(tmp_path):
+    w = Window(tmp_path)
+    w.block([])
+    with pytest.raises(ValueError):
+        Replay(*w.write(), listing, touch_refill="middle")
+
+
 def test_gate_uses_the_bbo_touch(tmp_path):
     w = Window(tmp_path)
     w.book("BTC", T0 - 10, [("60000", "0.001")], [("60020", "0.001")])

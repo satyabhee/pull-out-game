@@ -153,7 +153,7 @@ class Replay:
                  observer: Observer | None = None, engine: Engine | None = None,
                  alo_gate: str | None = None, gate_max_age_ms: int | None = None,
                  reconcile_known: str | None = None, reseed: bool = False,
-                 touch_reconcile: bool = False, touch_n_cap: bool = False,
+                 touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
                  keep_known: bool = False, skip_lead_in: bool = False,
                  snapshot_shift: int = 0, outside_position: str = "end", outside_other_txs: bool = False,
                  other_position: str = "end",
@@ -179,6 +179,10 @@ class Replay:
         as a one-level snapshot, evicting known orders oldest first: nothing rests better than the
         real touch, and the touch level holds at most its real size. touch_n_cap=True also evicts
         known orders (oldest first) while our touch level has more orders than bbo's n.
+        touch_refill="front"|"back" (implies touch_reconcile; Nov 20): after that trim, wherever the bbo touch
+        level holds more than we do, the difference goes in as one placeholder, ahead of (front) or behind
+        (back) the level's orders. The bbo is stamped with block time and describes the book after that
+        block, so the latest one before a block is the real touch going into it.
         Lead-in chunks (window.json lead_in_blocks > 0, collect/capture.py LEAD_IN_BLOCKS): blocks before
         warmup_end_height are replayed but never scored, also with reseed. skip_lead_in=True drops them
         (exactly what a chunk without lead-in would replay). keep_known=True (needs reseed): at every
@@ -371,7 +375,11 @@ class Replay:
         if reseed and not self.lead_in:
             self.warmup_end_height = self.blocks[0].height     # every horizon starts from a snapshot
         self.touch: RealTouch | None = None
-        self.touch_reconcile, self.touch_n_cap = touch_reconcile, touch_n_cap
+        if touch_refill not in (None, "front", "back"):
+            raise ValueError(f"unknown touch_refill {touch_refill!r}")
+        self.touch_refill = touch_refill
+        self.touch_reconcile, self.touch_n_cap = touch_reconcile or touch_refill is not None, touch_n_cap
+        touch_reconcile = self.touch_reconcile
         self.touch_reconciled: Counter = Counter()  # (coin, trimmed|drift|evicted|...|n_capped) -> lots/orders
         self._next_snap: dict[tuple[int, int], object] = {}
         self._trades_by: dict[tuple, list] = {}
@@ -861,8 +869,21 @@ class Replay:
                 self.touch_reconciled[(ASSETS[asset].name, "abstain_no_bbo")] += 1
                 continue
             _, bid, ask = latest
-            res = eng.reconcile(asset, [bid[:2]] if bid else [], [ask[:2]] if ask else [], known="oldest")
+            bids, asks = [bid[:2]] if bid else [], [ask[:2]] if ask else []
+            res = eng.reconcile(asset, bids, asks, known="oldest")
             name = ASSETS[asset].name
+            if self.touch_refill is not None:
+                first = eng.next_oid
+                res.update(eng.refill(asset, bids, asks))
+                blk = getattr(self, "_block", None)
+                t = blk.time_ms if blk is not None else self.t0
+                for oid in range(first, eng.next_oid):
+                    if oid in eng.books[asset]:
+                        self.ph_meta[oid] = (t, 0, eng.books[asset].node(oid).remaining, asset)
+                        if self.placeholder_ttl_ms is not None:
+                            heapq.heappush(self._ph_heap, (t, oid))
+                if self.touch_refill == "back":
+                    self._refill_to_back(asset, first)
             for k, v in res.items():
                 self.touch_reconciled[(name, k)] += v
             if self.touch_n_cap:

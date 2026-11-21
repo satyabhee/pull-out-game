@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import gc
 import gzip
 import json
 from collections import Counter, defaultdict
@@ -460,7 +461,7 @@ def book_text(book, side, depth=BOOK_DEPTH) -> str:
 
 def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
         alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False,
-        touch_reconcile=False, touch_n_cap=False, keep_known=False, skip_lead_in=False,
+        touch_reconcile=False, touch_n_cap=False, touch_refill=None, keep_known=False, skip_lead_in=False,
         snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
         outside_other_txs=False, other_position="end", placeholder_ttl_ms=None,
         placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False,
@@ -469,10 +470,14 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         learn_keep_known=False, facts_exclude=(), use_bbo=True, anchor_drop_kinds=(), oid_bracket=False, p_priority=None,
         evict_arrival=False):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
+    # A replay holds millions of long-lived objects (oid facts, books, placed actions); CPython's full collections
+    # re-scan all of them and were ~65% of a chunk's runtime. Young generations still collect cycles; outputs are
+    # identical (checked on a chunk, Nov 20). Process-wide, so it also covers validate_chunks workers.
+    gc.set_threshold(50_000, 20, 1_000)
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
                 gate_max_age_ms=gate_max_age_ms, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
-                reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap,
+                reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap, touch_refill=touch_refill,
                 keep_known=keep_known, skip_lead_in=skip_lead_in,
                 snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
                 other_position=other_position, placeholder_ttl_ms=placeholder_ttl_ms,
@@ -811,6 +816,8 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     ap.add_argument("--reseed", action="store_true", help="G1 #3: rebuild each book from every snapshot")
     ap.add_argument("--touch-reconcile", action="store_true", help="rule 8 against the recorded bbo before every block")
     ap.add_argument("--touch-n-cap", action="store_true", help="with --touch-reconcile: cap touch order count at bbo n")
+    ap.add_argument("--touch-refill", choices=["front", "back"], default=None,
+                    help="touch reconcile + add missing bbo touch size as a placeholder (ahead of / behind the level)")
     ap.add_argument("--keep-known", action="store_true",
                     help="with --reseed: keep known orders at each snapshot, refill missing size at the front")
     ap.add_argument("--skip-lead-in", action="store_true", help="lead-in chunks: replay only the scored part")
@@ -873,7 +880,7 @@ def replay_kwargs(a) -> dict:
     """Keyword arguments for run() from add_replay_args options (all but hl_data, policy, anchors)."""
     return dict(use_resolver=not a.no_resolver, alo_gate=a.alo_gate, gate_max_age_ms=a.gate_max_age_ms,
                 evict_known=a.evict_known, nearest_ratio=a.nearest_ratio, reseed=a.reseed,
-                touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap,
+                touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap, touch_refill=a.touch_refill,
                 keep_known=a.keep_known, skip_lead_in=a.skip_lead_in,
                 snapshot_shift=a.snapshot_shift, outside_position=a.outside_position, stp=a.stp,
                 outside_other_txs=a.outside_other_txs, other_position=a.other_position,
@@ -896,6 +903,7 @@ def options_tag(a) -> str:
                     f"-evict{a.evict_known}" if a.evict_known else "",
                     f"-nr{a.nearest_ratio}" if a.nearest_ratio else "", "-reseed" if a.reseed else "",
                     "-touch" if a.touch_reconcile else "", "-ncap" if a.touch_n_cap else "",
+                    f"-tref{a.touch_refill}" if a.touch_refill else "",
                     "-keep" if a.keep_known else "", "-nolead" if a.skip_lead_in else "",
                     f"-shift{a.snapshot_shift}" if a.snapshot_shift else "",
                     "-ofstart" if a.outside_position == "start" else "", "-stpexpire" if a.stp == "expire_maker" else "",

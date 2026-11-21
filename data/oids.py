@@ -342,7 +342,15 @@ class OidEstimator:
         return None if k is None else self.estimate_count(k)
 
     def distance_to_anchor(self, k: int) -> int:
-        return min((abs(k - ka) for ka, _ in self.anchors), default=10**18)
+        a = self.anchors                    # sorted by count, counts unique (__init__): nearest by bisection
+        cached = getattr(self, "_anchor_ks", None)
+        if cached is None or cached[0] is not a:
+            cached = self._anchor_ks = (a, [ka for ka, _ in a])
+        ks = cached[1]
+        if not ks:
+            return 10**18
+        i = bisect_left(ks, k)
+        return min(abs(k - ks[j]) for j in (i - 1, i) if 0 <= j < len(ks))
 
     def tolerance(self, k: int, base: int = 50, per_mille: int = 50) -> int:
         """Allowed |estimate - real| for count k: grows with the distance to the nearest anchor
