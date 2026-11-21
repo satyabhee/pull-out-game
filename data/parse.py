@@ -221,7 +221,7 @@ def iter_window(window_dir, hl_data=None, stats: Stats | None = None,
     stats["outside_fill_no_block"] += sum(len(v) for v in outside.values())
 
 
-_WINDOW_CACHE_MAX = 8
+_WINDOW_CACHE_MAX = 1     # one chunk at a time (its variants reuse it); 8 kept ~0.1 GB/chunk alive in long workers
 
 
 def load_window(window_dir, hl_data=None, outside_other_txs: bool = False, other_at_tx_index: bool = False) -> tuple[tuple[Block, ...], Stats]:
