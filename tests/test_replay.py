@@ -397,3 +397,22 @@ def test_gate_uses_the_bbo_touch(tmp_path):
     out = list(r)
     assert [x.reason for x in out[1][2]] == [RejectReason.ALO_WOULD_CROSS]
     assert r.gate_stats["reject_engine_would_admit"] == 1
+
+
+def test_touch_evict_bad_mode_fails_loudly(tmp_path):
+    w = Window(tmp_path)
+    w.block([])
+    with pytest.raises(ValueError):
+        Replay(*w.write(), listing, touch_reconcile=True, touch_evict="random")
+
+
+def test_touch_evict_newest_keeps_the_older_known_order(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 10, [], [("60020", "0.001")])
+    w.block([place_tx(M, "0xm1", 0, order(px="60000", sz="0.001")),
+             place_tx(N_, "0xn1", 0, order(px="60000", sz="0.001"))], dt_ms=0)
+    w.bbo("BTC", T0 + 50, ("60000", "0.001", 1), ("60020", "0.001", 1))
+    w.block([], dt_ms=100)
+    r = Replay(*w.write(), listing, touch_reconcile=True, touch_evict="newest")
+    list(r)
+    assert [nd.order.user for nd in r.engine.books[0].side(Side.BUY)[ticks("60000")]] == [M]

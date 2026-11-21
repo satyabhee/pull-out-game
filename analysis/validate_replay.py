@@ -462,6 +462,7 @@ def book_text(book, side, depth=BOOK_DEPTH) -> str:
 def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
         alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False,
         touch_reconcile=False, touch_n_cap=False, touch_refill=None, keep_known=False, skip_lead_in=False,
+        lead_in_keep=None, touch_evict="oldest",
         snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
         outside_other_txs=False, other_position="end", placeholder_ttl_ms=None,
         placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False,
@@ -478,6 +479,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
                 gate_max_age_ms=gate_max_age_ms, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
                 reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap, touch_refill=touch_refill,
+                lead_in_keep=lead_in_keep, touch_evict=touch_evict,
                 keep_known=keep_known, skip_lead_in=skip_lead_in,
                 snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
                 other_position=other_position, placeholder_ttl_ms=placeholder_ttl_ms,
@@ -821,6 +823,9 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     ap.add_argument("--keep-known", action="store_true",
                     help="with --reseed: keep known orders at each snapshot, refill missing size at the front")
     ap.add_argument("--skip-lead-in", action="store_true", help="lead-in chunks: replay only the scored part")
+    ap.add_argument("--lead-in-keep", type=int, default=None, help="measurement: replay only the last N lead-in blocks")
+    ap.add_argument("--touch-evict", choices=["oldest", "newest"], default="oldest",
+                    help="touch reconcile: which known orders go first when our touch level exceeds bbo")
     ap.add_argument("--snapshot-shift", type=int, default=0, help="triage H4: apply snapshots k blocks later (<0 earlier)")
     ap.add_argument("--outside-position", choices=["end", "start"], default="end", help="triage H7")
     ap.add_argument("--outside-other-txs", action="store_true",
@@ -882,6 +887,7 @@ def replay_kwargs(a) -> dict:
                 evict_known=a.evict_known, nearest_ratio=a.nearest_ratio, reseed=a.reseed,
                 touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap, touch_refill=a.touch_refill,
                 keep_known=a.keep_known, skip_lead_in=a.skip_lead_in,
+                lead_in_keep=a.lead_in_keep, touch_evict=a.touch_evict,
                 snapshot_shift=a.snapshot_shift, outside_position=a.outside_position, stp=a.stp,
                 outside_other_txs=a.outside_other_txs, other_position=a.other_position,
                 placeholder_ttl_ms=a.placeholder_ttl_ms, placeholder_queue=a.placeholder_queue,
@@ -904,6 +910,8 @@ def options_tag(a) -> str:
                     f"-nr{a.nearest_ratio}" if a.nearest_ratio else "", "-reseed" if a.reseed else "",
                     "-touch" if a.touch_reconcile else "", "-ncap" if a.touch_n_cap else "",
                     f"-tref{a.touch_refill}" if a.touch_refill else "",
+                    f"-tev{a.touch_evict}" if a.touch_evict != "oldest" else "",
+                    f"-lead{a.lead_in_keep}" if a.lead_in_keep is not None else "",
                     "-keep" if a.keep_known else "", "-nolead" if a.skip_lead_in else "",
                     f"-shift{a.snapshot_shift}" if a.snapshot_shift else "",
                     "-ofstart" if a.outside_position == "start" else "", "-stpexpire" if a.stp == "expire_maker" else "",

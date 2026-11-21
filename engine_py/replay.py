@@ -154,7 +154,8 @@ class Replay:
                  alo_gate: str | None = None, gate_max_age_ms: int | None = None,
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
-                 keep_known: bool = False, skip_lead_in: bool = False,
+                 keep_known: bool = False, skip_lead_in: bool = False, lead_in_keep: int | None = None,
+                 touch_evict: str = "oldest",
                  snapshot_shift: int = 0, outside_position: str = "end", outside_other_txs: bool = False,
                  other_position: str = "end",
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
@@ -282,6 +283,9 @@ class Replay:
             blocks = [b for b in blocks if b.height >= self.window_meta["warmup_end_height"]]
             if not blocks:
                 raise ValueError(f"{self.window_dir}: nothing after the lead-in")
+        elif lead_in_keep is not None and self.lead_in:     # measurement: keep only the last N lead-in blocks
+            w = self.window_meta["warmup_end_height"]
+            blocks = [b for b in blocks if b.height >= w - lead_in_keep]
         self.blocks: list[Block] = list(blocks)
         self.t0, self.t1 = self.blocks[0].time_ms, self.blocks[-1].time_ms
         self.warmup_end_height: int = max(self.window_meta.get("warmup_end_height", self.blocks[0].height),
@@ -378,6 +382,9 @@ class Replay:
         if touch_refill not in (None, "front", "back"):
             raise ValueError(f"unknown touch_refill {touch_refill!r}")
         self.touch_refill = touch_refill
+        if touch_evict not in ("oldest", "newest"):
+            raise ValueError(f"unknown touch_evict {touch_evict!r}")
+        self.touch_evict = touch_evict
         self.touch_reconcile, self.touch_n_cap = touch_reconcile or touch_refill is not None, touch_n_cap
         touch_reconcile = self.touch_reconcile
         self.touch_reconciled: Counter = Counter()  # (coin, trimmed|drift|evicted|...|n_capped) -> lots/orders
@@ -870,7 +877,7 @@ class Replay:
                 continue
             _, bid, ask = latest
             bids, asks = [bid[:2]] if bid else [], [ask[:2]] if ask else []
-            res = eng.reconcile(asset, bids, asks, known="oldest")
+            res = eng.reconcile(asset, bids, asks, known=self.touch_evict)
             name = ASSETS[asset].name
             if self.touch_refill is not None:
                 first = eng.next_oid
