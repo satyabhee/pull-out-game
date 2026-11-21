@@ -178,3 +178,60 @@ def test_learn_keep_known_leaves_orders_we_saw_placed(tmp_path):
     list(r)
     assert level(r, Side.SELL, "60005") == [(B, lots("0.002"))]       # kept: it may still rest on chain
     assert r.learn_stats["swept_kept_known:BTC"] == 1 and r.learn_stats["swept_known_lots:BTC"] == 0
+
+
+def two_takers_one_block(tmp_path):
+    """B rests 0.003 @ 60005 (the chain no longer has it). One block, two takers: on chain both fill at 60010
+    from M, so B's order was already gone."""
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 50, [], [("60010", "0.005")])
+    w.block([place_tx(B, "0xb1", 0, order(buy=False, px="60005", sz="0.003", tif="Gtc"))], dt_ms=0)
+    h = w.block([place_tx(A, "0xa1", 0, order(px="60020", sz="0.001", tif="Ioc")),
+                 place_tx(A, "0xa2", 0, order(px="60020", sz="0.001", tif="Ioc"))], dt_ms=1000)
+    w.trade("BTC", "B", "60010", "0.001", w.time_of(h), "0xa1", 1, A, M)
+    w.trade("BTC", "B", "60010", "0.001", w.time_of(h), "0xa2", 2, A, M)
+    w.block([], dt_ms=1500)
+    return w.write()
+
+
+def makers_of(out, tx_hash):
+    return [f.maker_user for _, fills, _, _ in out for f in fills if f.taker_hash == tx_hash]
+
+
+def test_trade_learn_at_block_end_never_changes_fills_inside_the_block(tmp_path):
+    window, hl = two_takers_one_block(tmp_path)
+    per_tx = Replay(window, hl, listing, trade_learn="sweep")
+    out_tx = list(per_tx)
+    at_end = Replay(window, hl, listing, trade_learn="sweep", trade_learn_at="block-end")
+    out_end = list(at_end)
+    assert makers_of(out_tx, "0xa1") == makers_of(out_end, "0xa1") == [B]
+    assert makers_of(out_tx, "0xa2") == [PLACEHOLDER]          # mid-block: tx 1's real trade already swept B
+    assert makers_of(out_end, "0xa2") == [B]                   # block end: same as with no learning at all
+    off = list(Replay(window, hl, listing))
+    assert makers_of(off, "0xa2") == [B]
+    assert level(per_tx, Side.SELL, "60005") == level(at_end, Side.SELL, "60005") == []   # corrected by the next block
+
+
+def test_trade_learn_at_block_end_runs_in_listing_order_under_every_policy(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 50, [], [("60010", "0.005")])
+    w.block([place_tx(A, "0xa1", 0, order(px="60020", sz="0.001", tif="Ioc")),
+             place_tx(B, "0xb1", 0, order(buy=False, px="60030", sz="0.001", tif="Alo"))], dt_ms=0)
+    w.block([], dt_ms=500)
+    window, hl = w.write()
+    seen = {}
+    for at in ("tx", "block-end"):
+        for name, pol in (("listing", listing), ("class", vr.class_policy)):
+            r = Replay(window, hl, pol, trade_learn="sweep", trade_learn_at=at)
+            calls = []
+            r._learn = lambda h, calls=calls: calls.append(h)
+            list(r)
+            seen[(at, name)] = calls
+    assert seen[("block-end", "listing")] == seen[("block-end", "class")] == ["0xa1", "0xb1"]
+    assert seen[("tx", "class")] == ["0xb1", "0xa1"]           # the per-tx position follows the policy
+
+
+def test_trade_learn_at_bad_value_fails_loudly(tmp_path):
+    window, hl = sweep_window(tmp_path)
+    with pytest.raises(ValueError):
+        Replay(window, hl, listing, trade_learn="sweep", trade_learn_at="midway")

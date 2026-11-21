@@ -466,7 +466,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
         outside_other_txs=False, other_position="end", placeholder_ttl_ms=None,
         placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False,
-        trade_learn=None, oid_guard=None, refill_position="front", oid_facts=False,
+        trade_learn=None, trade_learn_at="tx", oid_guard=None, refill_position="front", oid_facts=False,
         name_prewindow=False, named_anon="front", deep_book=False,
         learn_keep_known=False, facts_exclude=(), use_bbo=True, anchor_drop_kinds=(), oid_bracket=False, p_priority=None,
         evict_arrival=False):
@@ -484,7 +484,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
                 other_position=other_position, placeholder_ttl_ms=placeholder_ttl_ms,
                 placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap,
-                reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, oid_guard=oid_guard, refill_position=refill_position, oid_facts=oid_facts,
+                reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, trade_learn_at=trade_learn_at, oid_guard=oid_guard, refill_position=refill_position, oid_facts=oid_facts,
                 name_prewindow=name_prewindow and oid_facts, named_anon=named_anon, deep_book=deep_book, learn_keep_known=learn_keep_known, facts_exclude=facts_exclude,
                 use_bbo=use_bbo, anchor_drop_kinds=anchor_drop_kinds, oid_bracket=oid_bracket, engine=engine if engine is not None else Engine(stp=stp, p_priority=p_priority, evict_arrival=evict_arrival))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
@@ -845,6 +845,9 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="keep-known: missing snapshot size goes ahead of known orders (front) or behind them")
     ap.add_argument("--oid-guard", choices=["ghost", "ratio25", "ratio50", "cap3000", "none"],
                     help="int-oid resolver preset (default ghost = data/oids defaults; none = old rule)")
+    ap.add_argument("--trade-learn-at", choices=["tx", "block-end"], default="tx",
+                    help="when trade_learn corrections run: after each tx (default) or once at the end of the block, in "
+                         "listing order (same position under every ordering policy; use for counterfactuals)")
     ap.add_argument("--trade-learn", metavar="RULES", default=DEFAULT_TRADE_LEARN,
                     help="correct the book from each tx's real trades after it is applied (later txs only): "
                          "sweep = remove what the real taker must have consumed; name = front placeholder at the "
@@ -894,7 +897,7 @@ def replay_kwargs(a) -> dict:
                 placeholder_ttl_ms=a.placeholder_ttl_ms, placeholder_queue=a.placeholder_queue,
                 placeholder_cap=a.placeholder_cap, reseed_keep_known=a.reseed_keep_known,
                 wildcard_pre_reseed_known=a.wildcard_pre_reseed_known,
-                trade_learn=None if a.trade_learn == "off" else a.trade_learn,
+                trade_learn=None if a.trade_learn == "off" else a.trade_learn, trade_learn_at=a.trade_learn_at,
                 oid_guard=a.oid_guard, refill_position=a.refill_position,
                 oid_facts=not a.no_resolver and not a.no_oid_facts,
                 name_prewindow=a.name_prewindow, named_anon=a.named_anon,
@@ -925,6 +928,7 @@ def options_tag(a) -> str:
                     "-wcknown" if a.wildcard_pre_reseed_known else "",
                     "-tloff" if a.trade_learn == "off" else
                     f"-tl{a.trade_learn.replace(',', '+')}" if a.trade_learn != DEFAULT_TRADE_LEARN else "",
+                    "-tlblockend" if a.trade_learn_at == "block-end" and a.trade_learn != "off" else "",
                     f"-og{a.oid_guard}" if a.oid_guard not in (None, "ghost") else "",
                     f"-refill{a.refill_position}" if a.refill_position != DEFAULT_REFILL_POSITION else "",
                     "-nofacts" if a.no_oid_facts else "",

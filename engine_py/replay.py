@@ -198,7 +198,8 @@ class Replay:
                  other_position: str = "end",
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
                  placeholder_cap: str | None = None, reseed_keep_known: bool = False,
-                 trade_learn: str | None = None, oid_guard: str | None = None, refill_position: str = "front",
+                 trade_learn: str | None = None, trade_learn_at: str = "tx", oid_guard: str | None = None,
+                 refill_position: str = "front",
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
                  deep_book: bool = False, deep_lookback_ms: int = 600_000, learn_keep_known: bool = False,
                  facts_exclude: tuple = (), use_bbo: bool = True, anchor_drop_kinds: tuple = (),
@@ -251,6 +252,11 @@ class Replay:
         dropped at integration; the refill placeholders are registered in ph_meta like seeded ones).
         `ph_meta` maps every placeholder oid to (seed snapshot time ms, rank of its price in that
         snapshot side (0 = best), seeded lots, asset) for analyses.
+        trade_learn_at="tx" (default) | "block-end" (Nov 21, for counterfactuals): "tx" applies each tx's corrections
+        right after its last action, i.e. mid-block at a position that depends on the ordering policy; "block-end"
+        applies all of the block's corrections after its last action (before end_block), in the block's listing
+        order (tx_index), so they never change who fills inside the block and their position is the same under
+        every policy.
         trade_learn (measurement, default None = off): after each tx's last action, the tx's REAL
         trades (recorder, linked by hash) correct the book for LATER actions only; the tx itself was
         already applied and scored. Uses no information from the future.
@@ -346,6 +352,9 @@ class Replay:
         self.ph_stats: Counter = Counter()          # placeholder flag effects (lots / counts)
         self.trade_learn = trade_learn
         self._rules = self.parse_trade_learn(trade_learn)
+        if trade_learn_at not in ("tx", "block-end"):
+            raise ValueError(f"unknown trade_learn_at {trade_learn_at!r}")
+        self.trade_learn_at = trade_learn_at
         self._name_clip = "name-clip" in self._rules
         self.learn_keep_known = learn_keep_known
         if oid_guard not in OID_GUARDS:
@@ -1040,9 +1049,15 @@ class Replay:
                 f, r = self._apply(b, a)
                 fills += f
                 rejects += r
-                if (self._rules and not isinstance(a, OutsideFill)
+                if (self._rules and self.trade_learn_at == "tx" and not isinstance(a, OutsideFill)
                         and (i + 1 == len(seq) or seq[i + 1].hash != a.hash)):
                     self._learn(a.hash)
+            if self._rules and self.trade_learn_at == "block-end":
+                done: set[str] = set()
+                for a in sorted((x for x in ordered), key=lambda x: (x.tx_index, x.item_index)):
+                    if a.hash not in done:
+                        done.add(a.hash)
+                        self._learn(a.hash)
             eng.end_block(b.height, b.time_ms)
             minute = self.minute(b.time_ms)
             self.observer.after_block(self, b, minute)
