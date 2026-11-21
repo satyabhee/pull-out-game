@@ -60,6 +60,7 @@ class TraceObserver(vr.ValidateObserver):
         self.placements = defaultdict(list)      # (user, asset, cloid) -> [(block, engine oid | None, tif)]
         self.removed_by: dict[int, tuple] = {}   # engine oid -> (block, what removed it)
         self.events = defaultdict(list)          # block -> [event dict] (cancels, fills) in apply order
+        self.user_orders = defaultdict(list)     # (user, asset) -> [placement dict], every Place / Modify in the window
         self._patched = False
         self._current = None
 
@@ -137,6 +138,11 @@ class TraceObserver(vr.ValidateObserver):
         super().after_action(rp, block, a, fills, rejects, created)
         self._current = None
         p = a.new if isinstance(a, Modify) else a
+        if isinstance(p, Place):
+            self.user_orders[(a.user, p.asset)].append({
+                "block": block.height, "tx": a.tx_index, "seq": self.seq, "px": p.px, "side": p.side.name,
+                "tif": p.tif.name, "oid": created, "rejects": sorted({r.reason.name for r in rejects}),
+                "modify": isinstance(a, Modify)})
         if isinstance(p, Place) and p.cloid is not None:
             self.placements[(a.user, p.asset, p.cloid)].append((block.height, created, p.tif.name))
         if block.height not in self.blocks:
@@ -222,7 +228,43 @@ def _trace_chunk(job) -> list[dict]:
             e["pos"] = i
         case = {**t, "events": [{k: v for k, v in e.items() if not k.startswith("_")} for e in evs]}
         case["scenario"], case["step"] = classify(case)
+        case["r_fate"] = r_fate(obs, t)
         out.append(case)
+    return out
+
+
+def r_fate(obs, t) -> list[dict]:
+    """For each real maker of the target: their in-window placements at that price and side, and what became of the
+    last one before the taker (rejected and why / what removed it / still resting)."""
+    from decimal import Decimal
+    from engine_py.types import ASSETS
+    spec = ASSETS[t["asset"]]
+    qs = [e for e in obs.events.get(t["block"], []) if e["kind"] == "queue" and e["hash"] == t["hash"]]
+    out = []
+    for part in t["real"].split(";"):
+        b = part.strip().split()
+        if len(b) != 2:
+            continue
+        px = spec.px_to_ticks(b[0].split("@")[1])
+        user = next((u for (u, a) in obs.user_orders if a == t["asset"] and u.lower().startswith(b[1].lower())), None)
+        in_q = bool(qs) and any(o["user"].lower().startswith(b[1].lower()) and o["px"] == px for o in qs[0]["queue"])
+        if user is None:
+            out.append({"maker": b[1], "px": px, "fate": "no placement by this maker in the window", "in_queue": in_q})
+            continue
+        side = None
+        pl = [x for x in obs.user_orders[(user, t["asset"])] if x["px"] == px and x["block"] <= t["block"]]
+        if not pl:
+            out.append({"maker": b[1], "px": px, "fate": "never placed at this price in the window", "in_queue": in_q})
+            continue
+        last = pl[-1]
+        if last["oid"] is None:
+            fate = "rejected by replay: " + ",".join(last["rejects"] or ["?"])
+        elif last["oid"] in obs.removed_by:
+            fate = "removed: " + obs.removed_by[last["oid"]][1] + (" (same block)" if obs.removed_by[last["oid"]][0] == t["block"] else "")
+        else:
+            fate = "resting"
+        out.append({"maker": b[1], "px": px, "fate": fate, "in_queue": in_q, "n_placements": len(pl),
+                    "last_block": last["block"], "last_tif": last["tif"], "same_block": last["block"] == t["block"]})
     return out
 
 
