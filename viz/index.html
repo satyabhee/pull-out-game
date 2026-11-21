@@ -433,12 +433,119 @@ svg tspan.dots { animation: blink 1.2s steps(2) infinite; }
     rejected: "A wrong admission decision earlier shows up later as an unmatched cancel.",
     exactgone: "Same root cause as the drifted cloid case, reached through the id path.",
   };
+  // ---------- Nov 21: where the remaining misses come from, and what was tried ----------
+  const RFATE = [   // analysis/cancel_trace.py --all-wrong-maker on held67 (dev): 135 real-maker fills in 120 wrong-maker trades
+    ["queue", "R in our queue, M ahead of it", 89, K.R],
+    ["recon", "removed by a snapshot correction or scheduled cancel", 9, "#ff8f7a"],
+    ["alo", "rejected as would-cross", 9, "#ff6f59"],
+    ["gate", "evicted by the gate", 8, "#e0533f"],
+    ["nopl", "R never placed in the window", 6, K.faint],
+    ["nopx", "R placed, but not at this price", 6, "#5d6878"],
+    ["ccl", "removed by a cloid cancel", 5, "#c94a38"],
+    ["fill", "already filled in the replay", 3, "#a83c2d"],
+  ];
+  function Fate({ s }) {
+    const cols = 27, cell = 26, x0 = 130, y0 = 70, dots = [];
+    RFATE.forEach(([id, , n, col], gi) => { for (let i = 0; i < n; i++) dots.push({ id, col, gi }); });
+    const on = id => s >= 3 || (s >= 1 && id === "queue") || (s >= 2 && id !== "queue");
+    return h("g", null,
+      h("text", { x: x0, y: y0 - 22, className: "cx-lbl" }, "135 FILLS THE CHAIN GAVE TO R, IN 120 TRADES THE REPLAY GOT WRONG"),
+      dots.map((d, i) => h("rect", { key: i, x: x0 + (i % cols) * cell, y: y0 + Math.floor(i / cols) * cell, width: cell - 6, height: cell - 6, rx: 4,
+        fill: on(d.id) ? d.col : K.faint, fillOpacity: on(d.id) ? (d.id === "queue" ? 0.55 : 0.75) : 0.18,
+        stroke: s === 3 && d.id === "recon" ? K.acc : "none", strokeWidth: 1.5, style: tr(i * 2) })),
+      h("g", { transform: `translate(${x0}, ${y0 + 6 * cell + 30})` },
+        RFATE.map(([id, label, n, col], i) => h("g", { key: id, opacity: on(id) ? 1 : 0.25, style: tr(),
+                                                        transform: `translate(${(i % 2) * 470}, ${Math.floor(i / 2) * 26})` },
+          h("rect", { x: 0, y: -12, width: 14, height: 14, rx: 3, fill: col, fillOpacity: id === "queue" ? 0.55 : 0.75 }),
+          h("text", { x: 24, y: 0, className: "cx-gl", fill: K.ink }, `${n}  ${label}`)))));
+  }
+
+  const FIXES = [   // strict per-tx diff vs the then-current best, points [95% CI], dev chunks unless noted
+    ["Ledger trim (k 99), untouched held66", 6.0, 3.8, 8.5, 4.9, "win"],
+    ["Ledger trim (k 99), dev", 5.4, 1.8, 10.4, 5.6, "win"],
+    ["Touch trim, oldest first", 0.6, -2.4, 4.0, -2.0, "bbo"],
+    ["Touch refill, back of level", 0.2, -3.2, 3.9, -2.9, "bbo"],
+    ["Touch refill, front of level", -5.0, -8.5, -1.0, -11.0, "bbo"],
+    ["Touch trim, newest first", -9.7, -19.6, -2.7, -12.3, "bbo"],
+    ["p only within a block (0 ms)", -3.7, -10.7, 4.1, -9.3, "p"],
+    ["p only within ~1 block (70 ms)", -4.3, -10.7, 3.1, -9.5, "p"],
+    ["Never jump orders without p", 0.5, -4.8, 6.3, -4.8, "p"],
+    ["Resolver guesses less (ratio 5)", 0.0, 0.0, 0.0, 0.0, "other"],
+    ["Half the lead-in (75 blocks)", -0.9, -2.6, 0.0, -1.6, "other"],
+  ];
+  function Fixes({ s }) {
+    const x0 = 430, zero = 720, k = 24, y0 = 74, rh = 40;
+    const show = g => g === "win" || (s >= 1 && g === "bbo") || (s >= 2 && g === "p") || (s >= 3 && g === "other");
+    return h("g", null,
+      h("text", { x: 120, y: 40, className: "cx-lbl" }, "STRICT CONTESTED RECALL, CHANGE IN POINTS (95% CI) · right column: all trades"),
+      h("line", { x1: zero, y1: y0 - 14, x2: zero, y2: y0 + FIXES.length * rh - 10, stroke: K.mute, strokeDasharray: "2 4" }),
+      [-15, -10, -5, 5, 10].map(v => h("text", { key: v, x: zero + v * k, y: y0 + FIXES.length * rh + 6, className: "cx-ts", textAnchor: "middle" }, (v > 0 ? "+" : "") + v)),
+      FIXES.map(([name, d, lo, hi, all, g], i) => {
+        const y = y0 + i * rh, col = g === "win" ? K.good : d <= -2 ? K.cancel : K.mute, vis = show(g);
+        return h("g", { key: name, opacity: vis ? 1 : 0, style: tr(i * 40) },
+          h("text", { x: x0 - 14, y: y + 5, className: "cx-gl", textAnchor: "end", fill: K.ink }, name),
+          h("rect", { x: Math.min(zero, zero + d * k), y: y - 9, width: Math.max(2, Math.abs(d) * k), height: 18, rx: 3, fill: col, fillOpacity: 0.55,
+                      style: { transformOrigin: `${zero}px ${y}px`, transform: vis ? "scaleX(1)" : "scaleX(0)", ...tr(i * 40) } }),
+          h("line", { x1: Math.max(x0 + 6, zero + lo * k), x2: zero + hi * k, y1: y, y2: y, stroke: K.ink, strokeOpacity: 0.7 }),
+          h("text", { x: zero + Math.max(hi, d, 0) * k + 10, y: y + 5, className: "cx-ts", fill: col }, (d > 0 ? "+" : "") + d.toFixed(1)),
+          h("text", { x: 1100, y: y + 5, className: "cx-ts", textAnchor: "end", fill: all < -2 ? K.cancel : all > 2 ? K.good : K.mute }, (all > 0 ? "+" : "") + all.toFixed(1)));
+      }));
+  }
+
+  const FINAL = [   // report/validate/final240 (240 chunks: 133 held-out + 107 captured after the list was frozen), Nov 21
+    ["Strict contested, all 240", 47.9, 44.8, 50.6, 52.7, 49.5, 55.5],
+    ["Strict contested, 107 fresh", 48.3, 44.5, 51.7, 52.7, 48.9, 56.2],
+    ["Strict, all trades", 52.3, 48.7, 55.6, 56.5, 52.8, 59.8],
+    ["Pooled fill recall (G1 target 80%)", 63.4, 52.7, 72.3, 64.8, 54.3, 73.7],
+  ];
+  function Final({ s }) {
+    const x0 = 380, k = 7.2, y0 = 86, rh = 104, X = v => x0 + v * k;
+    return h("g", null,
+      h("text", { x: 120, y: 44, className: "cx-lbl" }, "FINAL CONFIGURATION, 240 CHUNKS · bars: grey = default, green = default + ledger trim · lines = 95% CI"),
+      [0, 20, 40, 60, 80, 100].map(v => h("g", { key: v },
+        h("line", { x1: X(v), x2: X(v), y1: y0 - 18, y2: y0 + FINAL.length * rh - 30, stroke: K.line, strokeDasharray: v === 80 ? "none" : "2 5" }),
+        h("text", { x: X(v), y: y0 + FINAL.length * rh - 12, className: "cx-ts", textAnchor: "middle" }, v + "%"))),
+      h("text", { x: X(80) + 6, y: y0 - 22, className: "cx-ts", fill: K.T }, "G1 target (pooled)"),
+      FINAL.map(([name, a, alo, ahi, b, blo, bhi], i) => {
+        const y = y0 + i * rh, vis = s >= Math.min(i, 3);
+        const bar = (v, lo, hi, yy, col, d) => h("g", null,
+          h("rect", { x: x0, y: yy - 11, width: v * k, height: 22, rx: 3, fill: col, fillOpacity: 0.5,
+                      style: { transformOrigin: `${x0}px ${yy}px`, transform: vis ? "scaleX(1)" : "scaleX(0)", ...tr(d) } }),
+          h("line", { x1: X(lo), x2: X(hi), y1: yy, y2: yy, stroke: K.ink, strokeOpacity: vis ? 0.8 : 0, style: tr(d) }),
+          h("text", { x: X(hi) + 8, y: yy + 5, className: "cx-ts", fill: col, opacity: vis ? 1 : 0, style: tr(d) }, v.toFixed(1) + "%"));
+        return h("g", { key: name },
+          h("text", { x: x0 - 16, y: y + 16, className: "cx-gl", textAnchor: "end", fill: K.ink, opacity: vis ? 1 : 0.3, style: tr() }, name),
+          bar(a, alo, ahi, y, K.mute, 0), bar(b, blo, bhi, y + 30, K.good, 250));
+      }));
+  }
+
+  const EXTRA = [
+    { t: "Where the real maker's order went", C: Fate,
+      why: "No single cause of a lost order passes 20%, so there is no one targeted fix left; the big block is queue order, which three rule changes failed to fix.",
+      steps: ["Every fill the chain gave to R in a trade the replay got wrong: 135 fills in 120 trades (dev chunks).",
+              "89 of them: R's order is in the replay's queue, but M's order sits ahead of it, almost always through a higher priority bid (p).",
+              "46: the replay lost R's order. Seven different causes, none bigger than 9.",
+              "Lost orders spread thin: the largest cause (snapshot correction or scheduled cancel) is 9 of 46. Queue order is the one big block, and it isn't a single rule."] },
+    { t: "What was tried", C: Fixes,
+      why: "Only the ledger trim survived a test on untouched data; every blanket rule change fixed a few misses and broke more correct trades.",
+      steps: ["The ledger trim: remove orders only when the bbo's exact size and order count prove they're gone. +6.0 on untouched chunks.",
+              "Trims and refills from the best bid/ask feed: none helps contested trades, and the front refill hurts.",
+              "Three ways to limit the priority-bid rule: each costs 5 to 10 points on all trades. The chain does let higher p jump older orders.",
+              "Smaller levers: the resolver ratio never fires, and halving the lead-in costs about a point."] },
+    { t: "Final numbers", C: Final,
+      why: "This is the G1 number: a stated rate with an interval, measured on data never used for design, with the misses categorized in the scenes before.",
+      steps: ["Strict contested recall on all 240 chunks: 47.9% with the default, 52.7% with the ledger trim (+4.8 points, CI +3.8 to +5.9).",
+              "On the 107 chunks captured after the test list was frozen, which nothing was designed on: 52.7% [48.9, 56.2], the same +4.4 gain.",
+              "Across all trades (strict, maker must match): 52.3% to 56.5%.",
+              "Pooled fill recall, the G1 target metric: 64.8% [54.3, 73.7]. Short of 80%, and its interval is wide because a few large sweeps carry most of the dollar value."] },
+  ];
+
   window.CANCEL_SCENES = scenes.map(sc => ({
     t: sc.count ? `${sc.title} (${sc.count} of ${TOTAL})` : sc.title,
     C: ({ s }) => h(Draw, { sc, step: s }),
     why: WHY[sc.id],
     steps: sc.steps.map(x => x.cap),
-  }));
+  })).concat(EXTRA);
 
 })();
 
