@@ -93,6 +93,22 @@ class TraceObserver(vr.ValidateObserver):
                                    "evicted (gate / touch ledger / reconcile)")
             return out
         eng.evict = evict
+        if hasattr(rp, "_ledger_touch"):
+            real_ledger = rp._ledger_touch
+
+            def ledger(asset, side, lvl, name):
+                h = rp.blocks[rp.block_index].height
+                before = dict(rp.touch_reconciled)
+                lv = rp.engine.books[asset].side(side).get(lvl[0]) if lvl else None
+                ours = (len(lv), lv.total, sum(nd.order.user == PLACEHOLDER for nd in lv)) if lv is not None else (0, 0, 0)
+                out = real_ledger(asset, side, lvl, name)
+                if h in obs.blocks:
+                    got = [k[1] for k, v in rp.touch_reconciled.items() if k[0] == name and v != before.get(k, 0)
+                           and k[1].startswith("ledger_")]
+                    obs.events[h].append({"kind": "ledger", "hash": None, "asset": asset, "side": side.name,
+                                          "bbo": list(lvl) if lvl else None, "ours_n_lots_ph": ours, "result": got})
+                return out
+            rp._ledger_touch = ledger
         self._patched = True
 
     def before_action(self, rp, block, a):
