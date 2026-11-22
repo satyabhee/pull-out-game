@@ -8,6 +8,7 @@ setting (stp, p_priority mode, evict_arrival). After every step: same fills, sam
 """
 import copy
 import itertools
+import pickle
 
 import pytest
 from hypothesis import event, given, settings, strategies as st
@@ -87,7 +88,7 @@ def test_rust_engine_equals_python(d):
     for _ in range(d.draw(st.integers(1, 40))):
         op = d.draw(st.sampled_from(["place", "place", "place", "cancel", "cloid", "modify", "schedule", "outside",
                                      "end", "time", "seed", "reconcile", "refill", "clear", "evict", "rest",
-                                     "named", "reduce", "copy"]))
+                                     "named", "reduce", "copy", "pickle"]))
         resting = sorted((n.order.oid, n.order.user, n.remaining) for a in py.books for s in (Side.BUY, Side.SELL)
                          for lv in py.books[a].levels(s) for n in lv)
         pick = d.draw(st.integers(0, 10**6))
@@ -161,6 +162,14 @@ def test_rust_engine_equals_python(d):
         elif op == "reduce":                  # direct book reduce (placeholder trims)
             q = min(d.draw(st.integers(1, 3)), some_rem)
             fns = [lambda e, o=some_oid, q=q: e.books[0].reduce(o, q).remaining if o in e.books[0] else None]
+        elif op == "pickle":                  # setup cache: a pickled + reloaded engine is the same engine
+            resolver, rs.resolve_oid = rs.resolve_oid, None          # (the test's resolver is a lambda)
+            rs = pickle.loads(pickle.dumps(rs, protocol=5))
+            rs.resolve_oid = (lambda eng: (lambda user, asset, hl: hl if hl in eng.books[asset]
+                                           and eng.books[asset].node(hl).order.user == user else None))(rs)
+            assert state(rs) == state(py)
+            event("pickled mid-sequence")
+            continue
         else:
             copies.append((copy.deepcopy(rs), state(py)))
             continue

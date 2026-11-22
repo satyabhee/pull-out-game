@@ -194,5 +194,24 @@ class RustBook:
             return copy.deepcopy(self._owner, memo).books[self.asset]
         return RustBook(self.asset, self._core.copy())
 
+    # ---- pickling (setup cache)
+    def __reduce__(self):
+        if self._owner is not None:                 # an engine's book: rebuilt by its engine
+            return (_engine_book, (self._owner, self.asset))
+        levels = [(code, px, self._core.level_nodes(code, px)) for code in (0, 1) for px in self._core.prices(code)]
+        return (_standalone_book, (self.asset, levels))
+
     def shares_level_with(self, other: RustBook, side: Side, px: int) -> bool:
         return self._core.shares_level_with(other._core, _SIDE_CODE[side], px)
+
+
+def _engine_book(owner, asset: int) -> RustBook:
+    return owner.books[asset]
+
+
+def _standalone_book(asset: int, levels) -> RustBook:
+    b = RustBook(asset)
+    for _code, _px, nodes in levels:
+        for t, rem in nodes:
+            b._core.add(t, rem, None)
+    return b

@@ -7,15 +7,28 @@
 //! Codes: side 0 BUY / 1 SELL; tif 0 GTC / 1 IOC / 2 ALO; reject 0 ALO_WOULD_CROSS / 1 SELF_TRADE /
 //! 2 UNKNOWN_ORDER / 3 NO_MAKER. A fill crosses as (maker_order, taker_order | None, maker_user, px, sz, seq).
 
-use crate::engine::{Engine, FillRec, PMode, RejectCode};
+use crate::book::OrderData;
+use crate::engine::{Engine, EngineState, FillRec, PMode, RejectCode};
 use crate::pybook::{
     engine_err, h_add, h_level_info, h_level_node, h_level_nodes, h_node, h_reduce, h_remove, order_from,
-    order_tuple, side_of, OrderIn, OrderTuple,
+    order_tuple, side_code, side_of, OrderIn, OrderTuple,
 };
 use pyo3::prelude::*;
 use std::sync::Arc;
 
 type FillOut = (u64, Option<u64>, String, i64, i64, u64);
+
+/// export_state() / from_state(): (settings, counters, levels, p_meta, by_cloid, by_user, schedules, stats).
+type StateTuple = (
+    (Vec<u32>, bool, Option<String>, Option<i64>, bool),
+    (u64, u64, u64, u64, i64),
+    Vec<(u32, u8, i64, Vec<(OrderIn, i64)>)>,
+    Vec<(u64, i64, i64)>,
+    Vec<(String, u32, String, Vec<u64>)>,
+    Vec<(String, Vec<u64>)>,
+    Vec<(String, i64)>,
+    Vec<(String, i64)>,
+);
 
 fn fill_out(f: &FillRec) -> FillOut {
     (f.maker_order, f.taker_order, f.maker_user.to_string(), f.px, f.sz, f.seq)
@@ -222,6 +235,74 @@ impl PyEngine {
     /// Copy-on-write copy of the whole engine (books share untouched levels).
     fn copy(&self) -> PyEngine {
         self.clone()
+    }
+
+    /// Plain-data state (tuples of numbers / strings) for pickling: see Engine::export. Deterministic.
+    fn export_state(&self) -> StateTuple {
+        let s = self.inner.export();
+        let (mode, window) = match s.p_priority {
+            None => (None, None),
+            Some(PMode::Always) => (Some("always".to_string()), None),
+            Some(PMode::Known) => (Some("known".to_string()), None),
+            Some(PMode::KnownPos) => (Some("knownpos".to_string()), None),
+            Some(PMode::Docs) => (Some("docs".to_string()), None),
+            Some(PMode::DocsAll) => (Some("docsall".to_string()), None),
+            Some(PMode::Window(w)) => (Some("window".to_string()), Some(w)),
+        };
+        let order_in = |o: &OrderData| -> OrderIn {
+            (o.oid, o.user.to_string(), o.asset, side_code(o.side), o.px, o.sz, o.tif,
+             o.cloid.as_ref().map(|c| c.to_string()), o.seq, o.block)
+        };
+        (
+            (s.assets, s.expire_maker, mode, window, s.evict_arrival),
+            (s.next_oid, s.next_seq, s.next_fill_seq, s.block, s.block_time_ms),
+            s.levels
+                .iter()
+                .map(|(a, side, px, nodes)| {
+                    (*a, side_code(*side), *px, nodes.iter().map(|(o, r)| (order_in(o), *r)).collect())
+                })
+                .collect(),
+            s.p_meta,
+            s.by_cloid.into_iter().map(|(u, a, c, v)| (u.to_string(), a, c.to_string(), v)).collect(),
+            s.by_user.into_iter().map(|(u, v)| (u.to_string(), v)).collect(),
+            s.schedules.into_iter().map(|(u, t)| (u.to_string(), t)).collect(),
+            s.stats,
+        )
+    }
+
+    /// Rebuild an engine from export_state() output.
+    #[staticmethod]
+    fn from_state(py: Python<'_>, state: StateTuple) -> PyResult<PyEngine> {
+        let ((assets, expire_maker, mode, window, evict_arrival), counters, levels, p_meta, by_cloid, by_user,
+             schedules, stats) = state;
+        let p_priority = PyEngine::new(vec![], false, mode, window, false)?.inner.p_priority;
+        let (next_oid, next_seq, next_fill_seq, block, block_time_ms) = counters;
+        let mut lv = vec![];
+        for (a, side, px, nodes) in levels {
+            let mut ns = vec![];
+            for (o, r) in nodes {
+                ns.push((order_from(o)?, r));
+            }
+            lv.push((a, side_of(side)?, px, ns));
+        }
+        let st = EngineState {
+            assets,
+            expire_maker,
+            p_priority,
+            evict_arrival,
+            next_oid,
+            next_seq,
+            next_fill_seq,
+            block,
+            block_time_ms,
+            levels: lv,
+            p_meta,
+            by_cloid: by_cloid.into_iter().map(|(u, a, c, v)| (Arc::from(u), a, Arc::from(c), v)).collect(),
+            by_user: by_user.into_iter().map(|(u, v)| (Arc::from(u), v)).collect(),
+            schedules: schedules.into_iter().map(|(u, t)| (Arc::from(u), t)).collect(),
+            stats,
+        };
+        Ok(PyEngine { inner: Engine::import(st).map_err(|e| engine_err(py, e))? })
     }
 
     /// A view of the engine's book for `asset` (same methods as replay_core.Book).

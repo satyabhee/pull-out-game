@@ -212,6 +212,21 @@ class RustEngine:
                     sz=sz, block=of.block, seq=seq, taker_hash=of.hash) for m, t, mu, px, sz, seq in fills]
         return out, ([] if c is None else [Reject(of, _REASONS[c])])
 
+    # ------------------------------------------------------------ pickling (setup cache)
+    def __getstate__(self) -> dict:
+        """Settings, the oid resolver (it points back at this engine: pickle keeps the cycle) and the Rust state."""
+        return {"stp": self.stp, "check_every_action": self.check_every_action, "p_priority": self.p_priority,
+                "evict_arrival": self.evict_arrival, "resolve_oid": self.resolve_oid,
+                "core": self._core.export_state()}
+
+    def __setstate__(self, st: dict) -> None:
+        self.stp, self.check_every_action = st["stp"], st["check_every_action"]
+        self.p_priority, self.evict_arrival = st["p_priority"], st["evict_arrival"]
+        self._core = _CoreEngine.from_state(st["core"])
+        self.books = {a: RustBook(a, self._core.book(a), owner=self) for a in sorted(ASSETS)}
+        self.by_user = _ByUser(self._core)
+        self.resolve_oid = st["resolve_oid"]
+
     # ------------------------------------------------------------ copies
     def __deepcopy__(self, memo) -> RustEngine:
         new = RustEngine.__new__(RustEngine)

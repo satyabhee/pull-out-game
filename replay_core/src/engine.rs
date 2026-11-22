@@ -657,6 +657,104 @@ impl Engine {
             }
         }
     }
+
+    // ------------------------------------------------------------ save / restore (setup cache, Q4)
+    /// Everything needed to rebuild this engine exactly, in a deterministic order (sorted), so equal engines give
+    /// equal states. Queue order inside a level and each user's oid order are kept as they are.
+    pub fn export(&self) -> EngineState {
+        let mut levels = vec![];
+        for (i, book) in self.books.iter().enumerate() {
+            for side in [Side::Buy, Side::Sell] {
+                for px in book.prices(side) {
+                    let lv = book.level(side, px).expect("listed price");
+                    let nodes = lv.nodes.iter().map(|n| ((*n.order).clone(), n.remaining)).collect();
+                    levels.push((self.assets[i], side, px, nodes));
+                }
+            }
+        }
+        let mut p_meta: Vec<(u64, i64, i64)> = self.p_meta.iter().map(|(o, (p, t))| (*o, *p, *t)).collect();
+        p_meta.sort_unstable();
+        let mut by_cloid: Vec<_> = self
+            .by_cloid
+            .iter()
+            .map(|((u, a, c), v)| (u.clone(), *a, c.clone(), v.iter().copied().collect::<Vec<u64>>()))
+            .collect();
+        by_cloid.sort();
+        let mut by_user: Vec<_> = self.by_user.iter().map(|(u, s)| (u.clone(), s.oids())).collect();
+        by_user.sort();
+        let mut schedules: Vec<_> = self.schedules.iter().map(|(u, t)| (u.clone(), *t)).collect();
+        schedules.sort();
+        EngineState {
+            assets: self.assets.clone(),
+            expire_maker: self.expire_maker,
+            p_priority: self.p_priority,
+            evict_arrival: self.evict_arrival,
+            next_oid: self.next_oid,
+            next_seq: self.next_seq,
+            next_fill_seq: self.next_fill_seq,
+            block: self.block,
+            block_time_ms: self.block_time_ms,
+            levels,
+            p_meta,
+            by_cloid,
+            by_user,
+            schedules,
+            stats: self.stats.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+        }
+    }
+
+    /// Rebuild an engine from `export()`. The result behaves exactly like the original.
+    pub fn import(s: EngineState) -> R<Engine> {
+        let mut e = Engine::new(s.assets, s.expire_maker, s.p_priority, s.evict_arrival);
+        for (asset, _side, _px, nodes) in s.levels {
+            let book = e.book_mut(asset)?;
+            for (o, rem) in nodes {
+                book.add(Arc::new(o), rem, None)?; // tail, in the exported queue order
+            }
+        }
+        e.p_meta = s.p_meta.into_iter().map(|(o, p, t)| (o, (p, t))).collect();
+        for (u, a, c, oids) in s.by_cloid {
+            e.by_cloid.insert((u, a, c), oids.into_iter().collect());
+        }
+        for (u, oids) in s.by_user {
+            for oid in oids {
+                e.user_add(u.clone(), oid);
+            }
+        }
+        e.schedules = s.schedules.into_iter().collect();
+        e.stats = s.stats.into_iter().collect();
+        e.next_oid = s.next_oid;
+        e.next_seq = s.next_seq;
+        e.next_fill_seq = s.next_fill_seq;
+        e.block = s.block;
+        e.block_time_ms = s.block_time_ms;
+        Ok(e)
+    }
+}
+
+/// One exported price level: (asset, side, px, [(order, remaining)] head first).
+pub type LevelState = (u32, Side, i64, Vec<(OrderData, i64)>);
+/// One exported cloid index entry: (user, asset, cloid, resting oids oldest first).
+pub type CloidState = (Arc<str>, u32, Arc<str>, Vec<u64>);
+
+/// A plain-data copy of an Engine (see `Engine::export`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineState {
+    pub assets: Vec<u32>,
+    pub expire_maker: bool,
+    pub p_priority: Option<PMode>,
+    pub evict_arrival: bool,
+    pub next_oid: u64,
+    pub next_seq: u64,
+    pub next_fill_seq: u64,
+    pub block: u64,
+    pub block_time_ms: i64,
+    pub levels: Vec<LevelState>,
+    pub p_meta: Vec<(u64, i64, i64)>,
+    pub by_cloid: Vec<CloidState>,
+    pub by_user: Vec<(Arc<str>, Vec<u64>)>,
+    pub schedules: Vec<(Arc<str>, i64)>,
+    pub stats: Vec<(String, i64)>,
 }
 
 #[cfg(test)]
@@ -737,6 +835,23 @@ mod tests {
         let mut e = eng();
         e.seed(0, Side::Sell, 100, 5).unwrap();
         assert!(matches!(e.seed(0, Side::Buy, 100, 5), Err(EngineError::Crossed(_))));
+    }
+
+    #[test]
+    fn export_import_roundtrip() {
+        let mut e = Engine::new(vec![0, 1], false, Some(PMode::Docs), false);
+        e.place(u("a"), 0, Side::Buy, 99, 5, TIF_ALO, Some(u("x")), Some(3)).unwrap();
+        e.place(u("b"), 0, Side::Buy, 99, 2, TIF_ALO, None, Some(9)).unwrap();
+        e.place(u("c"), 1, Side::Sell, 120, 4, TIF_GTC, None, Some(0)).unwrap();
+        e.schedule(u("b"), Some(77));
+        let s = e.export();
+        let mut f = Engine::import(s.clone()).unwrap();
+        assert_eq!(f.export(), s);
+        // both keep behaving the same
+        let a = e.place(u("d"), 0, Side::Sell, 99, 6, TIF_IOC, None, Some(0)).unwrap();
+        let b = f.place(u("d"), 0, Side::Sell, 99, 6, TIF_IOC, None, Some(0)).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(e.export(), f.export());
     }
 
     #[test]

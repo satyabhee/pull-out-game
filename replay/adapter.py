@@ -142,13 +142,20 @@ class EngineAdapter:
         self.backend = backend
 
     # -------------------------------------------------------------- books
-    def new_book(self, window, hl_data, options=BASELINE_OPTIONS, observer: Observer | None = None) -> BookHandle:
+    def new_book(self, window, hl_data, options=BASELINE_OPTIONS, observer: Observer | None = None,
+                 cache: bool = True) -> BookHandle:
         """A book positioned before the window's first block (seeded from the nearest snapshot, as today).
-        options: replay options incl. an optional --policy, e.g. options_for(stp=..., order=..., correction=...)."""
+        options: replay options incl. an optional --policy, e.g. options_for(stp=..., order=..., correction=...).
+        cache: load / store the built Replay in the per-chunk setup cache (replay/setup_cache.py)."""
         policy_name, opts = split_policy(options)
         args, kw = replay_args(window, hl_data, policy_name, **run_kwargs_from_options(hl_data, opts))
         kw["engine"] = self.prepare_engine(kw["engine"])
-        return self.book_from_replay(Replay(*args, **kw), observer)
+        if cache:
+            from replay import setup_cache
+            rp = setup_cache.get_replay(args, kw, self.backend)
+        else:
+            rp = Replay(*args, **kw)
+        return self.book_from_replay(rp, observer)
 
     def prepare_engine(self, engine):
         """The engine to build the Replay with. Backend "rust": a new RustEngine with the same settings as the
