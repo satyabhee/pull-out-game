@@ -133,6 +133,11 @@ place this can differ is `Engine._outside_fill` when the named maker is literall
 would be listed twice; Python then fails with a 0-lot Fill, Rust with "not resting"). Outside fills always name a
 `0x` address, so this input does not occur; the differential test excludes it.
 
+**D24. Random cross-engine tests use Hypothesis, not proptest.** The plan asks for proptest-generated random blocks
+run through both engines. The reference engine is Python, so the cross-engine comparison runs on the Python side with
+Hypothesis (`tests/test_rust_engine.py`, `tests/test_rust_book.py`, `tests/test_replay_core.py`); proptest checks the
+Rust-internal properties (book invariants and copies, subset search vs brute force).
+
 **D23. Parity runner switches.** `python -m replay.parity` takes `--stp/--order/--correction` (default = the
 baseline switches); `make checkpoint` runs full dev20 parity under both `correction` settings (block-end vs
 `report/validate/m0_blockend20`, mid-block vs `report/validate/m0_base20`), so Q1's answer does not change coverage.
