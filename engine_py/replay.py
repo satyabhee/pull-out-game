@@ -1090,6 +1090,9 @@ class Replay:
                             extra -= 1
 
     LEDGER_BUDGET = 300_000   # combinations tried per touch level before abstaining
+    # The ledger's subset search; replay/adapter.py (backend="rust") swaps in replay_core.unique_subset, which
+    # returns exactly the same answers (tests/test_replay_core.py).
+    subset_search = staticmethod(unique_subset)
     LEDGER_MAX_ORDERS = 60
 
     def _ledger_touch(self, asset: int, side: Side, lvl, name: str) -> list:
@@ -1115,7 +1118,7 @@ class Replay:
         if k > self.ledger_k or len(nodes) > self.LEDGER_MAX_ORDERS:
             st[(name, "ledger_too_many")] += 1
             return [(px, max(sz, level.total))]
-        got = unique_subset([nd.remaining for nd in nodes], k, excess, self.LEDGER_BUDGET)
+        got = self.subset_search([nd.remaining for nd in nodes], k, excess, self.LEDGER_BUDGET)
         if not isinstance(got, tuple):
             st[(name, f"ledger_{got}")] += 1
             return [(px, max(sz, level.total))]

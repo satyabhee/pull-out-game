@@ -14,7 +14,7 @@ By Satya's choice (Nov 22), M0 runs on sub-branch `mahito` = `capture-guard` + a
 0.588, +7.5 [+5.7, +9.8]), 63.2% real-makers scope, 62.7% all-scored on final240
 (`handoff/pdocs_final240.paired.txt`). The adapter's baseline is that config (`replay/adapter.BASELINE_OPTIONS`).
 
-**D2. `new_book(snapshot)` -> `new_book(window, hl_data, policy_name, options)`.** The engine is window-driven: it
+**D2. `new_book(snapshot)` -> `new_book(window, hl_data, options)`** (options may include `--policy`). The engine is window-driven: it
 seeds from the recorder snapshot nearest the window start, re-seeds at later snapshots (rule 8), gates ALOs on the
 real touch and resolves cancels from window files. A `BookHandle` therefore wraps a whole `Replay`; `apply_block`
 advances it one block via `Replay.step_block`. `book_from_replay(rp)` wraps a Replay built elsewhere (the scoring path).
@@ -23,14 +23,23 @@ advances it one block via `Replay.step_block`. `book_from_replay(rp)` wraps a Re
 handle holds BTC and ETH) and return float sizes. Project rule (AGENT_PLAN §2.1): no floats for prices or sizes. They
 return `(lots, n)` and `(px ticks, lots, n)`; convert with `ASSETS[a].lots_to_sz / ticks_to_px` at the edge.
 
-**D4. Rule 1 (no look-ahead) vs the baseline. Needs a decision.** The baseline's trade corrections
-(`--trade-learn sweep,queue`, CLI default `--trade-learn-at tx`) read each tx's REAL trades right after that tx,
-in the middle of its block, so later txs of the same block see a book corrected by printed trades.
-`tests/test_lookahead.py` shows it: `--trade-learn-at block-end` passes the rule-1 guard, the baseline fails it
-(marked `xfail(strict)`). Options: (a) keep the baseline as is (58.8%) and accept the deviation for validation
-only; (b) make `block-end` the baseline (counterfactual-clean). Earlier dev20 cost of (b) on the frozen config
-(Nov 21, `report/validate/tlcost20`): contested 0.0 pts (0 of 115 txs changed), uncontested -1.3 [-4.9, +1.0],
-all-scored -0.8 [-3.0, +0.6]; not yet measured with `--p-priority docs`.
+**D4. Rule 1 (no look-ahead) vs the baseline. DECIDED Nov 22: block-end is the official baseline.** The 58.8%
+engine's trade corrections (`--trade-learn sweep,queue`, `--trade-learn-at tx`) read each tx's REAL trades right
+after it, mid-block, which breaks rule 1. Satya's rule: measure block-end + `--p-priority docs` on dev20; if the
+contested CI includes ~0, block-end becomes the baseline. Result (`report/validate/m0_tl20`, paired chunk-cluster
+bootstrap 4000, `handoff/m0/tl20.paired.txt`):
+
+| maker-strict per-tx, dev20 | n / chunks | mid-block -> block-end | diff [95% CI] |
+|---|---|---|---|
+| contested (union) | 112 / 18 | 0.592 -> 0.592 | +0.0 [0.0, 0.0] (no tx changed) |
+| contested (real makers) | 92 / 17 | 0.661 -> 0.661 | +0.0 [0.0, 0.0] |
+| uncontested | 196 / 20 | 0.730 -> 0.710 | -2.0 [-5.4, 0.0] |
+| all scored | 308 / 20 | 0.680 -> 0.667 | -1.3 [-3.5, 0.0] |
+
+So `replay.adapter.BASELINE_OPTIONS` = `options_for(stp="taker", order="proposer", correction="blockend")`, and
+`tests/test_lookahead.py` requires it to pass rule 1 (and requires the guard to catch `correction="midblock"`).
+The final240 58.8% is recorded as the **"mid-block correction"** number; final240 has not been re-run with
+block-end (Satya: ask before any final240 run).
 
 **D5. Self-trade.** Plan §1: the chain cancels the RESTING order and keeps matching (`expire_maker`). The engine's
 default and the baseline use `stp="cancel_taker"` (cancel the taker's remainder). Not changed in M0 (scoring must
@@ -50,9 +59,9 @@ levels replace it (plan: Rust core).
 
 **D9. Commit guards.** `make check` runs the secret check, the full pytest suite (incl. rule-1 and adapter tests)
 and, once `replay_core/` exists, cargo test + clippy. Rust-vs-Python parity is skipped until M5. The pre-commit
-hook (`scripts/git-hooks/pre-commit`) is NOT installed automatically: `git config core.hooksPath` is shared by
-every worktree of this repo, several of which other sessions commit from. Enable with
-`git config core.hooksPath scripts/git-hooks` when wanted.
+hook (`scripts/git-hooks/pre-commit`) is enabled for THIS worktree only (Satya, Nov 22:
+`git config extensions.worktreeConfig true; git config --worktree core.hooksPath scripts/git-hooks`); the other
+worktrees (other sessions) are unaffected (checked: `~/book-replay-data` sees no hooksPath).
 
 **D10. Private-key check.** A bare `0x` + 64-hex string is not refused: Hyperliquid tx hashes have exactly that shape.
 The check refuses 64-hex values assigned to key-like names, PEM blocks, `.env*` / `*.key` / `*.pem` files and model
@@ -68,3 +77,36 @@ use bbo only on those sets.
 
 **D13. Layout.** `replay/` is a new top-level package next to the engine's `engine_py/`, `data/`, `analysis/`
 (not a move of the engine). `replay/parity.py` is added (not in the plan's layout).
+
+## M5 · Isomer
+
+**D14. What is hot.** Plan M5 ports book + matching first. Measured on 3 dev20 chunks (plain timers, baseline
+config): per chunk, setup (Python loaders, decoding, oid facts) 16.5-20.0 s; blocks 4.1-11.6 s, of which the touch
+ledger's subset search (`engine_py/replay.py::unique_subset`) is 3.4-10.6 s (85-92%) and `Engine.apply`
+(matching) 0.26-0.45 s (~2% of the chunk). So M5 ports `unique_subset` first (pure function, exact port) and the book
+/ matching second, with copy-on-write from the start (Satya, decision 3). The book/matching port cannot pay off for
+one-guess replays (<= 0.45 s of ~25 s per chunk); its value is M2, where per-guess work multiplies.
+
+**D15. Build.** The crate has its own `replay_core/pyproject.toml` (maturin backend) instead of making the root
+`pyproject.toml` (hatchling, the engine's package) build it: `pip install -e .` keeps installing the Python engine;
+the crate installs with `make rust` (= `maturin develop --uv --release` into this worktree's `.venv`; the venv has
+no pip, hence `--uv`). `pyo3/extension-module` is an optional cargo feature that only maturin enables, so
+`cargo test` links. Versions pinned: pyo3 0.23.4 (abi3-py312), proptest 1.6.0, maturin 1.8.1. The compiled module is
+`replay_core.replay_core` (the crate folder at the repo root would otherwise shadow it as a namespace package).
+
+**D16. Switches (Satya, decision 2).** `replay.adapter.options_for(stp, order, correction)` maps each switch to an
+option the Python engine already has: stp taker|maker -> `--stp cancel_taker|expire_maker`; order
+proposer|class_sort -> `--policy listing|class`; correction midblock|blockend -> `--trade-learn-at tx|block-end`.
+All 8 combinations exist in Python; `tests/test_switch_parity.py` checks Rust = Python for each on the fast test
+set (first 40 blocks of one dev20 chunk). It takes ~2 min, so it runs at checkpoints (`make checkpoint`,
+`RUN_SLOW=1`), not on every commit. Per-switch accuracy on dev20 is measured after M5, as decided.
+
+**D17. Crossing granularity.** The plan wants one Python->Rust crossing per block. Today the ported piece is called
+once per touch level per block (<= 4 calls per block), well under the per-tx crossing the plan forbids. When the
+engine itself moves to Rust, the replay's per-action Python logic (ALO gate on the real touch, taker rules, oid
+resolver callback) sits between engine calls; whether that logic moves too or the engine is called per action is
+decided by profiling the ported book (D14 says matching is not the bottleneck today).
+
+**D18. Timings.** Satya: M5 timings are the median of >= 3 runs with data capture paused. The ingest processes
+(`record_hl.py`, `capture.py`) are not touched by these agents, so timing runs wait until Satya pauses capture.
+Correctness runs (parity) do not need it.

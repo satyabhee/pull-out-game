@@ -1,0 +1,24 @@
+[package]
+name = "replay_core"
+version = "0.1.0"
+edition = "2021"
+description = "Rust hot path for the Hyperliquid order-book replay (MAHITO_PLAN M5). The Python engine is the reference."
+publish = false
+
+[lib]
+name = "replay_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "=0.23.4", features = ["abi3-py312"] }
+
+[features]
+# maturin turns this on for the Python wheel; off for `cargo test` so test binaries link libpython
+extension-module = ["pyo3/extension-module"]
+
+[dev-dependencies]
+proptest = "=1.6.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

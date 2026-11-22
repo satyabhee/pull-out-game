@@ -8,8 +8,8 @@ import pytest
 from analysis import validate_replay as vr
 from engine_py.replay import Replay
 from engine_py.types import Side
-from replay.adapter import (BASELINE_OPTIONS, EMPTY, BranchContext, EngineAdapter, replay_args,
-                            run_kwargs_from_options)
+from replay.adapter import (BASELINE_OPTIONS, EMPTY, BranchContext, EngineAdapter, options_for, replay_args,
+                            run_kwargs_from_options, split_policy)
 
 M3 = Path(os.environ.get("BOOK_REPLAY_DATA", Path.home() / "hl-data" / "mac3"))
 CHUNK = M3 / "dev20" / "1227159597-1227159806"
@@ -27,15 +27,35 @@ def test_empty_context():
     assert not BranchContext(priority_mode="known").is_empty()
 
 
-def test_only_python_backend_until_m5():
-    with pytest.raises(NotImplementedError):
-        EngineAdapter(backend="rust")
+def test_backends():
+    assert EngineAdapter().backend == "py"          # default stays Python until sign-off
+    assert "--trade-learn-at" in BASELINE_OPTIONS and BASELINE_OPTIONS[BASELINE_OPTIONS.index("--trade-learn-at") + 1] == "block-end"
+    with pytest.raises(ValueError):
+        options_for(order="fifo")
+    with pytest.raises(ValueError):
+        EngineAdapter(backend="cpp")
 
 
-def fresh_replay() -> Replay:
+@needs_data
+def test_rust_backend_same_fills_as_python():
+    pytest.importorskip("replay_core.replay_core", reason="replay_core extension not built")
+    outs = {}
+    for backend in ("py", "rust"):
+        ad = EngineAdapter(backend)
+        book = ad.book_from_replay(fresh_replay())
+        fills = []
+        for _ in range(N):
+            for fs in ad.apply_block(book).values():
+                fills += [key(f) for f in fs]
+        outs[backend] = fills
+    assert outs["py"] == outs["rust"] and outs["py"]
+
+
+def fresh_replay(options=BASELINE_OPTIONS) -> Replay:
     """A new Replay as validate_replay.run would build it. Captured args carry their own Engine, so they are
     never reused across Replays."""
-    a, k = replay_args(CHUNK, HL, "listing", **run_kwargs_from_options(HL, BASELINE_OPTIONS))
+    policy, opts = split_policy(options)
+    a, k = replay_args(CHUNK, HL, policy, **run_kwargs_from_options(HL, opts))
     return Replay(*a, **k)
 
 

@@ -3,9 +3,9 @@ block's fills are recorded. The replay reads a tx's real trades in Replay._learn
 when any book action of block h is applied after a _learn of block h, i.e. when real trades of h were read
 before out[h] was complete.
 
-The baseline (58.8% config) runs trade_learn per tx (CLI default --trade-learn-at tx), which reads real trades
-MID-block: that case is marked xfail(strict) until Satya decides (docs/deviations.md D4). --trade-learn-at
-block-end must pass.
+Since Nov 22 the official baseline corrects at block END (docs/deviations.md D4) and must pass. The mid-block
+setting (correction=midblock, the 58.8% final240 configuration) reads real trades mid-block; the guard must
+detect it, which also proves the guard is live.
 """
 import os
 from itertools import islice
@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from engine_py.replay import Replay
-from replay.adapter import BASELINE_OPTIONS, replay_args, run_kwargs_from_options
+from replay.adapter import BASELINE_OPTIONS, options_for, replay_args, run_kwargs_from_options, split_policy
 
 M3 = Path(os.environ.get("BOOK_REPLAY_DATA", Path.home() / "hl-data" / "mac3"))
 CHUNK = M3 / "dev20" / "1227159597-1227159806"
@@ -25,7 +25,8 @@ N = 60
 
 def violations(options) -> tuple[int, int]:
     """(blocks where a book action followed a real-trade read in the same block, blocks with any read)."""
-    a, k = replay_args(CHUNK, HL, "listing", **run_kwargs_from_options(HL, options))
+    policy, opts = split_policy(options)
+    a, k = replay_args(CHUNK, HL, policy, **run_kwargs_from_options(HL, opts))
     rp = Replay(*a, **k)
     state = {"block": None, "read": False, "bad": set(), "reads": set()}
     learn, apply = rp._learn, rp._apply
@@ -48,13 +49,12 @@ def violations(options) -> tuple[int, int]:
     return len(state["bad"]), len(state["reads"])
 
 
-def test_block_end_learning_reads_no_trades_before_fills():
-    bad, reads = violations([*BASELINE_OPTIONS, "--trade-learn-at", "block-end"])
+def test_baseline_reads_no_trades_before_fills():
+    bad, reads = violations(BASELINE_OPTIONS)
     assert reads > 0                                  # the guard is live: trades are read
     assert bad == 0
 
 
-@pytest.mark.xfail(strict=True, reason="baseline reads real trades mid-block (deviation D4, awaiting decision)")
-def test_baseline_reads_no_trades_before_fills():
-    bad, _ = violations(list(BASELINE_OPTIONS))
-    assert bad == 0
+def test_midblock_correction_is_detected():
+    bad, _ = violations(options_for(correction="midblock"))
+    assert bad > 0

@@ -23,10 +23,47 @@ from analysis import validate_replay as vr
 from engine_py.replay import Observer, Replay
 from engine_py.types import Fill, Side
 
-# The engine at 58.8% contested strict on final240 (frozen config + docs priority), handoff/pdocs_final240.paired.txt.
-BASELINE_OPTIONS = ("--alo-gate touch --reseed --nearest-ratio 3 --keep-known --outside-other-txs --deep-book "
-                    "--p-priority docs --evict-arrival --oid-bracket --touch-reconcile --touch-evict ledger "
-                    "--ledger-k 99").split()
+# Engine options shared by every switch setting (frozen config + docs priority).
+ENGINE_OPTIONS = ("--alo-gate touch --reseed --nearest-ratio 3 --keep-known --outside-other-txs --deep-book "
+                  "--p-priority docs --evict-arrival --oid-bracket --touch-reconcile --touch-evict ledger "
+                  "--ledger-k 99").split()
+
+# Switches (Satya, Nov 22): each maps to an option the Python engine already has.
+#   stp:        taker = cancel the taker's remainder (engine default) | maker = cancel the resting order (plan §1)
+#   order:      proposer = listing order | class_sort = no-GTC/IOC, then cancels, then GTC/IOC (docs)
+#   correction: blockend = trade corrections after all of a block's fills (rule 1) | midblock = after each tx
+SWITCHES = {
+    "stp": {"taker": ["--stp", "cancel_taker"], "maker": ["--stp", "expire_maker"]},
+    "order": {"proposer": ["--policy", "listing"], "class_sort": ["--policy", "class"]},
+    "correction": {"blockend": ["--trade-learn-at", "block-end"], "midblock": ["--trade-learn-at", "tx"]},
+}
+# Official baseline since Nov 22 (docs/deviations.md D4): block-end corrections. The 58.8% final240 number is the
+# same engine with midblock corrections ("mid-block correction" baseline).
+BASELINE_SWITCHES = {"stp": "taker", "order": "proposer", "correction": "blockend"}
+
+
+def options_for(stp: str = "taker", order: str = "proposer", correction: str = "blockend") -> list[str]:
+    """Replay options for one switch setting (the policy option is split off by split_policy)."""
+    chosen = {"stp": stp, "order": order, "correction": correction}
+    out = list(ENGINE_OPTIONS)
+    for name, value in chosen.items():
+        if value not in SWITCHES[name]:
+            raise ValueError(f"{name}={value!r}: choose from {sorted(SWITCHES[name])}")
+        out += SWITCHES[name][value]
+    return out
+
+
+def split_policy(options) -> tuple[str, list[str]]:
+    """(policy name, options without --policy): the policy is a run() argument, not a replay option."""
+    opts, policy = list(options), "listing"
+    if "--policy" in opts:
+        i = opts.index("--policy")
+        policy = opts[i + 1]
+        del opts[i:i + 2]
+    return policy, opts
+
+
+BASELINE_OPTIONS = options_for(**BASELINE_SWITCHES)
 
 TxHash = str
 
@@ -92,21 +129,29 @@ def run_kwargs_from_options(hl_data, options=BASELINE_OPTIONS) -> dict:
 
 class EngineAdapter:
     def __init__(self, backend: str = "py"):
-        if backend != "py":
-            raise NotImplementedError(f"backend {backend!r}: only 'py' exists until M5 (Rust core)")
+        """backend "py" = the Python engine unchanged. "rust" = the same engine with the parts M5 has ported so far
+        swapped for replay_core (today: the touch ledger's subset search). Default stays "py" until Satya signs off."""
+        if backend not in ("py", "rust"):
+            raise ValueError(f"unknown backend {backend!r}")
+        self.rust = None
+        if backend == "rust":
+            from replay_core import replay_core as rust     # ImportError if the crate is not built
+            self.rust = rust
         self.backend = backend
 
     # -------------------------------------------------------------- books
-    def new_book(self, window, hl_data, policy_name: str = "listing", options=BASELINE_OPTIONS,
-                 observer: Observer | None = None) -> BookHandle:
-        """A book positioned before the window's first block (seeded from the nearest snapshot, as today)."""
-        args, kw = replay_args(window, hl_data, policy_name, **run_kwargs_from_options(hl_data, options))
+    def new_book(self, window, hl_data, options=BASELINE_OPTIONS, observer: Observer | None = None) -> BookHandle:
+        """A book positioned before the window's first block (seeded from the nearest snapshot, as today).
+        options: replay options incl. an optional --policy, e.g. options_for(stp=..., order=..., correction=...)."""
+        policy_name, opts = split_policy(options)
+        args, kw = replay_args(window, hl_data, policy_name, **run_kwargs_from_options(hl_data, opts))
         return self.book_from_replay(Replay(*args, **kw), observer)
 
-    @staticmethod
-    def book_from_replay(rp: Replay, observer: Observer | None = None) -> BookHandle:
+    def book_from_replay(self, rp: Replay, observer: Observer | None = None) -> BookHandle:
         if observer is not None:
             rp.observer = observer
+        if self.rust is not None:
+            rp.subset_search = self.rust.unique_subset
         rp._begin_blocks()
         return BookHandle(rp)
 
