@@ -58,3 +58,23 @@ No `cargo bench` / criterion suite was added: the plan's measurements are end-to
 | runtime vs baseline | (no M5 limit) | 0.78x of the Python run (1.28x faster) | no |
 | timings protocol | median of >= 3, capture paused | 3 runs per backend, two paused windows (41 + 25 min) | no |
 | N_max in {1, 64, 256} | after M2 | not applicable yet (no particle filter) | n/a |
+
+## Q4: per-chunk setup cache (Nov 22; commit 0d53922)
+
+dev20, Rust backend, ingest RUNNING (never paused again: more runs + median). One priming run filled the cache,
+then 5 uncached and 5 cached runs, interleaved (`~/book-replay-data/handoff/q4/q4.sh`, `q4.log`). Every run
+re-checked parity: all 11 wrote CSVs byte-identical to the block-end baseline.
+
+| | runs (s) | median | peak RSS |
+|---|---|---|---|
+| no cache (`replay.parity --no-cache`) | 355.1, 359.1, 356.0, 355.6, 355.0 | **355.6 s** (17.8 s / chunk) | 1.39-1.46 GB |
+| warm cache (20 of 20 hits; 3.5-3.6 s loading in total) | 226.3, 223.3, 223.5, 223.5, 223.4 | **223.5 s** (11.2 s / chunk) | 1.37 GB |
+
+1.59x faster. Building the 20 Replays took 244 s in the priming run; loading them takes 3.6 s. What remains in a
+cached run is mostly scoring-side input that `analysis/validate_replay.run` reads after the Replay exists (real trades,
+ALO truth, tracked-user streams from the recorder files), which used to be warm in the parser's file cache from the
+build and now is read cold (QUESTIONS Q9). Disk: ~10 MB per chunk (lz4 pickle); the cache folder held 644 MB after
+the day's runs because entries from earlier code versions stay until the 5 GB LRU cap evicts them.
+
+Note: a first benchmark attempt was invalid (0 hits) because the key hashed all of `replay/`, and the simulator was
+being edited in that folder during the runs; the key now covers only what a built Replay depends on (CODE_PATHS).

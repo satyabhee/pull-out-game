@@ -118,3 +118,12 @@ orders, 10x fewer post-only margin rejections, no open-order cap; docs/m1_report
 smaller MM orders per level, a broke quoter agent, an open-order cap), regenerate sim200 (90 s), re-run calibration
 and the baseline (recommended: cheap, and M2 needs it). (b) Defer to M3 profiles. **Blocked / done instead.** The
 default suite is the untuned v1; nothing in M1's done-criteria depends on the answer.
+
+## Q9. Cache the scoring-side inputs too?
+
+**Why it matters.** The setup cache made dev20 1.59x faster (355.6 -> 223.5 s). Most of the remaining ~10 s per
+chunk is `analysis/validate_replay.run` reading the real trades, ALO truth and tracked-user streams from the recorder
+files after the Replay is built. Caching them (same key scheme) would likely bring a dev20 run near the ~40 s of pure
+block replay. **Options.** (a) Extend the cache to those inputs: a change inside the scoring module's input loading
+(no change to scoring logic), so it needs your OK. (b) Leave scoring untouched (current). **Blocked / done instead.**
+Nothing; the cache covers the built Replay only.
