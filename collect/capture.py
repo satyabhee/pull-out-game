@@ -37,6 +37,8 @@ Settings (environment variables):
   CHUNK_HIST_USERS=1   chunks: historicalOrders of the users with the most int-oid cancels (hist_orders.json), asked
                        after the chunk's blocks are fetched (minutes late: a busy user's last 2000 orders may no
                        longer reach back to the chunk)
+  MARGIN_USERS=0       chunks: when the chunk is planned, clearinghouseState + spotClearinghouseState (weight 2
+                       each) of this many users: the previous chunk's IOC users, then recent takers
   HIST_END_USERS=6     chunks: historicalOrders (~120 weight each, reserved up front so they queue under the
                        budget instead of bursting) asked all at once as soon as the chunk's last block exists (its
                        history then always covers the chunk), for the ranker's users (TRACKERS_FILE: contested
@@ -72,6 +74,7 @@ CHUNK_HIST_USERS = int(os.environ.get("CHUNK_HIST_USERS", 1))
 HIST_END_USERS = int(os.environ.get("HIST_END_USERS", 6))
 TRACKERS_FILE = os.environ.get("TRACKERS_FILE", "trackers.json")
 HIST_END_RANDOM = os.environ.get("HIST_END_RANDOM") == "1"
+MARGIN_USERS = int(os.environ.get("MARGIN_USERS", 0))   # chunks: clearinghouseState + spot of this many IOC users at plan time
 TARGET_LOOKUPS = int(os.environ.get("TARGET_LOOKUPS", 0))    # orderStatus of int-oid cancel targets in the SCORED blocks   # experiment: per-chunk coin flip (seeded by the snapshot)
 INFO_FILES = {"userFillsByTime": "fills.json", "frontendOpenOrders": "open_orders.json",
               "historicalOrders": "hist_orders.json"}
@@ -390,6 +393,44 @@ def top_makers(trades, n):
     return [u for u, _ in sorted(c.items(), key=lambda x: (-x[1], x[0]))][:n]
 
 
+def ioc_users(block):
+    """user -> number of BTC/ETH IOC order items in one block's txs (rejected ones too: the margin snapshot
+    is for exactly the users whose IOCs the chain rejects)."""
+    c = collections.Counter()
+    for tx in block.get("txs", []):
+        a = tx.get("action") or {}
+        kind = a.get("type")
+        items = (a.get("orders", []) if kind == "order" else [a.get("order", {})] if kind == "modify"
+                 else [m.get("order", {}) for m in a.get("modifies", [])] if kind == "batchModify" else [])
+        n = sum(1 for o in items if isinstance(o, dict) and o.get("a") in (0, 1)
+                and ((o.get("t") or {}).get("limit") or {}).get("tif") == "Ioc")
+        if n:
+            c[tx.get("user", "").lower()] += n
+    return c
+
+
+def margin_users(prev_iocs, trades, n):
+    """Users for the plan-time margin snapshot: the previous chunk's IOC users (most IOCs first), then the takers
+    of the recorder's recent trades (most notional first)."""
+    out = [u for u, _ in sorted((prev_iocs or {}).items(), key=lambda x: (-x[1], x[0]))]
+    c = collections.Counter()
+    for t in trades:
+        taker = t["users"][0] if t["side"] == "B" else t["users"][1]
+        c[taker.lower()] += float(t["px"]) * float(t["sz"])
+    out += [u for u, _ in sorted(c.items(), key=lambda x: (-x[1], x[0])) if u not in out]
+    return out[:n]
+
+
+def ask_margin(writer, snap_ms, users):
+    """clearinghouseState and spotClearinghouseState of `users`, asked at once when the chunk is planned (the
+    scored blocks are a few seconds after the snapshot). Stored with the chunk (clearinghouseState.json ...)."""
+    if not users:
+        return None
+    extra = {"snapshot_time": snap_ms}
+    writer.ask_info_now("clearinghouseState", users, extra)
+    return writer.ask_info_now("spotClearinghouseState", users, extra)
+
+
 def int_cancel_users(block):
     """user -> number of BTC/ETH int-oid cancel/modify-target items in one block's successful txs."""
     c = collections.Counter()
@@ -454,6 +495,7 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
     meta.setdefault("failed_heights", [])
     fetched_now, t0, status = 0, time.time(), None
     cancels = collections.Counter()
+    iocs = collections.Counter()
     for i, h in enumerate(range(start, end + 1)):
         p = os.path.join(d, f"{h}.json.gz")
         b = None
@@ -500,6 +542,7 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
         if b is not None:
             picker.feed(h, b)
             cancels.update(int_cancel_users(b))
+            iocs.update(ioc_users(b))
             if h >= start + warmup:
                 for u, oid in int_oid_targets(b):
                     scored_targets.setdefault((u, oid), h)
@@ -514,6 +557,7 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
             meta["blocks_on_disk"] = len(glob.glob(os.path.join(d, "*.json.gz")))
             save_json(wpath, meta); save_json(apath, old + writer.snapshot())
     meta["int_cancel_users"] = dict(sorted(cancels.items(), key=lambda x: (-x[1], x[0]))[:30])
+    meta["ioc_users"] = dict(sorted(iocs.items(), key=lambda x: (-x[1], x[0]))[:100])
     if extras and status is None:
         ask_extras(writer, extras, meta, cancels)
     if TARGET_LOOKUPS and status is None and scored_targets:
@@ -767,6 +811,7 @@ def run_chunks(fetcher, state, writer, cancellers=None):
     last_snap, last_start = 0, 0.0
     cancellers = cancellers or CancellerTally()
     answered = None                                  # prefetched open orders: latest answer time (ms)
+    prev_iocs = {}                                   # previous chunk's IOC users (margin snapshot)
     while True:
         pct = disk_pct()
         if pct > 85:
@@ -803,6 +848,11 @@ def run_chunks(fetcher, state, writer, cancellers=None):
             answered = None
         else:
             ask_open_orders(writer, snap)
+        if MARGIN_USERS:
+            mu = margin_users(prev_iocs, recorder_trades(snap - 60_000, snap), MARGIN_USERS)
+            if ask_margin(writer, snap, mu):
+                meta["margin_users"] = len(mu)
+                meta["margin_answered_at"] = int(time.time() * 1000)
         hist_on = HIST_END_USERS and (not HIST_END_RANDOM or random.Random(snap).random() < 0.5)
         if HIST_END_RANDOM:
             meta["arm_hist_end"] = bool(hist_on)
@@ -814,6 +864,7 @@ def run_chunks(fetcher, state, writer, cancellers=None):
         status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=warmup, max_anchors=CHUNK_ANCHORS,
                          extras=chunk_extras())
         cancellers.add(meta.get("int_cancel_users"))
+        prev_iocs = meta.get("ioc_users") or {}
         save_json(STATE, state)
         if status == "archived_cap":
             if ONCE:

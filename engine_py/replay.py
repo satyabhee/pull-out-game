@@ -186,6 +186,36 @@ def unique_subset(sizes: list[int], k: int, target: int, budget: int = 300_000):
     return tuple(out)
 
 
+MAX_LEVERAGE = {"BTC": 40, "ETH": 25}          # Hyperliquid max leverage (Nov 2026): the most lenient margin need
+
+
+def load_margin(window_dir, spot: bool = False) -> dict:
+    """taker_reject margin: user -> (free margin USD, {coin: signed position size}) from the chunk's plan-time
+    clearinghouseState.json (collect/capture.py MARGIN_USERS). free = accountValue - totalMarginUsed (perp only);
+    spot=True adds the spot USDC available after maintenance (unified accounts). Missing file: {}."""
+    path = Path(window_dir) / "clearinghouseState.json"
+    if not path.exists():
+        return {}
+    out = {}
+    for r in json.load(open(path)):
+        ans = r.get("answer")
+        if not isinstance(ans, dict) or "marginSummary" not in ans:
+            continue
+        ms = ans["marginSummary"]
+        free = float(ms["accountValue"]) - float(ms["totalMarginUsed"])
+        pos = {p["position"]["coin"]: float(p["position"]["szi"]) for p in ans.get("assetPositions", [])}
+        out[r["user"].lower()] = (free, pos)
+    if spot:
+        sp = Path(window_dir) / "spotClearinghouseState.json"
+        for r in (json.load(open(sp)) if sp.exists() else []):
+            ans, u = r.get("answer"), r["user"].lower()
+            if u in out and isinstance(ans, dict):
+                avail = dict((int(k), float(v)) for k, v in ans.get("tokenToAvailableAfterMaintenance") or [])
+                if 0 in avail:
+                    out[u] = (out[u][0] + avail[0], out[u][1])
+    return out
+
+
 class Replay:
     def __init__(self, window_dir, hl_data, policy: Policy, *, anchors=None, use_resolver: bool = True,
                  nearest_ratio: int = 0, check_permutation: bool = True, hasher: Hasher | None = None,
@@ -367,12 +397,14 @@ class Replay:
         self.refill_position = refill_position
         self.learn_stats: Counter = Counter()
         self.taker_reject = frozenset(x for x in (taker_reject or "").split(",") if x)
-        bad = self.taker_reject - {"min10", "learn"}
+        bad = self.taker_reject - {"min10", "learn", "margin", "margin_spot"}
         if bad:
             raise ValueError(f"unknown taker_reject rules {sorted(bad)}")
         self.taker_stats: Counter = Counter()
         self._taker_blocked: set[str] = set()    # learn: users whose last engine-filled IOC had no real fill
         self._blk_ioc: dict[str, tuple[str, bool]] = {}   # this block: hash -> (user, engine filled or skipped)
+        self._margin = load_margin(self.window_dir, spot="margin_spot" in self.taker_reject) \
+            if self.taker_reject & {"margin", "margin_spot"} else {}
         self._real_trades: dict[str, list] = {}
         if self._rules or "learn" in self.taker_reject:
             for tr in iter_trades(self.hl_data, COINS, self.t0, self.t1):
@@ -799,13 +831,27 @@ class Replay:
     def _taker_skip(self, p: Place) -> str | None:
         """taker_reject: why this IOC is treated as rejected by the chain (None = apply it).
         min10: notional (limit px x size) under 10 USD, Hyperliquid's minimum order value.
-        learn: the user's last IOC that filled in the engine had no real trade (and no real fill since)."""
+        learn: the user's last IOC that filled in the engine had no real trade (and no real fill since).
+        margin / margin_spot: the order grows the user's position and their plan-time free margin (see load_margin)
+        is under the grown notional / max leverage; reduce-only orders and users without a snapshot pass."""
         if "min10" in self.taker_reject:
             a = ASSETS[p.asset]
             if Decimal(a.ticks_to_px(p.px)) * Decimal(a.lots_to_sz(p.sz)) < 10:
                 return "skip_min10"
         if "learn" in self.taker_reject and p.user in self._taker_blocked:
             return "skip_learn"
+        if self._margin and not p.reduce_only:
+            st = self._margin.get(p.user.lower())
+            if st is None:
+                self.taker_stats["margin_unknown"] += 1
+            else:
+                a = ASSETS[p.asset]
+                free, pos = st
+                szi = pos.get(a.name, 0.0)
+                signed = float(a.lots_to_sz(p.sz)) * (1 if p.side is Side.BUY else -1)
+                grow = abs(signed) if szi == 0 or (szi > 0) == (signed > 0) else max(0.0, abs(signed) - abs(szi))
+                if grow > 0 and free < grow * float(a.ticks_to_px(p.px)) / MAX_LEVERAGE[a.name]:
+                    return "skip_margin"
         return None
 
     def _taker_learn(self) -> None:
@@ -1101,6 +1147,8 @@ class Replay:
                         self._learn(a.hash)
             if "learn" in self.taker_reject:
                 self._taker_learn()
+            else:
+                self._blk_ioc.clear()
             eng.end_block(b.height, b.time_ms)
             minute = self.minute(b.time_ms)
             self.observer.after_block(self, b, minute)

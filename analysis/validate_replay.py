@@ -847,7 +847,9 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="int-oid resolver preset (default ghost = data/oids defaults; none = old rule)")
     ap.add_argument("--taker-reject", metavar="RULES", default=None,
                     help="treat IOC takers as rejected by the chain (comma list): min10 = notional under 10 USD; "
-                         "learn = the user's last engine-filled IOC had no real trade (until a real fill)")
+                         "learn = the user's last engine-filled IOC had no real trade (until a real fill); "
+                         "margin = grows the position past the plan-time free margin (clearinghouseState.json); "
+                         "margin_spot = margin plus spot USDC available")
     ap.add_argument("--trade-learn-at", choices=["tx", "block-end"], default="tx",
                     help="when trade_learn corrections run: after each tx (default) or once at the end of the block, in "
                          "listing order (same position under every ordering policy; use for counterfactuals)")

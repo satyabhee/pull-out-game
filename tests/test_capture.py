@@ -461,3 +461,22 @@ def test_scored_block_cancel_targets_are_looked_up_unpaced_and_skip_covered_user
     assert cap.capture(F(), 10, 14, meta, writer=w, state={}, warmup=2, max_anchors=0, extras=extras) == "complete"
     assert asked == [("0xu", 112), ("0xu", 113), ("0xu", 114)]          # scored blocks only, covered user skipped,
     assert meta["target_lookups"] == 3 and meta["target_candidates"] == 6  # and no 100-s gap between them
+
+
+def test_ioc_users_counts_btc_eth_iocs_including_rejected():
+    ioc = {"a": 0, "b": True, "p": "1", "s": "1", "r": False, "t": {"limit": {"tif": "Ioc"}}}
+    alo = {**ioc, "t": {"limit": {"tif": "Alo"}}}
+    block = {"txs": [
+        {"user": "0xAA", "error": None, "action": {"type": "order", "orders": [ioc, ioc, alo]}},
+        {"user": "0xbb", "error": "rejected", "action": {"type": "order", "orders": [ioc]}},
+        {"user": "0xcc", "action": {"type": "order", "orders": [{**ioc, "a": 5}]}},          # other asset
+        {"user": "0xdd", "action": {"type": "batchModify", "modifies": [{"oid": 1, "order": ioc}]}},
+    ]}
+    assert dict(cap.ioc_users(block)) == {"0xaa": 2, "0xbb": 1, "0xdd": 1}
+
+
+def test_margin_users_prev_iocs_first_then_recent_takers():
+    trades = [{"users": ["0xT1", "0xM1"], "side": "B", "px": "100", "sz": "1"},
+              {"users": ["0xM2", "0xT2"], "side": "A", "px": "100", "sz": "5"},
+              {"users": ["0xi1", "0xM3"], "side": "B", "px": "100", "sz": "9"}]
+    assert cap.margin_users({"0xi1": 3, "0xi2": 7}, trades, 4) == ["0xi2", "0xi1", "0xt2", "0xt1"]

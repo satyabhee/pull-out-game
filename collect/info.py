@@ -15,7 +15,7 @@ import urllib.request
 
 URL = "https://api.hyperliquid.xyz/info"
 WEIGHT_PER_MIN = int(os.environ.get("INFO_WEIGHT_PER_MIN", 600))
-BASE_WEIGHT = {"orderStatus": 2, "userFillsByTime": 20, "historicalOrders": 20, "frontendOpenOrders": 20}
+BASE_WEIGHT = {"orderStatus": 2, "clearinghouseState": 2, "spotClearinghouseState": 2, "userFillsByTime": 20, "historicalOrders": 20, "frontendOpenOrders": 20}
 PER_20_ITEMS = {"userFillsByTime", "historicalOrders"}
 
 
@@ -85,5 +85,14 @@ def frontend_open_orders(user):
     return post({"type": "frontendOpenOrders", "user": user})
 
 
+def clearinghouse_state(user):
+    return post({"type": "clearinghouseState", "user": user})
+
+
+def spot_clearinghouse_state(user):
+    return post({"type": "spotClearinghouseState", "user": user})
+
+
 CALLS = {"userFillsByTime": user_fills_by_time, "historicalOrders": historical_orders,
-         "frontendOpenOrders": frontend_open_orders}
+         "frontendOpenOrders": frontend_open_orders, "clearinghouseState": clearinghouse_state,
+         "spotClearinghouseState": spot_clearinghouse_state}
