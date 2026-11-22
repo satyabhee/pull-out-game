@@ -1,0 +1,7 @@
+#!/bin/sh
+# MAHITO_PLAN §0b pre-commit: refuse key-like secrets / env files / >1 MB model files, then `make check`.
+# Not installed automatically. Enable for this clone with:  git config core.hooksPath scripts/git-hooks
+# (worktrees of other branches without scripts/git-hooks then simply have no hook).
+set -e
+python3 scripts/check_secrets.py
+[ -n "$SKIP_MAKE_CHECK" ] || make check

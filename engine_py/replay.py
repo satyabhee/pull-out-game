@@ -1162,8 +1162,14 @@ class Replay:
         return fills, rejects
 
     def __iter__(self) -> Iterator[tuple[int, list[Fill], list[Reject], bytes | None]]:
-        eng = self.engine
-        state_hash: bytes | None = None
+        self._begin_blocks()
+        while self._next_bi < len(self.blocks):
+            yield self.step_block()
+
+    def _begin_blocks(self) -> None:
+        """Set up block-by-block replay (replay/adapter.py drives step_block directly)."""
+        self._state_hash: bytes | None = None
+        self._next_bi = 0
         times = [b.time_ms for b in self.blocks]
         at_block: dict[int, list] = {}               # block index -> snapshots applied after it
         for s in self.snapshots:                    # rule 8: the last block with time <= s.time
@@ -1175,63 +1181,69 @@ class Replay:
                 self.shift_dropped += 1
                 continue
             at_block.setdefault(bi, []).append(s)
-        for bi, b in enumerate(self.blocks):
-            self.block_index = bi
-            if self.touch is not None:
-                self.touch.advance(b.time_ms)
-            if self.touch_reconcile:
-                self._reconcile_touch()
-            if self.placeholder_ttl_ms is not None:
-                self._expire_placeholders(b.time_ms)
-            ordered, outside = self._ordered(b)
-            fills: list[Fill] = []
-            rejects: list[Reject] = []
-            seq = self._sequence(ordered, outside)
-            for i, a in enumerate(seq):
-                f, r = self._apply(b, a)
-                fills += f
-                rejects += r
-                if (self._rules and self.trade_learn_at == "tx" and not isinstance(a, OutsideFill)
-                        and (i + 1 == len(seq) or seq[i + 1].hash != a.hash)):
+        self._at_block = at_block
+
+    def step_block(self) -> tuple[int, list[Fill], list[Reject], bytes | None]:
+        """Replay the next block: (height, fills, rejects, state_hash). Same body as the former __iter__ loop."""
+        eng, at_block, bi = self.engine, self._at_block, self._next_bi
+        b = self.blocks[bi]
+        self.block_index = bi
+        if self.touch is not None:
+            self.touch.advance(b.time_ms)
+        if self.touch_reconcile:
+            self._reconcile_touch()
+        if self.placeholder_ttl_ms is not None:
+            self._expire_placeholders(b.time_ms)
+        ordered, outside = self._ordered(b)
+        fills: list[Fill] = []
+        rejects: list[Reject] = []
+        seq = self._sequence(ordered, outside)
+        for i, a in enumerate(seq):
+            f, r = self._apply(b, a)
+            fills += f
+            rejects += r
+            if (self._rules and self.trade_learn_at == "tx" and not isinstance(a, OutsideFill)
+                    and (i + 1 == len(seq) or seq[i + 1].hash != a.hash)):
+                self._learn(a.hash)
+        if self._rules and self.trade_learn_at == "block-end":
+            done: set[str] = set()
+            for a in sorted((x for x in ordered), key=lambda x: (x.tx_index, x.item_index)):
+                if a.hash not in done:
+                    done.add(a.hash)
                     self._learn(a.hash)
-            if self._rules and self.trade_learn_at == "block-end":
-                done: set[str] = set()
-                for a in sorted((x for x in ordered), key=lambda x: (x.tx_index, x.item_index)):
-                    if a.hash not in done:
-                        done.add(a.hash)
-                        self._learn(a.hash)
-            if "learn" in self.taker_reject:
-                self._taker_learn()
+        if "learn" in self.taker_reject:
+            self._taker_learn()
+        else:
+            self._blk_ioc.clear()
+        eng.end_block(b.height, b.time_ms)
+        minute = self.minute(b.time_ms)
+        self.observer.after_block(self, b, minute)
+        for s in at_block.get(bi, ()):
+            if self.reseed:
+                self.observer.before_reseed(self, b, s)
+            if self.reseed and self.keep_known:
+                res = eng.reconcile(s.asset, s.bids, s.asks, known="oldest")
+                first = eng.next_oid
+                res.update(eng.refill(s.asset, s.bids, s.asks), refill=1)
+                self._note_refill(s, first)
+                if self.refill_position == "back":
+                    self._refill_to_back(s.asset, first)
+            elif self.reseed:
+                res = eng.reconcile(s.asset, s.bids, s.asks)     # measure drift, then rebuild
+                res.update(eng.clear(s.asset), reseed=1)
+                self._seed_levels(s.asset, s.bids, s.asks, s.time_ms,
+                                  self._cap_sizes(s) if self.placeholder_cap == "next" else None)
             else:
-                self._blk_ioc.clear()
-            eng.end_block(b.height, b.time_ms)
-            minute = self.minute(b.time_ms)
-            self.observer.after_block(self, b, minute)
-            for s in at_block.get(bi, ()):
-                if self.reseed:
-                    self.observer.before_reseed(self, b, s)
-                if self.reseed and self.keep_known:
-                    res = eng.reconcile(s.asset, s.bids, s.asks, known="oldest")
-                    first = eng.next_oid
-                    res.update(eng.refill(s.asset, s.bids, s.asks), refill=1)
-                    self._note_refill(s, first)
-                    if self.refill_position == "back":
-                        self._refill_to_back(s.asset, first)
-                elif self.reseed:
-                    res = eng.reconcile(s.asset, s.bids, s.asks)     # measure drift, then rebuild
-                    res.update(eng.clear(s.asset), reseed=1)
-                    self._seed_levels(s.asset, s.bids, s.asks, s.time_ms,
-                                      self._cap_sizes(s) if self.placeholder_cap == "next" else None)
-                else:
-                    res = eng.reconcile(s.asset, s.bids, s.asks, known=self.reconcile_known)
-                for k, v in res.items():
-                    self.reconciled[(ASSETS[s.asset].name, k)] += v
-                if self.deep_book:
-                    self._build_deep(s)
-                self.observer.after_reconcile(self, b, s, res, minute)
-            if self.hasher is not None:
-                state_hash = self.hasher(eng, state_hash, b.height)
-            yield b.height, fills, rejects, state_hash
+                res = eng.reconcile(s.asset, s.bids, s.asks, known=self.reconcile_known)
+            for k, v in res.items():
+                self.reconciled[(ASSETS[s.asset].name, k)] += v
+            if self.deep_book:
+                self._build_deep(s)
+            self.observer.after_reconcile(self, b, s, res, minute)
+        if self.hasher is not None:
+            self._state_hash = self.hasher(eng, self._state_hash, b.height)
+        self._next_bi = bi + 1
+        return b.height, fills, rejects, self._state_hash
 
 
 def run(window_dir, policy: Policy, *, hl_data, **kw) -> Iterator[tuple[int, list[Fill], list[Reject], bytes | None]]:

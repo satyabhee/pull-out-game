@@ -41,3 +41,22 @@ handoff/
 
 # local Claude skills (copied from K-Dense scientific-agent-skills, adapted)
 .claude/skills/
+
+# MAHITO_PLAN §0b: never commit data, truth logs, model files, keys (scripts/check_secrets.py enforces keys/size)
+sim_data/
+truth/
+truth_logs/
+*.parquet
+probe_data/
+replay/probe/data/
+recorder_out/
+*.lgb
+*.onnx
+*.pkl
+*.joblib
+*.pt
+.env
+.env.*
+*.key
+*HL_TESTNET_KEY_*
+replay_core/target/
