@@ -130,6 +130,7 @@ def chunk_row(out: dict, meta: dict | None) -> dict:
     for scope in ("all", *COINS):
         for m in CHUNK_METRICS:
             row[f"{scope}:{m}"] = res.get(f"{scope}:{m}", "")
+    row["taker_blocked_end"] = res.get("taker_blocked_end", "")
     row["error"] = out["error"]
     return row
 

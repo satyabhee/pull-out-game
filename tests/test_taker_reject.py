@@ -63,3 +63,12 @@ def test_load_margin(tmp_path):
     assert load_margin(tmp_path) == {"0xab": (-7.0, {"BTC": -0.02})}
     assert load_margin(tmp_path, spot=True) == {"0xab": (11.5, {"BTC": -0.02})}
     assert load_margin(tmp_path / "missing") == {}
+
+
+def test_seeded_user_blocked_until_real_fill():
+    r = bare({"learn"}, real={"0xb": ["trade"]})
+    r._taker_blocked = {"u"}                    # seeded from an earlier chunk
+    assert r._taker_skip(ioc("u", "60000", "1")) == "skip_learn"
+    r._blk_ioc = {"0xb": ("u", True)}           # a skipped IOC of u really traded -> unblock
+    r._taker_learn()
+    assert r._taker_skip(ioc("u", "60000", "1")) is None

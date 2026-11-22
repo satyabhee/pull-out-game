@@ -234,7 +234,8 @@ class Replay:
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
                  deep_book: bool = False, deep_lookback_ms: int = 600_000, learn_keep_known: bool = False,
                  facts_exclude: tuple = (), use_bbo: bool = True, anchor_drop_kinds: tuple = (),
-                 oid_bracket: bool = False, taker_reject: str | None = None):
+                 oid_bracket: bool = False, taker_reject: str | None = None,
+                 taker_seed=None):
         """oid_bracket: reference points from the tracked users' orders on every coin + the monotone c(k) bracket
         rule in the resolver (data/oids.py).
         anchors: path to an anchors file; None = the window's anchors.json if present.
@@ -401,7 +402,7 @@ class Replay:
         if bad:
             raise ValueError(f"unknown taker_reject rules {sorted(bad)}")
         self.taker_stats: Counter = Counter()
-        self._taker_blocked: set[str] = set()    # learn: users whose last engine-filled IOC had no real fill
+        self._taker_blocked: set[str] = set(taker_seed or ())    # learn: users whose last engine-filled IOC had no real fill (seeded from earlier chunks)
         self._blk_ioc: dict[str, tuple[str, bool]] = {}   # this block: hash -> (user, engine filled or skipped)
         self._margin = load_margin(self.window_dir, spot="margin_spot" in self.taker_reject) \
             if self.taker_reject & {"margin", "margin_spot"} else {}
