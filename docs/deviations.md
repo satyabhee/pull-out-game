@@ -148,3 +148,9 @@ baseline switches); `make checkpoint` runs full dev20 parity under both `correct
 `backend="rust"`; `"py"` stays the reference that every Rust result is checked against. There was no CI in the repo:
 `.github/workflows/check.yml` runs the same `make check` on GitHub (Rust build, cargo test + clippy, all pytest
 incl. the Rust-vs-Python differential tests; dev20-data tests skip there). Untested on GitHub until it is pushed.
+
+**D26. Problem page source.** `docs/problem_page.md` was not in the repo on Nov 22, so it was transcribed from the
+"Replay the Order Book" artifact (version of Nov 22) with P4 case 2 corrected to `after = (6.5, 4)`. The Examples
+are data in `tests/chain_examples.py` (what the chain does), shared with M1's rules engine. Through the replay engine:
+Example 1 passes (docs priority), Example 6 passes with `stp=maker` and is a strict xfail under the default
+`stp=taker`, Examples 2, 5, 7 are strict xfails (hidden margin / position state the engine cannot see).
