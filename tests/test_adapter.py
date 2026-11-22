@@ -28,7 +28,7 @@ def test_empty_context():
 
 
 def test_backends():
-    assert EngineAdapter().backend == "py"          # default stays Python until sign-off
+    assert EngineAdapter().backend == "rust"        # default since Nov 22 (Q3); "py" is the reference
     assert "--trade-learn-at" in BASELINE_OPTIONS and BASELINE_OPTIONS[BASELINE_OPTIONS.index("--trade-learn-at") + 1] == "block-end"
     with pytest.raises(ValueError):
         options_for(order="fifo")
@@ -68,7 +68,7 @@ def test_replay_args_restores_scoring_module():
 @needs_data
 def test_apply_block_equals_engine_iteration():
     ref = [f for _, fills, _, _ in islice(iter(fresh_replay()), N) for f in fills]
-    ad = EngineAdapter()
+    ad = EngineAdapter("py")                        # wraps a Python-engine Replay
     book = ad.book_from_replay(fresh_replay())
     got = []
     for _ in range(N):

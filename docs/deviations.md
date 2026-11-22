@@ -141,3 +141,10 @@ Rust-internal properties (book invariants and copies, subset search vs brute for
 **D23. Parity runner switches.** `python -m replay.parity` takes `--stp/--order/--correction` (default = the
 baseline switches); `make checkpoint` runs full dev20 parity under both `correction` settings (block-end vs
 `report/validate/m0_blockend20`, mid-block vs `report/validate/m0_base20`), so Q1's answer does not change coverage.
+
+## After the M5 checkpoint (Nov 22, Satya's answers)
+
+**D25. Default backend is Rust (Q3).** `EngineAdapter()` and `python -m replay.parity` now default to
+`backend="rust"`; `"py"` stays the reference that every Rust result is checked against. There was no CI in the repo:
+`.github/workflows/check.yml` runs the same `make check` on GitHub (Rust build, cargo test + clippy, all pytest
+incl. the Rust-vs-Python differential tests; dev20-data tests skip there). Untested on GitHub until it is pushed.

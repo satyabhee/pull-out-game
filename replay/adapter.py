@@ -128,11 +128,11 @@ def run_kwargs_from_options(hl_data, options=BASELINE_OPTIONS) -> dict:
 
 
 class EngineAdapter:
-    def __init__(self, backend: str = "py"):
+    def __init__(self, backend: str = "rust"):
         """backend "py" = the Python engine unchanged. "rust" = the same engine with the parts M5 has ported so far
         swapped for replay_core (the touch ledger's subset search and the engine: matching, cancels, self-trade,
-        priority, reconcile, schedules, on copy-on-write books).
-        Default stays "py" until Satya signs off."""
+        priority, reconcile, schedules, on copy-on-write books). Default "rust" since Nov 22 (Satya, Q3); "py" stays
+        the reference every Rust result is checked against (tests/test_rust_*.py, test_adapter.py, replay.parity)."""
         if backend not in ("py", "rust"):
             raise ValueError(f"unknown backend {backend!r}")
         self.rust = None

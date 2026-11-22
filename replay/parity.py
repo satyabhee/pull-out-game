@@ -20,7 +20,7 @@ from replay.adapter import (BASELINE_SWITCHES, SWITCHES, EngineAdapter, options_
                             split_policy)
 
 
-BACKEND = "py"
+BACKEND = "rust"
 
 
 class AdapterDrivenReplay(Replay):
@@ -60,7 +60,7 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--baseline", required=True)
     ap.add_argument("--options", default=None, help="replay options as one quoted string (default: baseline)")
-    ap.add_argument("--backend", default="py", choices=["py", "rust"])
+    ap.add_argument("--backend", default="rust", choices=["py", "rust"])
     for name, values in SWITCHES.items():          # switch settings (instead of --options); default = baseline
         ap.add_argument(f"--{name}", default=BASELINE_SWITCHES[name], choices=sorted(values))
     a = ap.parse_args(argv)

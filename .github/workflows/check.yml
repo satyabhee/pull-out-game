@@ -1,0 +1,28 @@
+# MAHITO_PLAN §0b in CI: the same `make check` the pre-commit hook runs.
+# Rust vs Python parity runs here through the differential tests (tests/test_rust_engine.py, test_rust_book.py,
+# test_replay_core.py). Tests that need the dev20 data (~/hl-data/mac3) skip themselves on CI; full dev20 parity
+# is `make checkpoint`, run locally where the data lives.
+name: check
+on:
+  push:
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Python env
+        run: |
+          uv venv .venv --python 3.12
+          uv pip install --python .venv/bin/python -e . pytest hypothesis "maturin==1.8.1"
+      - name: Build replay_core into the venv
+        run: make rust
+      - name: make check
+        run: make check

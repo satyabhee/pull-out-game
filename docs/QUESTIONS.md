@@ -1,5 +1,9 @@
 # Open questions for Satya (overnight Nov 22-23)
 
+**All five answered by Satya on Nov 22** (Q1: re-measure, keep block-end if contested CI includes ~0; Q2: split
+shared inputs from per-guess state as M2's first step; Q3: Rust becomes the default; Q4: no more porting, add a
+per-chunk setup cache instead; Q5: docs/problem_page.md added, write the Example tests). Kept below for the record.
+
 Each entry: the question, why it matters, options with a recommendation and evidence, what is blocked vs what
 was done instead. Most important first.
 
