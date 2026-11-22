@@ -45,6 +45,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from analysis import validate_replay as vr
+from data.catalog import chunk_gap
 from engine_py.replay import COINS
 
 DEFAULT_JOBS = min(4, os.cpu_count() or 1)   # CLI default; parallel output is byte-identical to --jobs 1
@@ -86,6 +87,8 @@ def find_chunks(paths) -> tuple[list[Path], list[tuple[Path, str]]]:
             skipped.append((d, f"kind {meta.get('kind', 'window')}"))
         elif meta.get("status") != "complete":
             skipped.append((d, f"status {meta.get('status')}"))
+        elif chunk_gap(d) is not None:               # recorder/capture had no data then (data/ingest_gaps.json)
+            skipped.append((d, "ingest gap"))
         else:
             chunks.append((meta.get("start_height", 0), d.name, d))
     return [d for *_, d in sorted(chunks)], skipped
