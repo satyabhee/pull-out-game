@@ -95,7 +95,7 @@ def generate_chunk(cfg: SimConfig, root: Path) -> dict:
             "first_block_time": first_t, "last_block_time": last_t}
     (window / "window.json").write_text(json.dumps(meta, indent=1))
     rec.write()
-    truth_bytes = write_truth(root / "truth" / f"{window.name}.jsonl.lz4", truth_extra + chain.truth)
+    truth_bytes = write_truth(root / "truth" / f"{window.name}.parquet", truth_extra + chain.truth)
     return {"chunk": window.name, "seed": cfg.seed, "blocks": cfg.n_blocks, "trades": n_trades,
             "orders": sum(1 for r in chain.truth if r["kind"] == "placed"), "truth_bytes": truth_bytes,
             "seconds": round(time.perf_counter() - t_gen, 2)}

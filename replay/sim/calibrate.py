@@ -79,7 +79,7 @@ def real_rejections(histories: Path) -> dict:
 def sim_rejections(root: Path, set_name: str) -> dict:
     alo = alo_margin = n = too_many = 0
     for c in chunks_of(root, set_name):
-        truth = read_truth(root / "truth" / f"{c.name}.jsonl.lz4")
+        truth = read_truth(root / "truth" / f"{c.name}.parquet")
         tif = {r["oid"]: r["tif"] for r in truth if r["kind"] == "placed"}
         n += len(tif)
         alo += sum(1 for t in tif.values() if t == "Alo")

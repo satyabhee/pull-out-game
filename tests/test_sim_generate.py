@@ -41,7 +41,7 @@ def test_masked_files_match_truth(tmp_path):
     cfg = SimConfig(seed=3, **SMALL)
     info = generate_chunk(cfg, tmp_path)
     window = tmp_path / "windows" / chunk_name(cfg)
-    truth = read_truth(tmp_path / "truth" / f"{window.name}.jsonl.lz4")
+    truth = read_truth(tmp_path / "truth" / f"{window.name}.parquet")
     blocks = list(iter_window(window))                                     # the real decoder reads every block
     assert len(blocks) == cfg.n_blocks and [b.height for b in blocks] == sorted(b.height for b in blocks)
     meta = json.loads((window / "window.json").read_text())
@@ -74,3 +74,15 @@ def test_full_visibility_replay_is_exact(tmp_path):
     assert real > 0 and len(scored) > 20
     assert sum(r["matched_notional_full"] for r in scored) == real
     assert all(r["match_full"] for r in scored)
+
+
+def test_truth_parquet_roundtrip_is_exact(tmp_path):
+    from replay.sim.truth import read_config, write_truth
+    recs = [{"kind": "config", "seed": 3, "markets": {0: (1, 2, 3)}},
+            {"kind": "placed", "oid": 1, "cloid": None, "reduce_only": False},       # None present
+            {"kind": "block", "height": 7, "batches": [[0, 1], [2]]},                 # nested list
+            {"kind": "order_status", "oid": 1, "status": "canceled", "by": "0xab"},
+            {"kind": "order_status", "oid": 2, "status": "reduceOnlyCanceled", "silent": True}]
+    write_truth(tmp_path / "t.parquet", recs)
+    assert read_truth(tmp_path / "t.parquet") == recs[1:]
+    assert read_config(tmp_path / "t.parquet") == {"kind": "config", "seed": 3, "markets": {"0": [1, 2, 3]}}

@@ -163,8 +163,10 @@ formats (explorer blocks, window.json, anchors.json, clearinghouseState.json, re
 and scoring run on simulated chunks unchanged. Suites live outside the repo: `~/hl-data/sim/m1` (set `sim200`,
 200 seeds) and `~/hl-data/sim/m1_fv` (set `fv20`, full visibility). Each seed gets its own recorder hour in 2028.
 
-**D28. Truth logs are lz4 JSON lines, not parquet.** Parquet needs `pyarrow`, a new dependency (QUESTIONS Q6).
-Only `replay/sim/truth.py` knows the format. Size: ~0.9 MB per chunk.
+**D28. Truth logs are parquet (Satya, Q6).** `pyarrow==18.1.0` added (pyproject + uv.lock). The truth log mixes
+record kinds, so `replay/sim/truth.py` writes the union of columns plus an `_absent` column listing each row's
+missing keys; `read_truth` returns exactly the dicts written (test: `test_truth_parquet_roundtrip_is_exact`). The
+SimConfig is kept as JSON in the file metadata (`read_config`). zstd compression.
 
 **D29. Rules-engine simplifications** (all in `rules_engine.py`'s docstring): free margin is fixed per account for
 the chunk (no mark-to-market) and checked on the order's full size at its limit price; rejected items take an oid;
