@@ -41,6 +41,9 @@ class CrossedBookError(BookError):
     pass
 
 
+DOCS_T_MS = 400        # priority-fees doc: ALO orders within T = 400 ms sort by priority
+
+
 class Engine:
     def __init__(self, stp: str = "cancel_taker", resolve_oid: Resolver | None = None,
                  check_every_action: bool = False, p_priority: str | int | None = None,
@@ -55,12 +58,17 @@ class Engine:
         from outside evidence (pre-window liquidity whose p we never saw) are never jumped.
         "knownpos" (Nov 21) = "known", except that an order without a priority bid (p = 0) is never jumped: p only
         reorders orders that both carry a bid (dump: in 44 of 82 wrong-maker misses the chain's maker had p = 0).
+        "docs" (Nov 22) = Hyperliquid priority-fees doc: a new ALO order goes ahead of each in-window ALO order
+        (placed through this engine less than DOCS_T_MS = 400 ms earlier, block time) with a lower p, p = 0
+        included; older orders have locked in their place. Placeholders / outside-evidence orders are never jumped.
+        "docsall" = "docs" for every resting tif, not only ALO.
         evict_arrival (off by default): reconcile(known="oldest"|"newest") picks known orders by arrival
         (Order.seq) instead of queue position. Under p_priority the queue head is the highest-p order, not
         the oldest one, so queue order would trim the freshest high-p orders first."""
-        if not (p_priority is None or p_priority in ("always", "known", "knownpos")
+        if not (p_priority is None or p_priority in ("always", "known", "knownpos", "docs", "docsall")
                 or (isinstance(p_priority, int) and p_priority >= 0)):
-            raise ValueError(f"p_priority must be None, 'always', 'known', 'knownpos' or ms >= 0, not {p_priority!r}")
+            raise ValueError(f"p_priority must be None, 'always', 'known', 'knownpos', 'docs', 'docsall' or ms >= 0, "
+                             f"not {p_priority!r}")
         self.evict_arrival = evict_arrival
         self.p_priority = p_priority
         self.p_meta: dict[int, tuple[int, int]] = {}         # engine oid -> (p, block time ms)
@@ -261,8 +269,11 @@ class Engine:
                     return m is not None and p > m[0]
                 if window == "knownpos":
                     return m is not None and 0 < m[0] < p
+                if window in ("docs", "docsall"):
+                    return (m is not None and p > m[0] and t - m[1] < DOCS_T_MS
+                            and (window == "docsall" or (order.tif is Tif.ALO and node.order.tif is Tif.ALO)))
                 return m is not None and m[0] > 0 and p > m[0] and t - m[1] <= window
-        if self.p_priority is not None and order.user != PLACEHOLDER and p is not None and (p or self.p_priority in ("known", "knownpos")):
+        if self.p_priority is not None and order.user != PLACEHOLDER and p is not None and (p or self.p_priority in ("known", "knownpos", "docs", "docsall")):
             self.p_meta[order.oid] = (p, self.block_time_ms)     # p None = rested from outside evidence
         self.books[order.asset].add(order, remaining, jumps=jumps)
         if order.user != PLACEHOLDER:

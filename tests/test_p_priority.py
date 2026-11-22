@@ -100,3 +100,16 @@ def test_knownpos_never_jumps_p0_orders_but_jumps_lower_positive_p():
     eng.apply(place("0xb", Side.SELL, 100, 1, p=3))
     eng.apply(place("0xc", Side.SELL, 100, 1, p=9))       # jumps b (3 < 9), not a (p 0)
     assert queue(eng, 100) == ["0xa", "0xc", "0xb"]
+
+
+def test_docs_example_zero_fee_jumped_in_window_then_locked():
+    # priority-fees doc: A (p 0) at t', B (p > 0) at t' + T - 1 -> B, A; C (p' > p) at t' + T + 1 -> B, A, C
+    eng = run("docs", [(0, place("0xa", Side.SELL, 100, 1)), (399, place("0xb", Side.SELL, 100, 1, p=3)),
+                       (401, place("0xc", Side.SELL, 100, 1, p=9))])
+    assert queue(eng, 100) == ["0xb", "0xa", "0xc"]
+
+
+def test_docs_alo_only_docsall_any_tif():
+    seq = [(0, place("0xa", Side.SELL, 100, 1, tif=Tif.GTC)), (10, place("0xb", Side.SELL, 100, 1, p=3))]
+    assert queue(run("docs", seq), 100) == ["0xa", "0xb"]
+    assert queue(run("docsall", seq), 100) == ["0xb", "0xa"]
