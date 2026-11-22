@@ -130,7 +130,9 @@ def run_kwargs_from_options(hl_data, options=BASELINE_OPTIONS) -> dict:
 class EngineAdapter:
     def __init__(self, backend: str = "py"):
         """backend "py" = the Python engine unchanged. "rust" = the same engine with the parts M5 has ported so far
-        swapped for replay_core (today: the touch ledger's subset search). Default stays "py" until Satya signs off."""
+        swapped for replay_core (the touch ledger's subset search and the engine: matching, cancels, self-trade,
+        priority, reconcile, schedules, on copy-on-write books).
+        Default stays "py" until Satya signs off."""
         if backend not in ("py", "rust"):
             raise ValueError(f"unknown backend {backend!r}")
         self.rust = None
@@ -145,12 +147,26 @@ class EngineAdapter:
         options: replay options incl. an optional --policy, e.g. options_for(stp=..., order=..., correction=...)."""
         policy_name, opts = split_policy(options)
         args, kw = replay_args(window, hl_data, policy_name, **run_kwargs_from_options(hl_data, opts))
+        kw["engine"] = self.prepare_engine(kw["engine"])
         return self.book_from_replay(Replay(*args, **kw), observer)
+
+    def prepare_engine(self, engine):
+        """The engine to build the Replay with. Backend "rust": a new RustEngine with the same settings as the
+        (new, empty) Python engine validate_replay.run created. Must run before the Replay seeds the book."""
+        if self.rust is None:
+            return engine
+        from replay.rust_engine import RustEngine
+        if any(len(b.side(s)) for b in engine.books.values() for s in (Side.BUY, Side.SELL)):
+            raise ValueError("prepare_engine needs an empty engine (call it before the Replay is built)")
+        return RustEngine.like(engine)
 
     def book_from_replay(self, rp: Replay, observer: Observer | None = None) -> BookHandle:
         if observer is not None:
             rp.observer = observer
         if self.rust is not None:
+            from replay.rust_engine import RustEngine
+            if not isinstance(rp.engine, RustEngine):
+                raise ValueError('backend "rust": build the Replay with prepare_engine(engine) first (or new_book)')
             rp.subset_search = self.rust.unique_subset
         rp._begin_blocks()
         return BookHandle(rp)

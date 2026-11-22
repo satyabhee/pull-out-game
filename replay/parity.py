@@ -16,7 +16,8 @@ from pathlib import Path
 from analysis import validate_chunks as vc
 from analysis import validate_replay as vr
 from engine_py.replay import Replay
-from replay.adapter import BASELINE_OPTIONS, EngineAdapter, run_kwargs_from_options, split_policy
+from replay.adapter import (BASELINE_SWITCHES, SWITCHES, EngineAdapter, options_for, run_kwargs_from_options,
+                            split_policy)
 
 
 BACKEND = "py"
@@ -24,6 +25,10 @@ BACKEND = "py"
 
 class AdapterDrivenReplay(Replay):
     """The Replay validate_replay.run builds, but its blocks are advanced through the adapter."""
+
+    def __init__(self, *a, **k):
+        k["engine"] = EngineAdapter(BACKEND).prepare_engine(k["engine"])   # Rust engine before the seed (rust)
+        super().__init__(*a, **k)
 
     def __iter__(self):
         ad = EngineAdapter(BACKEND)
@@ -56,11 +61,13 @@ def main(argv=None):
     ap.add_argument("--baseline", required=True)
     ap.add_argument("--options", default=None, help="replay options as one quoted string (default: baseline)")
     ap.add_argument("--backend", default="py", choices=["py", "rust"])
+    for name, values in SWITCHES.items():          # switch settings (instead of --options); default = baseline
+        ap.add_argument(f"--{name}", default=BASELINE_SWITCHES[name], choices=sorted(values))
     a = ap.parse_args(argv)
     global BACKEND
     BACKEND = a.backend
     EngineAdapter(BACKEND)                         # fail fast if the rust extension is missing
-    opts = a.options.split() if a.options else list(BASELINE_OPTIONS)
+    opts = a.options.split() if a.options else options_for(stp=a.stp, order=a.order, correction=a.correction)
     policy, opts = split_policy(opts)
     kw = run_kwargs_from_options(a.hl_data, opts)
     chunks, skipped = vc.find_chunks([a.chunks])

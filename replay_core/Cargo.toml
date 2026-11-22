@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "=0.23.4", features = ["abi3-py312"] }
+im = "=15.1.0"            # persistent maps: copy-on-write books (MAHITO_PLAN M5)
 
 [features]
 # maturin turns this on for the Python wheel; off for `cargo test` so test binaries link libpython

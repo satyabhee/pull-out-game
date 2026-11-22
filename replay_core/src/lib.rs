@@ -7,7 +7,15 @@
 //! Modules:
 //! - `subset`: the touch ledger's unique-subset search (`engine_py/replay.py::unique_subset`), the measured hot
 //!   spot of a one-guess replay (85-92% of per-block time on dev20).
+//! - `book`: one market's order book with copy-on-write price levels (`engine_py/book.py`).
+//! - `pybook`: the Python class for `book` (wrapped by `replay/rust_book.py` into engine_py.book.Book's API).
+//! - `engine`: the matching engine (`engine_py/matching.py`) on copy-on-write books.
+//! - `pyengine`: the Python classes for `engine` (wrapped by `replay/rust_engine.py` into engine_py.matching.Engine's API).
 
+pub mod book;
+pub mod engine;
+pub mod pybook;
+pub mod pyengine;
 pub mod subset;
 
 use pyo3::prelude::*;
@@ -40,5 +48,8 @@ fn unique_subset(py: Python<'_>, sizes: Vec<i64>, k: i64, target: i64, budget: u
 #[pymodule]
 fn replay_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(unique_subset, m)?)?;
+    m.add_class::<pybook::PyBook>()?;
+    m.add_class::<pyengine::PyEngine>()?;
+    m.add_class::<pyengine::BookRef>()?;
     Ok(())
 }

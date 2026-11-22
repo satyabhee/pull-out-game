@@ -10,7 +10,7 @@ import os
 import pytest
 
 from replay.adapter import SWITCHES, EngineAdapter, options_for
-from tests.test_adapter import CHUNK, HL, N, fresh_replay, key, needs_data
+from tests.test_adapter import CHUNK, HL, N, key, needs_data
 
 pytestmark = [
     needs_data,
@@ -26,7 +26,7 @@ def test_rust_equals_python(stp, order, correction):
     outs = {}
     for backend in ("py", "rust"):
         ad = EngineAdapter(backend)
-        book = ad.book_from_replay(fresh_replay(opts))
+        book = ad.new_book(CHUNK, HL, opts)
         fills = []
         for _ in range(N):
             for fs in ad.apply_block(book).values():

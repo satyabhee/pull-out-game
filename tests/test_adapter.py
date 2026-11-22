@@ -42,7 +42,7 @@ def test_rust_backend_same_fills_as_python():
     outs = {}
     for backend in ("py", "rust"):
         ad = EngineAdapter(backend)
-        book = ad.book_from_replay(fresh_replay())
+        book = ad.new_book(CHUNK, HL)
         fills = []
         for _ in range(N):
             for fs in ad.apply_block(book).values():
@@ -102,10 +102,19 @@ def test_new_book_and_errors():
     assert ad.level_view(book, 0, Side.BUY, ask + 10_000) == (0, 0)
 
 
+def _backends():
+    try:
+        import replay_core.replay_core  # noqa: F401
+        return ["py", "rust"]
+    except ImportError:
+        return ["py"]
+
+
 @needs_data
-def test_copy_is_independent_and_identical():
-    ad = EngineAdapter()
-    book = ad.book_from_replay(fresh_replay())
+@pytest.mark.parametrize("backend", _backends())
+def test_copy_is_independent_and_identical(backend):
+    ad = EngineAdapter(backend)
+    book = ad.new_book(CHUNK, HL)
     for _ in range(10):
         ad.apply_block(book)
     twin = ad.copy_book(book)

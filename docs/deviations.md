@@ -110,3 +110,29 @@ decided by profiling the ported book (D14 says matching is not the bottleneck to
 **D18. Timings.** Satya: M5 timings are the median of >= 3 runs with data capture paused. The ingest processes
 (`record_hl.py`, `capture.py`) are not touched by these agents, so timing runs wait until Satya pauses capture.
 Correctness runs (parity) do not need it.
+
+**D19. Book port shape.** The Rust book (`replay_core/src/book.rs`) keeps each queue as a `Vec` (head = index 0)
+instead of the Python doubly linked list: same order, same results, simpler code; cancel is O(level size) instead of
+O(1), with levels of at most a few dozen orders. The priority rule (`jumps`) stays a Python callable evaluated by
+`replay/rust_book.py`, which hands Rust the resulting queue position. Level objects are live views and iteration
+snapshots the queue (callers only remove the node they are on).
+
+**D20. `im` crate.** Persistent maps for copy-on-write (`im = 15.1.0`, on the plan's dependency list).
+
+**D21. Engine port shape.** `replay_core/src/engine.rs` ports `engine_py/matching.py` function by function on
+copy-on-write books; every engine map (`by_user`, `by_cloid`, priority metadata, schedules, stats) is an `im`
+persistent map, so a whole-engine copy is cheap too. `replay/rust_engine.py` keeps in Python only: the dispatch
+`if`-chain of `Engine.apply`, building Fill/Reject objects, the `check_every_action` option and the int-oid
+resolver call (the resolver is a Python object; Rust never calls back into Python). `by_user` is exposed as a live
+ordered view with exactly the operations the replay and resolver use (`get`, `setdefault(...)[oid] = None`, `in`,
+iteration in insertion order).
+
+**D22. Node views are snapshots.** A Python `Node` is one shared object, so a reduce made through one reference is
+visible through every other. `RustBook` node views carry the remaining size read when they were made. The only
+place this can differ is `Engine._outside_fill` when the named maker is literally `"placeholder"` (each placeholder
+would be listed twice; Python then fails with a 0-lot Fill, Rust with "not resting"). Outside fills always name a
+`0x` address, so this input does not occur; the differential test excludes it.
+
+**D23. Parity runner switches.** `python -m replay.parity` takes `--stp/--order/--correction` (default = the
+baseline switches); `make checkpoint` runs full dev20 parity under both `correction` settings (block-end vs
+`report/validate/m0_blockend20`, mid-block vs `report/validate/m0_base20`), so Q1's answer does not change coverage.
