@@ -186,6 +186,54 @@ def unique_subset(sizes: list[int], k: int, target: int, budget: int = 300_000):
     return tuple(out)
 
 
+# historicalOrders statuses for placements the chain refused for reasons the blocks don't show (not
+# iocCancelRejected / badAloPxRejected: the engine decides those itself)
+HIDDEN_REJECTS = {"perpMarginRejected", "minTradeNtlRejected", "tooManyOpenOrdersRejected", "reduceOnlyRejected",
+                  "insufficientSpotBalanceRejected", "oracleRejected", "perpMaxPositionRejected",
+                  "positionIncreaseAtOpenInterestCapRejected", "positionFlipAtOpenInterestCapRejected",
+                  "tooAggressiveAtOpenInterestCapRejected", "openInterestIncreaseRejected"}
+HIST_MATCH_MS = 2000
+
+
+def load_hist_rejects(window_dir) -> dict:
+    """taker_reject hist: the chunk's hist_orders.json (capture HIST_IOC_USERS) -> {key: [timestamp ms]} of
+    BTC/ETH placements with a HIDDEN_REJECTS final status. key = ("c", user, cloid) when the order has a cloid,
+    else (user, asset, side, px ticks, size lots)."""
+    path = Path(window_dir) / "hist_orders.json"
+    if not path.exists():
+        return {}
+    by_name = {a.name: (aid, a) for aid, a in ASSETS.items()}
+    out: dict = {}
+    for r in json.load(open(path)):
+        ans = r.get("answer")
+        if not isinstance(ans, list):
+            continue
+        user = r["user"].lower()
+        for rec in ans:
+            o = rec.get("order") or {}
+            if rec.get("status") not in HIDDEN_REJECTS or o.get("coin") not in by_name:
+                continue
+            aid, a = by_name[o["coin"]]
+            ts = int(o["timestamp"])
+            if o.get("cloid"):
+                out.setdefault(("c", user, o["cloid"].lower()), []).append(ts)
+            side = Side.BUY if o["side"] == "B" else Side.SELL
+            try:
+                key = (user, aid, side, a.px_to_ticks(o["limitPx"]), a.sz_to_lots(o.get("origSz") or o["sz"]))
+            except (ValueError, ArithmeticError):
+                continue
+            out.setdefault(key, []).append(ts)
+    return out
+
+
+def hist_rejected(rej: dict, p: Place, t_ms: int) -> bool:
+    """True when this placement matches a hidden rejection within HIST_MATCH_MS of the block time."""
+    keys = [(p.user.lower(), p.asset, p.side, p.px, p.sz)]
+    if p.cloid:
+        keys.insert(0, ("c", p.user.lower(), p.cloid.lower()))
+    return any(abs(ts - t_ms) <= HIST_MATCH_MS for k in keys for ts in rej.get(k, ()))
+
+
 MAX_LEVERAGE = {"BTC": 40, "ETH": 25}          # Hyperliquid max leverage (Nov 2026): the most lenient margin need
 
 
@@ -398,7 +446,7 @@ class Replay:
         self.refill_position = refill_position
         self.learn_stats: Counter = Counter()
         self.taker_reject = frozenset(x for x in (taker_reject or "").split(",") if x)
-        bad = self.taker_reject - {"min10", "learn", "margin", "margin_spot"}
+        bad = self.taker_reject - {"min10", "learn", "margin", "margin_spot", "hist"}
         if bad:
             raise ValueError(f"unknown taker_reject rules {sorted(bad)}")
         self.taker_stats: Counter = Counter()
@@ -406,6 +454,7 @@ class Replay:
         self._blk_ioc: dict[str, tuple[str, bool]] = {}   # this block: hash -> (user, engine filled or skipped)
         self._margin = load_margin(self.window_dir, spot="margin_spot" in self.taker_reject) \
             if self.taker_reject & {"margin", "margin_spot"} else {}
+        self._hist_rej = load_hist_rejects(self.window_dir) if "hist" in self.taker_reject else {}
         self._real_trades: dict[str, list] = {}
         if self._rules or "learn" in self.taker_reject:
             for tr in iter_trades(self.hl_data, COINS, self.t0, self.t1):
@@ -1078,6 +1127,11 @@ class Replay:
 
     def _apply(self, block: Block, action: Action) -> tuple[list[Fill], list[Reject]]:
         self.observer.before_action(self, block, action)
+        if self._hist_rej and isinstance(action, Place) and hist_rejected(self._hist_rej, action, block.time_ms):
+            self.taker_stats[f"skip_hist_{action.tif.name.lower()}"] += 1
+            if action.tif is Tif.IOC:
+                self._blk_ioc[action.hash] = (action.user, True)
+            return [], []
         if self.taker_reject and isinstance(action, Place) and action.tif is Tif.IOC:
             skip = self._taker_skip(action)
             if skip:

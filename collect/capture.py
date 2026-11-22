@@ -37,6 +37,8 @@ Settings (environment variables):
   CHUNK_HIST_USERS=1   chunks: historicalOrders of the users with the most int-oid cancels (hist_orders.json), asked
                        after the chunk's blocks are fetched (minutes late: a busy user's last 2000 orders may no
                        longer reach back to the chunk)
+  HIST_IOC_USERS=0     chunks: at the chunk's end, historicalOrders (~120 weight each) of the previous chunk's
+                       top IOC senders: exact final statuses (perpMarginRejected ...) for replay --taker-reject hist
   MARGIN_USERS=0       chunks: when the chunk is planned, clearinghouseState + spotClearinghouseState (weight 2
                        each) of this many users: the previous chunk's IOC users, then recent takers
   HIST_END_USERS=6     chunks: historicalOrders (~120 weight each, reserved up front so they queue under the
@@ -74,6 +76,7 @@ CHUNK_HIST_USERS = int(os.environ.get("CHUNK_HIST_USERS", 1))
 HIST_END_USERS = int(os.environ.get("HIST_END_USERS", 6))
 TRACKERS_FILE = os.environ.get("TRACKERS_FILE", "trackers.json")
 HIST_END_RANDOM = os.environ.get("HIST_END_RANDOM") == "1"
+HIST_IOC_USERS = int(os.environ.get("HIST_IOC_USERS", 0))   # chunks: historicalOrders at chunk end for the top IOC senders
 MARGIN_USERS = int(os.environ.get("MARGIN_USERS", 0))   # chunks: clearinghouseState + spot of this many IOC users at plan time
 TARGET_LOOKUPS = int(os.environ.get("TARGET_LOOKUPS", 0))    # orderStatus of int-oid cancel targets in the SCORED blocks   # experiment: per-chunk coin flip (seeded by the snapshot)
 INFO_FILES = {"userFillsByTime": "fills.json", "frontendOpenOrders": "open_orders.json",
@@ -861,6 +864,10 @@ def run_chunks(fetcher, state, writer, cancellers=None):
             ask_hist_at_end(writer, end, hu)
             meta["hist_end_users"] = len(hu)
             meta["hist_end_user_list"] = hu
+        if HIST_IOC_USERS:
+            iu = [u for u, _ in sorted(prev_iocs.items(), key=lambda x: (-x[1], x[0]))][:HIST_IOC_USERS]
+            if iu and ask_hist_at_end(writer, end, iu):
+                meta["hist_ioc_users"] = iu
         status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=warmup, max_anchors=CHUNK_ANCHORS,
                          extras=chunk_extras())
         cancellers.add(meta.get("int_cancel_users"))

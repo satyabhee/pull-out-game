@@ -72,3 +72,19 @@ def test_seeded_user_blocked_until_real_fill():
     r._blk_ioc = {"0xb": ("u", True)}           # a skipped IOC of u really traded -> unblock
     r._taker_learn()
     assert r._taker_skip(ioc("u", "60000", "1")) is None
+
+
+def test_hist_rejects_match_by_cloid_or_shape_within_2s(tmp_path):
+    import json
+    from engine_py.replay import load_hist_rejects, hist_rejected
+    rec = lambda status, cloid=None, ts=1_000_000: {"status": status, "order": {
+        "coin": "BTC", "side": "B", "limitPx": "60000", "sz": "0.0", "origSz": "0.01", "timestamp": ts, "cloid": cloid}}
+    json.dump([{"user": "0xU", "answer": [rec("perpMarginRejected"), rec("iocCancelRejected", ts=5_000_000),
+                                          rec("perpMarginRejected", cloid="0xAB", ts=9_000_000)]}],
+              open(tmp_path / "hist_orders.json", "w"))
+    rej = load_hist_rejects(tmp_path)
+    assert hist_rejected(rej, ioc("0xu", "60000", "0.01"), 1_001_500)
+    assert not hist_rejected(rej, ioc("0xu", "60000", "0.01"), 1_003_000)          # > 2 s away
+    assert not hist_rejected(rej, ioc("0xu", "60000", "0.01"), 5_000_000)          # iocCancelRejected: engine decides
+    assert not hist_rejected(rej, ioc("0xu", "60000", "0.02"), 1_000_000)          # other size
+    assert load_hist_rejects(tmp_path / "none") == {}
