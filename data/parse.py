@@ -150,12 +150,23 @@ def decode_tx(tx: dict, tx_index: int, stats: Stats) -> list:
     return out
 
 
-def iter_window(window_dir, hl_data=None, stats: Stats | None = None) -> Iterator[Block]:
+def iter_window(window_dir, hl_data=None, stats: Stats | None = None,
+                outside_other_txs: bool = False, other_at_tx_index: bool = False) -> Iterator[Block]:
     """Yield the window's blocks in strictly increasing height order.
 
     With `hl_data`, zero-hash BTC/ETH trades are appended to the block whose
     time equals the trade time, after all real txs, ordered by tid.
+    outside_other_txs=True (G1 triage measurement flag, default off): trades whose hash is a tx
+    in this block that decodes to no BTC/ETH book action (e.g. SetGlobalAction, the oracle
+    update that fires triggers/liquidations) are also outside fills, in the same end-of-block
+    tid order. Counted as stats["outside_fill_other_tx"].
+    other_at_tx_index=True (measurement, needs outside_other_txs): those fills carry their own tx's
+    index as tx_index (item_index = tid order within the tx) instead of len(txs), so the replay can
+    apply them at the tx's position (engine_py/replay.Replay other_position="index"). They still
+    come after the book actions in Block.actions; zero-hash trades are unchanged.
     """
+    if other_at_tx_index and not outside_other_txs:
+        raise ValueError("other_at_tx_index needs outside_other_txs")
     window_dir = Path(window_dir)
     stats = stats if stats is not None else Stats()
     files = _block_files(window_dir)
@@ -163,12 +174,15 @@ def iter_window(window_dir, hl_data=None, stats: Stats | None = None) -> Iterato
         raise ValueError(f"no blocks in {window_dir}")
 
     outside: dict[int, list] = defaultdict(list)
+    by_hash: dict[str, list] = defaultdict(list)
     if hl_data is not None:
         t0 = read_block(files[0][1])["blockTime"]
         t1 = read_block(files[-1][1])["blockTime"]
         for tr in iter_trades(hl_data, ("BTC", "ETH"), t0, t1):
             if tr.hash == ZERO_HASH:
                 outside[tr.time_ms].append(tr)
+            elif outside_other_txs:
+                by_hash[tr.hash].append(tr)
 
     prev = None
     for height, path in files:
@@ -180,13 +194,25 @@ def iter_window(window_dir, hl_data=None, stats: Stats | None = None) -> Iterato
         prev = height
 
         actions: list = []
+        other: list = []
+        at_index: list = []
         for i, tx in enumerate(b["txs"]):
-            actions.extend(decode_tx(tx, i, stats))
+            decoded = decode_tx(tx, i, stats)
+            actions.extend(decoded)
+            if not decoded and tx["hash"] in by_hash:
+                stats["outside_fill_other_tx"] += 1
+                if other_at_tx_index:
+                    for k, tr in enumerate(sorted(by_hash.pop(tx["hash"]), key=lambda t: t.seq)):
+                        at_index.append(tr.as_outside_fill(height, i, k))
+                else:
+                    other += by_hash.pop(tx["hash"])
 
-        trades = sorted(outside.pop(b["blockTime"], []), key=lambda t: t.tid)
+        trades = sorted(outside.pop(b["blockTime"], []) + other, key=lambda t: t.seq)
         for k, tr in enumerate(trades):
             actions.append(tr.as_outside_fill(height, len(b["txs"]), k))
             stats["action:OutsideFill"] += 1
+        actions += at_index
+        stats["action:OutsideFill"] += len(at_index)
 
         stats["blocks"] += 1
         stats["txs"] += len(b["txs"])
@@ -195,20 +221,21 @@ def iter_window(window_dir, hl_data=None, stats: Stats | None = None) -> Iterato
     stats["outside_fill_no_block"] += sum(len(v) for v in outside.values())
 
 
-_WINDOW_CACHE_MAX = 8
+_WINDOW_CACHE_MAX = 1     # one chunk at a time (its variants reuse it); 8 kept ~0.1 GB/chunk alive in long workers
 
 
-def load_window(window_dir, hl_data=None) -> tuple[tuple[Block, ...], Stats]:
+def load_window(window_dir, hl_data=None, outside_other_txs: bool = False, other_at_tx_index: bool = False) -> tuple[tuple[Block, ...], Stats]:
     """iter_window's blocks as a tuple plus its parse stats, decoded once per process per window
     (re-decoded when any block file changes). Blocks are frozen, so they are shared; the stats are a
     fresh copy on every call."""
     window_dir = Path(window_dir)
     sig = tuple(sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns) for _, p in _block_files(window_dir)))
-    key = (window_dir.resolve(), None if hl_data is None else Path(hl_data).resolve())
+    key = (window_dir.resolve(), None if hl_data is None else Path(hl_data).resolve(), outside_other_txs, other_at_tx_index)
     hit = _window_cache.get(key)
     if hit is None or hit[0] != sig:
         stats = Stats()
-        hit = (sig, tuple(iter_window(window_dir, hl_data, stats)), stats)
+        hit = (sig, tuple(iter_window(window_dir, hl_data, stats, outside_other_txs=outside_other_txs,
+                                                other_at_tx_index=other_at_tx_index)), stats)
         _window_cache[key] = hit
         while len(_window_cache) > _WINDOW_CACHE_MAX:
             _window_cache.popitem(last=False)
@@ -285,15 +312,32 @@ _FILE_CACHE_MAX = 32
 
 
 class _RecorderFile:
-    """One recorder file read once: raw lines, their receive times, and lines parsed so far."""
+    """One recorder file read once: raw lines, their receive times, and lines parsed so far.
+    span=(lo, hi): keep only lines whose receive time is in [lo, hi] (and lines without one), so a ranged read
+    holds minutes of an hour file, not all of it (an hour of user_orders is ~0.8 GB of text). span=None: every line."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, span: tuple[int, int] | None = None):
+        self.span = span
+        lo, hi = span if span is not None else (None, None)
+        self.lines, self.recv = [], []
         with _open_text(path) as f:
-            self.lines = [ln for ln in (x.strip() for x in f) if ln]
-        self.recv: list[int | None] = [self._recv(ln) for ln in self.lines]
+            for x in f:
+                ln = x.strip()
+                if not ln:
+                    continue
+                r = self._recv(ln)
+                if span is not None and r is not None and not lo <= r <= hi:
+                    continue
+                self.lines.append(ln)
+                self.recv.append(r)
         known = [r for r in self.recv if r is not None]
         self.sorted = len(known) == len(self.recv) and all(a <= b for a, b in zip(known, known[1:]))
         self.parsed: dict[int, dict | None] = {}
+
+    def covers(self, lo: int | None, hi: int | None) -> bool:
+        if self.span is None:
+            return True
+        return lo is not None and self.span[0] <= lo and hi <= self.span[1]
 
     @staticmethod
     def _recv(line: str) -> int | None:
@@ -305,14 +349,17 @@ class _RecorderFile:
         except ValueError:
             return None                                   # cut mid-number: the full parse will fail too
 
-    def get(self, i: int) -> dict | None:
-        if i not in self.parsed:
-            try:
-                self.parsed[i] = _loads(self.lines[i])
-            except json.JSONDecodeError:
-                # the open hour's last line can be cut mid-write; anything else is real
-                self.parsed[i] = None
-        return self.parsed[i]
+    def get(self, i: int, keep: bool = True) -> dict | None:
+        if i in self.parsed:
+            return self.parsed[i]
+        try:
+            rec = _loads(self.lines[i])
+        except json.JSONDecodeError:
+            # the open hour's last line can be cut mid-write; anything else is real
+            rec = None
+        if keep:
+            self.parsed[i] = rec
+        return rec
 
     def indices(self, lo: int | None, hi: int | None) -> range | list[int]:
         if lo is None:
@@ -320,6 +367,9 @@ class _RecorderFile:
         if self.sorted:
             return range(bisect.bisect_left(self.recv, lo), bisect.bisect_right(self.recv, hi))
         return [i for i, r in enumerate(self.recv) if r is None or lo <= r <= hi]
+
+
+SPAN_PAD_MS = 120_000          # a ranged load keeps this much extra on each side (neighbouring reads hit the cache)
 
 
 _file_cache: "OrderedDict[Path, tuple[tuple[int, int], _RecorderFile]]" = OrderedDict()
@@ -331,15 +381,16 @@ def clear_caches() -> None:
     _window_cache.clear()
 
 
-def _recorder_file(path: Path) -> _RecorderFile:
-    """Per-process cache keyed by path; reloaded when the file's size or mtime changes (the open hour)."""
+def _recorder_file(path: Path, lo: int | None = None, hi: int | None = None) -> _RecorderFile:
+    """Per-process cache keyed by path; reloaded when the file's size or mtime changes (the open hour) or the
+    cached span does not cover [lo, hi] (lo None = the whole file)."""
     st = path.stat()
     sig = (st.st_size, st.st_mtime_ns)
     hit = _file_cache.get(path)
-    if hit is not None and hit[0] == sig:
+    if hit is not None and hit[0] == sig and hit[1].covers(lo, hi):
         _file_cache.move_to_end(path)
         return hit[1]
-    rf = _RecorderFile(path)
+    rf = _RecorderFile(path, None if lo is None else (lo - SPAN_PAD_MS, hi + SPAN_PAD_MS))
     _file_cache[path] = (sig, rf)
     _file_cache.move_to_end(path)
     while len(_file_cache) > _FILE_CACHE_MAX:
@@ -347,15 +398,16 @@ def _recorder_file(path: Path) -> _RecorderFile:
     return rf
 
 
-def _records(path: Path, t0_ms: int | None = None, t1_ms: int | None = None) -> Iterator[dict]:
+def _records(path: Path, t0_ms: int | None = None, t1_ms: int | None = None, keep_parsed: bool = True) -> Iterator[dict]:
     """Parsed lines of one recorder file in file order; with t0/t1, only lines whose receive time is in
     [t0 - RECV_SKEW_MS, t1 + RECV_LAG_MS] (lines without a receive time are always kept).
-    The dicts are shared through the cache: callers must not modify them."""
-    rf = _recorder_file(path)
+    The dicts are shared through the cache: callers must not modify them. keep_parsed=False: parse without caching
+    the dicts (user_orders: ~1 GB of parsed messages per chunk that callers reduce to compact facts at once)."""
     lo = None if t0_ms is None else t0_ms - RECV_SKEW_MS
     hi = None if t1_ms is None else t1_ms + RECV_LAG_MS
+    rf = _recorder_file(path, lo, None if lo is None else hi)
     for i in rf.indices(lo, hi):
-        rec = rf.get(i)
+        rec = rf.get(i, keep_parsed)
         if rec is not None:
             yield rec
 
@@ -372,6 +424,7 @@ class Trade:
     tid: int
     buyer: str
     seller: str
+    seq: int = 0          # position in the recorder stream: real fill order. tids are random, never order by them
 
     @property
     def taker(self) -> str:
@@ -389,9 +442,12 @@ class Trade:
 
 
 def iter_trades(hl_data, coins, t0_ms: int, t1_ms: int) -> Iterator[Trade]:
-    """Recorded trades with t0 <= time <= t1, deduplicated by tid, in (time, tid) order."""
+    """Recorded trades with t0 <= time <= t1, deduplicated by tid, in (time, stream) order.
+    Stream order (`seq`) is the order the recorder received them, which within a tx is the real fill order;
+    tids are random numbers and carry no order."""
     hl_data = Path(hl_data)
     seen: dict[int, Trade] = {}
+    n = 0
     for coin in coins:
         asset = COIN_TO_ASSET[coin]
         spec = ASSETS[asset]
@@ -400,12 +456,15 @@ def iter_trades(hl_data, coins, t0_ms: int, t1_ms: int) -> Iterator[Trade]:
                 for x in rec["msg"]["data"]:
                     if not (t0_ms <= x["time"] <= t1_ms) or x["coin"] != coin:
                         continue
+                    if x["tid"] in seen:
+                        continue
+                    n += 1
                     seen[x["tid"]] = Trade(
                         asset=asset, taker_side=Side(x["side"]),
                         px=spec.px_to_ticks(x["px"]), sz=spec.sz_to_lots(x["sz"]),
                         time_ms=x["time"], hash=x["hash"], tid=x["tid"],
-                        buyer=x["users"][0].lower(), seller=x["users"][1].lower())
-    yield from sorted(seen.values(), key=lambda t: (t.time_ms, t.tid))
+                        buyer=x["users"][0].lower(), seller=x["users"][1].lower(), seq=n)
+    yield from sorted(seen.values(), key=lambda t: (t.time_ms, t.seq))
 
 
 @dataclass(frozen=True)
@@ -422,11 +481,12 @@ def _snapshot(asset: int, d: dict) -> BookSnapshot:
     return BookSnapshot(asset=asset, time_ms=d["time"], bids=conv(d["levels"][0]), asks=conv(d["levels"][1]))
 
 
-def iter_books(hl_data, coin: str, t0_ms: int, t1_ms: int) -> Iterator[BookSnapshot]:
-    """L2 snapshots with t0 <= time <= t1, deduplicated by time, in time order."""
+def iter_books(hl_data, coin: str, t0_ms: int, t1_ms: int, suffix: str = "") -> Iterator[BookSnapshot]:
+    """L2 snapshots with t0 <= time <= t1, deduplicated by time, in time order. suffix="_sf4": the recorder's
+    coarse book (nSigFigs 4: prices grouped into buckets, bids rounded down, asks up)."""
     asset = COIN_TO_ASSET[coin]
     seen: dict[int, dict] = {}
-    for path in _hour_files(Path(hl_data), f"book_{coin}", t0_ms, t1_ms):
+    for path in _hour_files(Path(hl_data), f"book_{coin}{suffix}", t0_ms, t1_ms):
         for rec in _records(path, t0_ms, t1_ms):
             d = rec["msg"]["data"]
             if t0_ms <= d["time"] <= t1_ms:

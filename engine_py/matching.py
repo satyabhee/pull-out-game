@@ -41,9 +41,38 @@ class CrossedBookError(BookError):
     pass
 
 
+DOCS_T_MS = 400        # priority-fees doc: ALO orders within T = 400 ms sort by priority
+
+
 class Engine:
     def __init__(self, stp: str = "cancel_taker", resolve_oid: Resolver | None = None,
-                 check_every_action: bool = False):
+                 check_every_action: bool = False, p_priority: str | int | None = None,
+                 evict_arrival: bool = False):
+        """p_priority (G1, measured by analysis/p_priority.py): at one price a resting order with a higher
+        grouping.p is served first. None = pure price-time (default). "always" = queue by (p desc, arrival).
+        int W = a new order goes ahead of a lower-p order only if that order arrived at most W ms earlier
+        (block time; set block_time_ms before applying a block). Orders without p (placeholders, named
+        pre-window orders, actions without grouping) count as p = 0 and, under W, are never jumped.
+        "known" (Nov 20 overnight) = p order only among orders placed in the window through this engine (an
+        in-window order without grouping.p counts as p = 0 and can be jumped); placeholders and orders named
+        from outside evidence (pre-window liquidity whose p we never saw) are never jumped.
+        "knownpos" (Nov 21) = "known", except that an order without a priority bid (p = 0) is never jumped: p only
+        reorders orders that both carry a bid (dump: in 44 of 82 wrong-maker misses the chain's maker had p = 0).
+        "docs" (Nov 22) = Hyperliquid priority-fees doc: a new ALO order goes ahead of each in-window ALO order
+        (placed through this engine less than DOCS_T_MS = 400 ms earlier, block time) with a lower p, p = 0
+        included; older orders have locked in their place. Placeholders / outside-evidence orders are never jumped.
+        "docsall" = "docs" for every resting tif, not only ALO.
+        evict_arrival (off by default): reconcile(known="oldest"|"newest") picks known orders by arrival
+        (Order.seq) instead of queue position. Under p_priority the queue head is the highest-p order, not
+        the oldest one, so queue order would trim the freshest high-p orders first."""
+        if not (p_priority is None or p_priority in ("always", "known", "knownpos", "docs", "docsall")
+                or (isinstance(p_priority, int) and p_priority >= 0)):
+            raise ValueError(f"p_priority must be None, 'always', 'known', 'knownpos', 'docs', 'docsall' or ms >= 0, "
+                             f"not {p_priority!r}")
+        self.evict_arrival = evict_arrival
+        self.p_priority = p_priority
+        self.p_meta: dict[int, tuple[int, int]] = {}         # engine oid -> (p, block time ms)
+        self.block_time_ms = 0
         if stp not in ("cancel_taker", "expire_maker"):
             raise ValueError(f"unknown self-trade policy {stp!r}")
         self.stp = stp
@@ -142,6 +171,8 @@ class Engine:
                 if known is None or gap == 0:
                     continue
                 nodes = [n for n in level if n.order.user != PLACEHOLDER]
+                if self.evict_arrival:
+                    nodes.sort(key=lambda n: n.order.seq)
                 for node in (nodes if known == "oldest" else reversed(nodes)):
                     if gap == 0:
                         break
@@ -221,8 +252,30 @@ class Engine:
         self.next_seq += 1
         return order
 
-    def _rest(self, order: Order, remaining: int) -> None:
-        self.books[order.asset].add(order, remaining)
+    def _p_arg(self, p: Place) -> tuple:
+        """Extra _rest argument only when p_priority is on (subclasses overriding _rest stay compatible)."""
+        return (p.priority or 0,) if self.p_priority is not None else ()   # None (no grouping.p) -> 0
+
+    def _rest(self, order: Order, remaining: int, p: int | None = None) -> None:
+        jumps = None
+        if self.p_priority is not None and p:
+            t, window, meta = self.block_time_ms, self.p_priority, self.p_meta
+
+            def jumps(node, p=p, t=t, window=window, meta=meta):
+                m = meta.get(node.order.oid)
+                if window == "always":
+                    return p > (m[0] if m else 0)
+                if window == "known":
+                    return m is not None and p > m[0]
+                if window == "knownpos":
+                    return m is not None and 0 < m[0] < p
+                if window in ("docs", "docsall"):
+                    return (m is not None and p > m[0] and t - m[1] < DOCS_T_MS
+                            and (window == "docsall" or (order.tif is Tif.ALO and node.order.tif is Tif.ALO)))
+                return m is not None and m[0] > 0 and p > m[0] and t - m[1] <= window
+        if self.p_priority is not None and order.user != PLACEHOLDER and p is not None and (p or self.p_priority in ("known", "knownpos", "docs", "docsall")):
+            self.p_meta[order.oid] = (p, self.block_time_ms)     # p None = rested from outside evidence
+        self.books[order.asset].add(order, remaining, jumps=jumps)
         if order.user != PLACEHOLDER:
             self.by_user.setdefault(order.user, {})[order.oid] = None
             if order.cloid is not None:
@@ -234,6 +287,7 @@ class Engine:
     def _forget(self, order: Order) -> None:
         if order.user == PLACEHOLDER:
             return
+        self.p_meta.pop(order.oid, None)
         mine = self.by_user.get(order.user)
         if mine is not None:
             mine.pop(order.oid, None)
@@ -279,7 +333,7 @@ class Engine:
         if p.tif is Tif.ALO:
             if self._crosses(p.side, p.px, best_opp):
                 return [], [Reject(source, RejectReason.ALO_WOULD_CROSS)]
-            self._rest(self._new_order(p.user, p.asset, p.side, p.px, p.sz, p.tif, p.cloid), p.sz)
+            self._rest(self._new_order(p.user, p.asset, p.side, p.px, p.sz, p.tif, p.cloid), p.sz, *self._p_arg(p))
             return [], []
 
         taker = self._new_order(p.user, p.asset, p.side, p.px, p.sz, p.tif, p.cloid)
@@ -307,7 +361,7 @@ class Engine:
                 self._forget(maker)
 
         if remaining > 0 and p.tif is Tif.GTC:
-            self._rest(taker, remaining)
+            self._rest(taker, remaining, *self._p_arg(p))
         return fills, rejects
 
     def _cancel_cloid(self, source, user, asset, cloid) -> list[Reject]:

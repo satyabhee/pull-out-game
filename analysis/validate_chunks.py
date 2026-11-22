@@ -107,7 +107,19 @@ def _run_one(job) -> list[dict]:
                          "error": f"{type(e).__name__}: {e}"})
             continue
         outs.append({"chunk": Path(chunk).name, "status": "ok", "res": res, "rows": rows, "error": ""})
+    _free_chunk_caches()
     return outs
+
+
+def _free_chunk_caches() -> None:
+    """Drop the per-process caches once a chunk's variants are done (decoded window, recorder files, oid estimator):
+    the next chunk would only reuse the recorder hours they share, and keeping them made a worker's RSS climb
+    chunk after chunk (overnight_2026-11-21 Gate 1). Outputs are unchanged: caches only skip re-reading."""
+    import gc
+    from data import oids, parse
+    parse.clear_caches()
+    oids.clear_cache()
+    gc.collect()
 
 
 def chunk_row(out: dict, meta: dict | None) -> dict:
@@ -118,6 +130,7 @@ def chunk_row(out: dict, meta: dict | None) -> dict:
     for scope in ("all", *COINS):
         for m in CHUNK_METRICS:
             row[f"{scope}:{m}"] = res.get(f"{scope}:{m}", "")
+    row["taker_blocked_end"] = res.get("taker_blocked_end", "")
     row["error"] = out["error"]
     return row
 

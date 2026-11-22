@@ -15,7 +15,7 @@ each level's total equals the sum of its remaining sizes; the book is never cros
 
 from __future__ import annotations
 
-from typing import Iterator
+from typing import Callable, Iterator
 
 from sortedcontainers import SortedDict
 
@@ -58,6 +58,14 @@ class Level:
     def prepend(self, node: Node) -> None:
         first = self.head.next
         self.head.next, node.prev, node.next, first.prev = node, self.head, first, node
+        node.level = self
+        self.total += node.remaining
+        self.count += 1
+
+    def insert_before(self, node: Node, ref: Node) -> None:
+        """Link `node` directly ahead of `ref` (a node already in this level)."""
+        prev = ref.prev
+        prev.next, node.prev, node.next, ref.prev = node, prev, ref, node
         node.level = self
         self.total += node.remaining
         self.count += 1
@@ -124,8 +132,11 @@ class Book:
         return bb is not None and ba is not None and bb >= ba
 
     # ---- mutations
-    def add(self, order: Order, remaining: int, front: bool = False) -> Node:
-        """Rest an order at the tail of its level (front=True: at the head, ahead of every order there)."""
+    def add(self, order: Order, remaining: int, front: bool = False,
+            jumps: Callable[[Node], bool] | None = None) -> Node:
+        """Rest an order at the tail of its level (front=True: at the head, ahead of every order there).
+        jumps(node): walking forward from the tail, the new order goes ahead of each node for which it is
+        True and stops at the first node for which it is False (priority insertion; None = plain FIFO)."""
         if order.asset != self.asset:
             raise BookError(f"order for asset {order.asset} added to book {self.asset}")
         if order.oid in self.index:
@@ -139,8 +150,13 @@ class Book:
         node = Node(order, remaining)
         if front:
             level.prepend(node)
-        else:
+        elif jumps is None:
             level.append(node)
+        else:
+            ref = level.tail
+            while ref.prev is not level.head and jumps(ref.prev):
+                ref = ref.prev
+            level.insert_before(node, ref)
         self.index[order.oid] = node
         return node
 

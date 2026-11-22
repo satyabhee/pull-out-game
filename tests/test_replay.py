@@ -359,6 +359,34 @@ def test_touch_n_cap_evicts_extra_known_orders_oldest_first(tmp_path):
     assert r.touch_reconciled[("BTC", "n_capped")] == 1
 
 
+def test_touch_refill_adds_a_missing_touch_level(tmp_path):
+    # bbo after block 0: a better ask at 60008 that we never saw placed (rested before the window)
+    w = touch_window(tmp_path, ("60000", "0.003", 1), ("60008", "0.004", 2), [])
+    r = Replay(*w.write(), listing, touch_refill="front")
+    list(r)
+    level = r.engine.books[0].side(Side.SELL)[ticks("60008")]
+    assert [(nd.order.user, nd.remaining) for nd in level] == [(PLACEHOLDER, lots("0.004"))]
+    assert r.touch_reconciled[("BTC", "refilled")] == lots("0.004")
+    assert r.engine.books[0].side(Side.SELL)[ticks("60010")].total == lots("0.001")   # deeper level kept
+
+
+def test_touch_refill_tops_up_a_level_behind_known_orders(tmp_path):
+    w = touch_window(tmp_path, ("60000", "0.003", 1), ("60010", "0.003", 2),
+                     [place_tx(M, "0xm1", 0, order(buy=False, px="60010", sz="0.001", tif="Alo"))])
+    r = Replay(*w.write(), listing, touch_refill="back")
+    list(r)
+    level = r.engine.books[0].side(Side.SELL)[ticks("60010")]
+    assert level.total == lots("0.003") and [nd.order.user for nd in level][-1] == PLACEHOLDER
+    assert [nd.order.user for nd in level][:2] == [PLACEHOLDER, M]
+
+
+def test_touch_refill_bad_mode_fails_loudly(tmp_path):
+    w = Window(tmp_path)
+    w.block([])
+    with pytest.raises(ValueError):
+        Replay(*w.write(), listing, touch_refill="middle")
+
+
 def test_gate_uses_the_bbo_touch(tmp_path):
     w = Window(tmp_path)
     w.book("BTC", T0 - 10, [("60000", "0.001")], [("60020", "0.001")])
@@ -369,3 +397,63 @@ def test_gate_uses_the_bbo_touch(tmp_path):
     out = list(r)
     assert [x.reason for x in out[1][2]] == [RejectReason.ALO_WOULD_CROSS]
     assert r.gate_stats["reject_engine_would_admit"] == 1
+
+
+def test_touch_evict_bad_mode_fails_loudly(tmp_path):
+    w = Window(tmp_path)
+    w.block([])
+    with pytest.raises(ValueError):
+        Replay(*w.write(), listing, touch_reconcile=True, touch_evict="random")
+
+
+def test_touch_evict_newest_keeps_the_older_known_order(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 10, [], [("60020", "0.001")])
+    w.block([place_tx(M, "0xm1", 0, order(px="60000", sz="0.001")),
+             place_tx(N_, "0xn1", 0, order(px="60000", sz="0.001"))], dt_ms=0)
+    w.bbo("BTC", T0 + 50, ("60000", "0.001", 1), ("60020", "0.001", 1))
+    w.block([], dt_ms=100)
+    r = Replay(*w.write(), listing, touch_reconcile=True, touch_evict="newest")
+    list(r)
+    assert [nd.order.user for nd in r.engine.books[0].side(Side.BUY)[ticks("60000")]] == [M]
+
+
+def test_touch_evict_ledger_removes_the_unique_order_set_that_fits_bbo(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 10, [], [("60020", "0.001")])
+    w.block([place_tx(M, "0xm1", 0, order(px="60000", sz="0.001")),
+             place_tx(N_, "0xn1", 0, order(px="60000", sz="0.002")),
+             place_tx(M, "0xm2", 0, order(px="60000", sz="0.003"))], dt_ms=0)
+    w.bbo("BTC", T0 + 50, ("60000", "0.004", 2), ("60020", "0.001", 1))   # the 0.002 order is gone
+    w.block([], dt_ms=100)
+    r = Replay(*w.write(), listing, touch_reconcile=True, touch_evict="ledger")
+    list(r)
+    lv = r.engine.books[0].side(Side.BUY)[ticks("60000")]
+    assert [(nd.order.user, nd.remaining) for nd in lv] == [(M, lots("0.001")), (M, lots("0.003"))]
+    assert r.touch_reconciled[("BTC", "ledger_evicted")] == 1
+
+
+def test_touch_evict_ledger_abstains_when_ambiguous(tmp_path):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 10, [], [("60020", "0.001")])
+    w.block([place_tx(M, "0xm1", 0, order(px="60000", sz="0.001")),
+             place_tx(N_, "0xn1", 0, order(px="60000", sz="0.001"))], dt_ms=0)
+    w.bbo("BTC", T0 + 50, ("60000", "0.001", 1), ("60020", "0.001", 1))   # either could be gone
+    w.block([], dt_ms=100)
+    r = Replay(*w.write(), listing, touch_reconcile=True, touch_evict="ledger")
+    list(r)
+    assert r.engine.books[0].side(Side.BUY)[ticks("60000")].total == lots("0.002")
+    assert r.touch_reconciled[("BTC", "ledger_ambiguous")] >= 1
+
+
+def test_unique_subset_matches_brute_force():
+    import random
+    from itertools import combinations
+    from engine_py.replay import unique_subset
+    rnd = random.Random(7)
+    for _ in range(1500):
+        m = rnd.randint(0, 9)
+        sz = [rnd.randint(1, 6) for _ in range(m)]
+        k, tgt = rnd.randint(0, m), rnd.randint(0, sum(sz) + 1)
+        sols = [c for c in combinations(range(m), k) if sum(sz[i] for i in c) == tgt]
+        assert unique_subset(sz, k, tgt) == ("none" if not sols else "ambiguous" if len(sols) > 1 else sols[0])

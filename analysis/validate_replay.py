@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import gc
 import gzip
 import json
 from collections import Counter, defaultdict
@@ -53,12 +54,77 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from data.parse import iter_trades, recorder_hours
-from engine_py.matching import PLACEHOLDER
+from engine_py.matching import PLACEHOLDER, Engine
 from engine_py.replay import COINS, OUTSIDE_FILL_POSITION, Observer, Replay, listing
 from engine_py.types import (ASSETS, Cancel, CancelByCloid, Modify, OutsideFill, Place, RejectReason, Side,
                              Tif, ZERO_HASH)
 
-POLICIES = {"listing": listing}
+
+
+# --- G1 triage (H1), THROWAWAY measurement policies: not the ordering track's policies (engine_py/ordering.py).
+# Hyperliquid docs: within a block, actions that send no GTC/IOC order run first, then cancels, then
+# actions that send at least one GTC/IOC; within a class, proposer order. Consensus batches are not
+# visible in explorer blocks, so the whole block is treated as one batch.
+
+def tx_class(actions_of_tx) -> int:
+    """0: no GTC/IOC order (incl. ALO-only, scheduleCancel); 1: cancel; 2: sends a GTC/IOC order.
+    Classified on the tx's decoded BTC/ETH items only."""
+    if any((a.new if isinstance(a, Modify) else a).tif is not Tif.ALO
+           for a in actions_of_tx if isinstance(a, (Place, Modify))):
+        return 2
+    if any(isinstance(a, (Cancel, CancelByCloid)) for a in actions_of_tx):
+        return 1
+    return 0
+
+
+def _tx_classes(actions) -> dict:
+    by_tx = defaultdict(list)
+    for a in actions:
+        by_tx[a.tx_index].append(a)
+    return {k: tx_class(v) for k, v in by_tx.items()}
+
+
+def class_policy(actions):
+    """(class, tx_index, item_index): cancels before every GTC/IOC taker in the block."""
+    cls = _tx_classes(actions)
+    return sorted(actions, key=lambda a: (cls[a.tx_index], a.tx_index, a.item_index))
+
+
+def priority_policy(actions):
+    """class_policy, then GTC/IOC txs by grouping.p descending (priority fee; docs: IOCs >= 8 bps
+    in a 70 ms bucket sort by fee) instead of proposer order. No p sorts as 0."""
+    cls = _tx_classes(actions)
+    return sorted(actions, key=lambda a: (cls[a.tx_index], -(a.priority or 0) if cls[a.tx_index] == 2 else 0,
+                                          a.tx_index, a.item_index))
+
+
+def anti_policy(actions):
+    """Identification control (deliberately wrong): class_policy reversed, GTC/IOC takers before cancels before
+    the rest; proposer order inside a class."""
+    cls = _tx_classes(actions)
+    return sorted(actions, key=lambda a: (-cls[a.tx_index], a.tx_index, a.item_index))
+
+
+def shuffle_policy(actions):
+    """Identification control: txs in a random order (seeded by block height, so runs repeat), items kept in
+    order inside a tx."""
+    import random
+    if not actions:
+        return []
+    txs = sorted({a.tx_index for a in actions})
+    random.Random(actions[0].block).shuffle(txs)
+    rank = {t: i for i, t in enumerate(txs)}
+    return sorted(actions, key=lambda a: (rank[a.tx_index], a.item_index))
+
+
+POLICIES = {"listing": listing, "class": class_policy, "priority": priority_policy, "anti": anti_policy,
+            "shuffle": shuffle_policy}
+
+# CLI default (validate_replay / validate_chunks): correct the book from each applied tx's real trades
+# (engine_py/replay.Replay trade_learn; measured in handoff/integrate_result.md). run() and Replay stay off.
+DEFAULT_TRADE_LEARN = "sweep,queue"   # name-clip dropped Nov 19: 74 chunks, 17 txs better, 0 worse (+2.8 pts per-tx, all txs)
+# CLI default for keep-known refills: missing snapshot size behind known orders (chunks: recall_full 23.0% -> 26.8%)
+DEFAULT_REFILL_POSITION = "back"
 
 CATEGORIES = ("outside-fill timing", "wrong ALO decision", "unknown pre-window order", "unresolved cancel",
               "ordering", "margin rejection (unobservable)", "real bug (unexplained)")
@@ -104,6 +170,48 @@ def load_alo_status(hl_data, heights: range | None = None, t0_ms: int | None = N
                 out[(m["block"], m["hash"], m["item"])] = {
                     "truth": alo_truth_class(ans),
                     "status": ans.get("order", {}).get("status", ans.get("status")) if isinstance(ans, dict) else None}
+    return out
+
+
+def stream_order_truth(rp, hl_data) -> dict[tuple[int, str, int], dict]:
+    """Truth for placements of users the recorder tracked (orderUpdates: user_orders.jsonl), in load_alo_status's
+    form. Each Place / Modify of the window joins its order's statuses by (user, asset, cloid), else by (user,
+    asset, side, px, original size) with the order timestamp within 1 s of the block. badAloPxRejected ->
+    rejected_alo; any other *Rejected -> rejected_other; open / filled / canceled / ... -> accepted.
+    MEASUREMENT ONLY: it feeds the wrong-ALO flags and the confusion table, never the engine."""
+    from data import oid_facts
+    facts = oid_facts.load(rp.window_dir, hl_data)
+    by_oid: dict[int, list] = defaultdict(list)
+    for o in facts.orders:
+        if o["source"] == "ws" and o["status"]:
+            by_oid[o["oid"]].append(o)
+    if not by_oid:
+        return {}
+    by_cloid, by_shape = {}, defaultdict(list)
+    for oid, recs in by_oid.items():
+        o = recs[0]
+        sts = [r["status"] for r in recs]
+        rej = next((x for x in sts if x.endswith("Rejected")), None)
+        truth = ("rejected_alo" if rej == "badAloPxRejected" else "rejected_other") if rej else "accepted"
+        v = {"truth": truth, "status": rej or sts[0], "source": "user_orders"}
+        spec = ASSETS[o["asset"]]
+        if o["cloid"]:
+            by_cloid[(o["user"], o["asset"], o["cloid"])] = v
+        by_shape[(o["user"], o["asset"], o["buy"], spec.px_to_ticks(o["px"]), spec.sz_to_lots(o["sz"]))].append(
+            (o["timestamp"], v))
+    out = {}
+    for b in rp.blocks:
+        for a in b.actions:
+            if not isinstance(a, (Place, Modify)):
+                continue
+            p = a.new if isinstance(a, Modify) else a
+            v = by_cloid.get((a.user, p.asset, p.cloid)) if p.cloid else None
+            if v is None:
+                cands = [x for t, x in by_shape.get((a.user, p.asset, p.side is Side.BUY, p.px, p.sz), ())
+                         if abs(t - b.time_ms) <= 1000]
+                v = cands[0] if len(cands) == 1 else None
+            if v is not None:
+                out[(a.block, a.hash, a.item_index)] = v
     return out
 
 
@@ -166,6 +274,9 @@ def categorize(flags: set) -> str:
 
 class ValidateObserver(Observer):
     def __init__(self, real_by_hash: dict, alo_truth: dict):
+        # H11 scoring rule (g1-dd-placeholder, NOT approved; default off): with keep_known, every refill
+        # counts as a re-seed and known engine orders placed before it score as WILDCARD
+        self.wildcard_pre_reseed_known = False
         self.real_by_hash = real_by_hash
         self.alo_truth = alo_truth
         self.seq = 0
@@ -259,6 +370,8 @@ class ValidateObserver(Observer):
             self.reseed_time[s.asset] = s.time_ms
         elif result.get("refill"):                     # keep-known re-seed: known orders stay known
             self.reseed_time[s.asset] = s.time_ms
+            if self.wildcard_pre_reseed_known:         # H11 rule: a refill counts as a re-seed for scoring
+                self.reseed_seq[s.asset] = self.seq
 
     # ---------------------------------------------------------- scoring
     def flags_for(self, rec: TxRecord, rp) -> set:
@@ -315,7 +428,13 @@ class ValidateObserver(Observer):
         side = rec.side.opposite
         real = [(px, sz, m if self.quoted_since(m, rec.asset, side, px, rec.reseed_seq, rec.seq) else WILDCARD)
                 for px, sz, m in rec.real]
-        engine = [(px, sz, WILDCARD if m == PLACEHOLDER else m, oid) for px, sz, m, oid in rec.engine]
+        # a known engine order placed before the last re-seed (only with reseed_keep_known: the plain
+        # re-seed clears them) is pre-re-seed liquidity too, scored like a placeholder
+        if self.wildcard_pre_reseed_known:
+            engine = [(px, sz, WILDCARD if m == PLACEHOLDER or self.placed_seq.get(oid, rec.reseed_seq + 1) <= rec.reseed_seq
+                       else m, oid) for px, sz, m, oid in rec.engine]
+        else:
+            engine = [(px, sz, WILDCARD if m == PLACEHOLDER else m, oid) for px, sz, m, oid in rec.engine]
         return real, engine
 
     def real_makers_in_window(self, rec: TxRecord) -> bool:
@@ -342,19 +461,43 @@ def book_text(book, side, depth=BOOK_DEPTH) -> str:
 
 def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
         alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False,
-        touch_reconcile=False, touch_n_cap=False, keep_known=False, skip_lead_in=False):
+        touch_reconcile=False, touch_n_cap=False, touch_refill=None, keep_known=False, skip_lead_in=False,
+        lead_in_keep=None, touch_evict="oldest", ledger_k=3,
+        snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
+        outside_other_txs=False, other_position="end", placeholder_ttl_ms=None,
+        placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False,
+        trade_learn=None, trade_learn_at="tx", oid_guard=None, refill_position="front", oid_facts=False,
+        name_prewindow=False, named_anon="front", deep_book=False,
+        learn_keep_known=False, facts_exclude=(), use_bbo=True, anchor_drop_kinds=(), oid_bracket=False, p_priority=None,
+        evict_arrival=False, taker_reject=None, taker_seed=None):
+    """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
+    # A replay holds millions of long-lived objects (oid facts, books, placed actions); CPython's full collections
+    # re-scan all of them and were ~65% of a chunk's runtime. Young generations still collect cycles; outputs are
+    # identical (checked on a chunk, Nov 20). Process-wide, so it also covers validate_chunks workers.
+    gc.set_threshold(50_000, 20, 1_000)
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
                 gate_max_age_ms=gate_max_age_ms, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
-                reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap,
-                keep_known=keep_known, skip_lead_in=skip_lead_in)
+                reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap, touch_refill=touch_refill,
+                lead_in_keep=lead_in_keep, touch_evict=touch_evict, ledger_k=ledger_k,
+                keep_known=keep_known, skip_lead_in=skip_lead_in,
+                snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
+                other_position=other_position, placeholder_ttl_ms=placeholder_ttl_ms,
+                placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap,
+                reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, trade_learn_at=trade_learn_at, oid_guard=oid_guard, refill_position=refill_position, oid_facts=oid_facts,
+                name_prewindow=name_prewindow and oid_facts, named_anon=named_anon, deep_book=deep_book, learn_keep_known=learn_keep_known, facts_exclude=facts_exclude,
+                use_bbo=use_bbo, anchor_drop_kinds=anchor_drop_kinds, oid_bracket=oid_bracket, taker_reject=taker_reject, taker_seed=_seed_for(taker_seed, window), engine=engine if engine is not None else Engine(stp=stp, p_priority=p_priority, evict_arrival=evict_arrival))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
         if tr.hash != ZERO_HASH:
             real_by_hash[tr.hash].append(tr)
     alo_truth = load_alo_status(hl_data, heights, rp.t0, rp.t1)
-    obs = ValidateObserver(real_by_hash, alo_truth)
+    if oid_facts:
+        for k, v in stream_order_truth(rp, hl_data).items():
+            alo_truth.setdefault(k, v)                  # a probe answer (orderStatus) wins over the stream
+    obs = (observer_cls or ValidateObserver)(real_by_hash, alo_truth)
+    obs.wildcard_pre_reseed_known = wildcard_pre_reseed_known
     rp.observer = obs
     for _ in rp:
         pass
@@ -484,6 +627,48 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
            "lead_in": "skipped" if rp.skip_lead_in and rp.lead_in else f"{rp.lead_in} blocks" if rp.lead_in else "none",
            "touch_reconcile": ("bbo every block" + (" + n cap" if rp.touch_n_cap else "")) if rp.touch_reconcile else "off",
            "real_linked_txs_not_in_window": unlinked}
+    triage = {"snapshot_shift": rp.snapshot_shift, "shift_dropped": rp.shift_dropped,
+              "outside_position": rp.outside_position, "stp": rp.engine.stp,
+              "outside_fill_other_tx": rp.parse_stats["outside_fill_other_tx"]}
+    if rp.other_position != "end":
+        triage["other_position"] = rp.other_position
+    if (rp.snapshot_shift, rp.outside_position, rp.engine.stp, rp.outside_other_txs) != (0, "end", "cancel_taker", False):
+        res.update(triage)                          # G1 triage flags: only when not the default
+    ph = {"placeholder_ttl_ms": rp.placeholder_ttl_ms, "placeholder_queue": rp.placeholder_queue,
+          "placeholder_cap": rp.placeholder_cap, "reseed_keep_known": rp.reseed_keep_known}
+    if tuple(ph.values()) != (None, "ahead", None, False):
+        res.update(ph)                              # H11 placeholder flags: only when not the default
+        res.update({f"ph:{k}": v for k, v in sorted(rp.ph_stats.items())})
+    if obs.wildcard_pre_reseed_known:
+        res["wildcard_pre_reseed_known"] = True
+    if rp.refill_position != "front":
+        res["refill_position"] = rp.refill_position
+    if rp.oid_guard not in (None, "ghost"):
+        res["oid_guard"] = rp.oid_guard
+    if rp.oid_facts:                                # order-id facts: only when on
+        res["oid_facts"] = True
+        est = rp.resolver.est
+        res["facts:anchors"] = len(est.anchors)
+        res["facts:exact"] = len(est.exact)
+        res["facts:oid_px"] = sum(v is not None for v in est.oid_px.values())
+    if rp.deep_book:
+        res["deep_book"] = True
+        for k, v in sorted(rp.deep_stats.items()):
+            res["deep:" + k] = v
+    if rp.named or rp.name_stats:
+        for k, v in sorted(rp.name_stats.items()):
+            res["name:" + k] = v
+        for k in ("resolved_named", "named_gone"):
+            res["name:" + k] = rp.resolver.stats.get(k, 0) if rp.resolver is not None else 0
+        if rp.named_anon != "front":
+            res["named_anon"] = rp.named_anon
+        res["facts:dropped_anchors"] = est.dropped_anchors
+    if rp.taker_reject:
+        res.update({f"taker:{k}": v for k, v in sorted(rp.taker_stats.items())})
+        res["taker_blocked_end"] = ";".join(sorted(rp._taker_blocked))
+    if rp.trade_learn is not None:                  # trade-learning flag: only when set
+        res["trade_learn"] = rp.trade_learn
+        res.update({f"learn:{k}": v for k, v in sorted(rp.learn_stats.items())})
     res.update(scope_metrics(scored))
     post = [r for r in rows if not r["warmup"]]
     res["excluded_real_maker_prewindow"] = sum(r["status"].startswith("excluded") for r in post)
@@ -625,22 +810,120 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     ap.add_argument("--alo-gate", choices=["touch"], help="G1 fix #1: admit ALOs against the real touch")
     ap.add_argument("--gate-max-age-ms", type=int, help="gate abstains when the touch is older than this")
     ap.add_argument("--evict-known", choices=["oldest", "newest"], help="G1 fix #2: rule 8 evicts known orders")
+    ap.add_argument("--p-priority", type=_p_priority_arg, default=None, metavar="always|known|MS",
+                    help="queue by grouping.p at one price: 'always', or only against orders <= MS ms older")
+    ap.add_argument("--evict-arrival", action="store_true",
+                    help="keep-known/evict-known trims known orders by arrival (seq), not queue position")
+    ap.add_argument("--oid-bracket", action="store_true",
+                    help="reference points from tracked users' orders on every coin + monotone oid bracket rule")
     ap.add_argument("--nearest-ratio", type=int, default=0,
                     help="resolver: accept the nearest of several candidates if all others are this many times farther")
     ap.add_argument("--reseed", action="store_true", help="G1 #3: rebuild each book from every snapshot")
     ap.add_argument("--touch-reconcile", action="store_true", help="rule 8 against the recorded bbo before every block")
     ap.add_argument("--touch-n-cap", action="store_true", help="with --touch-reconcile: cap touch order count at bbo n")
+    ap.add_argument("--touch-refill", choices=["front", "back"], default=None,
+                    help="touch reconcile + add missing bbo touch size as a placeholder (ahead of / behind the level)")
     ap.add_argument("--keep-known", action="store_true",
                     help="with --reseed: keep known orders at each snapshot, refill missing size at the front")
     ap.add_argument("--skip-lead-in", action="store_true", help="lead-in chunks: replay only the scored part")
+    ap.add_argument("--lead-in-keep", type=int, default=None, help="measurement: replay only the last N lead-in blocks")
+    ap.add_argument("--touch-evict", choices=["oldest", "newest", "ledger"], default="oldest",
+                    help="touch reconcile: which known orders go first when our touch level exceeds bbo")
+    ap.add_argument("--ledger-k", type=int, default=3, help="--touch-evict ledger: most orders removed per touch level")
+    ap.add_argument("--snapshot-shift", type=int, default=0, help="triage H4: apply snapshots k blocks later (<0 earlier)")
+    ap.add_argument("--outside-position", choices=["end", "start"], default="end", help="triage H7")
+    ap.add_argument("--outside-other-txs", action="store_true",
+                    help="triage H9: trades linked to non-book txs (SetGlobalAction) become outside fills")
+    ap.add_argument("--other-position", choices=["end", "start", "index"], default="end",
+                    help="with --outside-other-txs: where those fills go (index = at their own tx's position)")
+    ap.add_argument("--stp", choices=["cancel_taker", "expire_maker"], default="cancel_taker", help="triage H8")
+    ap.add_argument("--placeholder-ttl-ms", type=int, help="H11: placeholders expire this long after their snapshot")
+    ap.add_argument("--placeholder-queue", choices=["ahead", "behind"], default="ahead",
+                    help="H11: behind = known orders get priority over placeholders at a level")
+    ap.add_argument("--placeholder-cap", choices=["next"],
+                    help="H11, LOOK-AHEAD (measurement only): cap re-seeded levels by the next snapshot + real trades")
+    ap.add_argument("--reseed-keep-known", action="store_true",
+                    help="H11: alias of --keep-known")
+    ap.add_argument("--refill-position", choices=["front", "back"], default=DEFAULT_REFILL_POSITION,
+                    help="keep-known: missing snapshot size goes ahead of known orders (front) or behind them")
+    ap.add_argument("--oid-guard", choices=["ghost", "ratio25", "ratio50", "cap3000", "none"],
+                    help="int-oid resolver preset (default ghost = data/oids defaults; none = old rule)")
+    ap.add_argument("--taker-reject", metavar="RULES", default=None,
+                    help="treat IOC takers as rejected by the chain (comma list): min10 = notional under 10 USD; "
+                         "learn = the user's last engine-filled IOC had no real trade (until a real fill); "
+                         "margin = grows the position past the plan-time free margin (clearinghouseState.json); "
+                         "margin_spot = margin plus spot USDC available")
+    ap.add_argument("--taker-seed", metavar="JSON", default=None,
+                    help="with --taker-reject learn: start each chunk with these users blocked "
+                         "({chunk: [users]}, built from EARLIER chunks by analysis/taker_seed.py)")
+    ap.add_argument("--trade-learn-at", choices=["tx", "block-end"], default="tx",
+                    help="when trade_learn corrections run: after each tx (default) or once at the end of the block, in "
+                         "listing order (same position under every ordering policy; use for counterfactuals)")
+    ap.add_argument("--trade-learn", metavar="RULES", default=DEFAULT_TRADE_LEARN,
+                    help="correct the book from each tx's real trades after it is applied (later txs only): "
+                         "sweep = remove what the real taker must have consumed; name = front placeholder at the "
+                         "last real price becomes the last real maker's order (-clip: only the size that maker just filled); "
+                         "queue = remove what rests ahead of a filled maker's order. Comma-separated, e.g. "
+                         "sweep,queue,name-clip; both = sweep,name; both-clip = sweep,name-clip. "
+                         f"Default {DEFAULT_TRADE_LEARN}; 'off' = none")
+    ap.add_argument("--no-oid-facts", action="store_true",
+                    help="resolver ignores real order-id facts (fills.json, hist_orders.json, open_orders.json, "
+                         "recorder user streams); default: uses them as anchors and exact oid matches")
+    ap.add_argument("--name-prewindow", action="store_true",
+                    help="with facts: pre-window orders the facts show resting at the seed snapshot become their real "
+                         "owner's orders (real oid, queue by oid). Off by default: neutral on 46 Mac chunks (G1 -0.3, "
+                         "full recall +0.3 points)")
+    ap.add_argument("--deep-book", action=argparse.BooleanOptionalAction, default=True,
+                    help="liquidity past the full snapshot's 20 levels from the coarse book (book_*_sf4), split over "
+                         "prices by what was observable, used only by orders whose limit reaches past the last level. "
+                         "Default ON (approved by Satya Nov 19 as an exception to 'never add liquidity from "
+                         "snapshots'; 74 Mac chunks: G1 59.0% -> 66.6%, one tx changed); --no-deep-book turns it off")
+    ap.add_argument("--facts-exclude", default="",
+                    help="comma-separated order-id fact sources to leave out (fills, hist, open, ws_orders, ws_fills)")
+    ap.add_argument("--no-bbo", action="store_true", help="the touch ignores the recorded bbo feed")
+    ap.add_argument("--no-target-lookups", action="store_true",
+                    help="ignore capture's orderStatus answers for cancel targets (anchors.json kind 'target')")
+    ap.add_argument("--learn-keep-known", action="store_true",
+                    help="trade_learn's sweep and queue rules remove placeholders only, never an order we saw placed")
+    ap.add_argument("--named-anon", choices=("front", "back"), default="front",
+                    help="where the anonymous rest of a level with named pre-window orders queues (default front)")
+    ap.add_argument("--wildcard-pre-reseed-known", action="store_true",
+                    help="H11 scoring (NOT approved, default off): with --keep-known, known engine orders placed "
+                         "before the last re-seed score as WILDCARD")
+
+
+def _p_priority_arg(v: str):
+    return v if v in ("always", "known", "knownpos", "docs", "docsall") else int(v)
 
 
 def replay_kwargs(a) -> dict:
     """Keyword arguments for run() from add_replay_args options (all but hl_data, policy, anchors)."""
     return dict(use_resolver=not a.no_resolver, alo_gate=a.alo_gate, gate_max_age_ms=a.gate_max_age_ms,
                 evict_known=a.evict_known, nearest_ratio=a.nearest_ratio, reseed=a.reseed,
-                touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap,
-                keep_known=a.keep_known, skip_lead_in=a.skip_lead_in)
+                touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap, touch_refill=a.touch_refill,
+                keep_known=a.keep_known, skip_lead_in=a.skip_lead_in,
+                lead_in_keep=a.lead_in_keep, touch_evict=a.touch_evict, ledger_k=a.ledger_k,
+                snapshot_shift=a.snapshot_shift, outside_position=a.outside_position, stp=a.stp,
+                outside_other_txs=a.outside_other_txs, other_position=a.other_position,
+                placeholder_ttl_ms=a.placeholder_ttl_ms, placeholder_queue=a.placeholder_queue,
+                placeholder_cap=a.placeholder_cap, reseed_keep_known=a.reseed_keep_known,
+                wildcard_pre_reseed_known=a.wildcard_pre_reseed_known,
+                trade_learn=None if a.trade_learn == "off" else a.trade_learn, trade_learn_at=a.trade_learn_at,
+                oid_guard=a.oid_guard, refill_position=a.refill_position,
+                oid_facts=not a.no_resolver and not a.no_oid_facts,
+                name_prewindow=a.name_prewindow, named_anon=a.named_anon,
+                deep_book=a.deep_book, learn_keep_known=a.learn_keep_known,
+                facts_exclude=tuple(x for x in a.facts_exclude.split(",") if x), use_bbo=not a.no_bbo,
+                anchor_drop_kinds=("target",) if a.no_target_lookups else (), oid_bracket=a.oid_bracket,
+                p_priority=a.p_priority, evict_arrival=a.evict_arrival, taker_reject=a.taker_reject,
+                taker_seed=a.taker_seed)
+
+
+def _seed_for(path, window):
+    """--taker-seed: {chunk folder name: [users]} (analysis/taker_seed.py); this chunk's list, [] if absent."""
+    if not path:
+        return None
+    return json.load(open(path)).get(Path(window).name, [])
 
 
 def options_tag(a) -> str:
@@ -649,7 +932,36 @@ def options_tag(a) -> str:
                     f"-evict{a.evict_known}" if a.evict_known else "",
                     f"-nr{a.nearest_ratio}" if a.nearest_ratio else "", "-reseed" if a.reseed else "",
                     "-touch" if a.touch_reconcile else "", "-ncap" if a.touch_n_cap else "",
-                    "-keep" if a.keep_known else "", "-nolead" if a.skip_lead_in else ""])
+                    f"-tref{a.touch_refill}" if a.touch_refill else "",
+                    f"-tev{a.touch_evict}" if a.touch_evict != "oldest" else "",
+                    f"-k{a.ledger_k}" if a.touch_evict == "ledger" and a.ledger_k != 3 else "",
+                    f"-lead{a.lead_in_keep}" if a.lead_in_keep is not None else "",
+                    "-keep" if a.keep_known else "", "-nolead" if a.skip_lead_in else "",
+                    f"-shift{a.snapshot_shift}" if a.snapshot_shift else "",
+                    "-ofstart" if a.outside_position == "start" else "", "-stpexpire" if a.stp == "expire_maker" else "",
+                    "-ofother" if a.outside_other_txs else "",
+                    f"-oth{a.other_position}" if a.other_position != "end" else "",
+                    f"-phttl{a.placeholder_ttl_ms}" if a.placeholder_ttl_ms is not None else "",
+                    "-phbehind" if a.placeholder_queue == "behind" else "",
+                    "-phcapnext" if a.placeholder_cap else "", "-keepknown" if a.reseed_keep_known else "",
+                    "-wcknown" if a.wildcard_pre_reseed_known else "",
+                    "-tloff" if a.trade_learn == "off" else
+                    f"-tl{a.trade_learn.replace(',', '+')}" if a.trade_learn != DEFAULT_TRADE_LEARN else "",
+                    "-tlblockend" if a.trade_learn_at == "block-end" and a.trade_learn != "off" else "",
+                    f"-og{a.oid_guard}" if a.oid_guard not in (None, "ghost") else "",
+                    f"-refill{a.refill_position}" if a.refill_position != DEFAULT_REFILL_POSITION else "",
+                    "-nofacts" if a.no_oid_facts else "",
+                    "-name" if a.name_prewindow and not a.no_oid_facts else "",
+                    "-anonback" if a.named_anon == "back" else "",
+                    "-nodeep" if not a.deep_book else "",
+                    "-learnkeep" if a.learn_keep_known else "",
+                    f"-fx{a.facts_exclude.replace(',', '+')}" if a.facts_exclude else "",
+                    "-nobbo" if a.no_bbo else "",
+                    "-notargets" if a.no_target_lookups else "", "-bracket" if a.oid_bracket else "",
+                    f"-p{a.p_priority}" if a.p_priority is not None else "",
+                    "-evarr" if a.evict_arrival else "",
+                    f"-trej{a.taker_reject.replace(',', '+')}" if a.taker_reject else "",
+                    "-tseed" if a.taker_seed else ""])
 
 
 def main(argv=None):

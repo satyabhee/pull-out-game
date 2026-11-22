@@ -164,7 +164,7 @@ def test_zero_hash_trades_become_outside_fills_at_block_end(tmp_path):
     place, of1, of2 = block.actions
     assert isinstance(place, Place)
     assert all(isinstance(a, OutsideFill) for a in (of1, of2))
-    assert (of1.tid, of2.tid) == (3, 9)                            # ordered by tid
+    assert (of1.tid, of2.tid) == (9, 3)                            # stream order (tids are random, not order)
     assert of1.tx_index == 1 and (of1.item_index, of2.item_index) == (0, 1)
     assert of1.user == MAKER and of1.maker_user == TAKER           # side B: taker is users[0]
 
@@ -362,3 +362,13 @@ def test_a_cut_last_line_is_still_skipped_with_orjson(tmp_path):
     d.mkdir(parents=True)
     (d / "trades_BTC.jsonl").write_text(json.dumps(trade_rec(T, 1)) + "\n" + '{"recv_ms": %d, "msg": {"cha' % T)
     assert [t.tid for t in iter_trades(tmp_path, ("BTC",), T, T)] == [1]
+
+
+def test_ranged_reads_keep_only_their_span_and_reload_for_a_new_span(tmp_path):
+    recs = [trade_rec(T + k * 60_000, 100 + k, t=T + k * 60_000) for k in range(-30, 31)]
+    path = trades_file(tmp_path, recs)
+    assert [t.tid for t in iter_trades(tmp_path, ("BTC",), T, T)] == [100]
+    rf = P._file_cache[path][1]
+    assert len(rf.lines) < len(recs)                                  # only the span (+ pad) is held
+    far = T + 25 * 60_000
+    assert [t.tid for t in iter_trades(tmp_path, ("BTC",), far, far)] == [125]   # outside it: reloaded, same answer
