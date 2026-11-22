@@ -90,3 +90,31 @@ cloid cancels and scheduleCancel; margin and reduce-only are outside the current
 
 **Blocked / done instead.** The Example-based tests are not written. Rule-based tests and differential tests against
 the Python engine cover the same engine paths.
+
+# M1 checkpoint questions (Nov 22)
+
+## Q6. Add `pyarrow` for parquet truth logs?
+
+**Why it matters.** The plan says truth logs are compressed parquet; that needs `pyarrow` (a new dependency, ~100 MB
+installed). **Options.** (a) Add pyarrow and switch `replay/sim/truth.py` (one function each way). (b) Keep lz4 JSON
+lines (~0.9 MB per chunk, read in ~0.1 s; recommended until M3's Polars features need columnar files).
+**Blocked / done instead.** Nothing blocked; lz4 JSON lines today.
+
+## Q7. Fix the trade-correction "queue" rule the simulator caught?
+
+**Why it matters.** With nothing hidden, the baseline's block-end trade corrections drop strict recall from 98.3% to
+92.0% (docs/deviations.md D31): when the real maker filled with an old quote and also has a newer quote at that price,
+the rule deletes every real order ahead of the newer one. On real data it is tuned to remove phantoms, so a fix could
+move the real baseline either way. **Options.** (a) Restrict the rule to orders ahead of the maker's order that was
+actually old enough to have been filled (first order placed before the tx's block); measure on dev20 + sim200.
+(b) Leave it (recommended until (a) is measured: it is a Python engine behaviour change, your call).
+**Blocked / done instead.** Nothing changed in the engine.
+
+## Q8. Calibrate the sampler toward real statistics now, or in M2/M3?
+
+**Why it matters.** The simulated market differs a lot from dev20 (5x the trades per block, levels with far fewer
+orders, 10x fewer post-only margin rejections, no open-order cap; docs/m1_report.md). Simulator-based measurements
+(M2 recovery rates) are only as good as this match. **Options.** (a) One tuning pass now (taker rates x0.2, more and
+smaller MM orders per level, a broke quoter agent, an open-order cap), regenerate sim200 (90 s), re-run calibration
+and the baseline (recommended: cheap, and M2 needs it). (b) Defer to M3 profiles. **Blocked / done instead.** The
+default suite is the untuned v1; nothing in M1's done-criteria depends on the answer.

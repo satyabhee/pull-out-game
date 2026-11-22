@@ -154,3 +154,37 @@ incl. the Rust-vs-Python differential tests; dev20-data tests skip there). Untes
 are data in `tests/chain_examples.py` (what the chain does), shared with M1's rules engine. Through the replay engine:
 Example 1 passes (docs priority), Example 6 passes with `stp=maker` and is a strict xfail under the default
 `stp=taker`, Examples 2, 5, 7 are strict xfails (hidden margin / position state the engine cannot see).
+
+## M1 · Transfigure
+
+**D27. Layout and formats.** `replay/sim/`: `config.py` (every sampler and mask parameter), `rules_engine.py`,
+`sampler.py`, `mask.py`, `truth.py`, `generate.py`, `calibrate.py`. A simulated chunk is written in the REAL on-disk
+formats (explorer blocks, window.json, anchors.json, clearinghouseState.json, recorder hours), so the existing replay
+and scoring run on simulated chunks unchanged. Suites live outside the repo: `~/hl-data/sim/m1` (set `sim200`,
+200 seeds) and `~/hl-data/sim/m1_fv` (set `fv20`, full visibility). Each seed gets its own recorder hour in 2028.
+
+**D28. Truth logs are lz4 JSON lines, not parquet.** Parquet needs `pyarrow`, a new dependency (QUESTIONS Q6).
+Only `replay/sim/truth.py` knows the format. Size: ~0.9 MB per chunk.
+
+**D29. Rules-engine simplifications** (all in `rules_engine.py`'s docstring): free margin is fixed per account for
+the chunk (no mark-to-market) and checked on the order's full size at its limit price; rejected items take an oid;
+a cancel action errors only when every item misses; a reduce-only order whose position shrinks below its size but not
+to zero is left as is (`reduce_only_shrink="leave"`, the plan's default while open). Not modelled yet: modify /
+batchModify, scheduleCancel, outside fills (liquidations, TWAP, triggers), tooManyOpenOrders, open-interest caps, the
+oracle band. The sampler is hand-set (config defaults) until M3's profiles exist.
+
+**D30. Full visibility needs every oid.** With only the default 50 anchors per chunk, int-oid cancels (15% of
+market-maker cancels) are hidden information: the property test then disagreed on 204 of 522 txs. With an anchor
+for every placement (`SimConfig.full_visibility`) the replay engine and the simulated chain have identical books
+after every block, and strict recall is exactly 1.0 (403/403 txs on 3 chunks; `tests/test_sim_generate.py`).
+
+**D31. Disagreements found by the property test** (full visibility, chain rules: class order, stp=maker, docs):
+plain engine 100.0% strict; + the baseline heuristics (ledger, touch reconcile, oid bracket, evict-arrival, ...)
+without trade corrections 98.3%; + block-end trade corrections (the full baseline) 92.0%. The trade-correction
+"queue" rule removes every order ahead of the real maker's FIRST order in our queue; when that maker filled with an
+old quote and also has a newer quote at the same price (placed earlier in the block), the rule takes the newer one
+and deletes real orders. Python engine behaviour is unchanged (Satya's call, QUESTIONS Q7).
+
+**D32. Errored actions are evidence.** In the P5 example the maker's cancel ran after its order filled, so the chain
+rejected the action; the explorer lists it with an error and `data.parse.decode_tx` drops errored txs. An errored
+cancel right after a fill is visible evidence of a batch boundary (useful for M2's `batch_cuts`).
