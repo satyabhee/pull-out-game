@@ -43,6 +43,7 @@ reported, and the dev-fast clause (upper bound >= 0) still applies.
 | Nov 23 | A4(b2) + name from cancels (vs B1) | (b1) + `--named-cancel` | rule since Nov 23 | identical to (b1) on every tx | identical | identical | n (same as b1; Q15) | this session |
 | Nov 23 | A5 Part 1 oid counting test | - | A5 rule (ce533a8) | **no scope holds**: best = V0 same block, 89.1% of 312,162 pairs r = 0 (bar 99%) | | | n/a: Part 2 (resolver) not built, per the rule | this session |
 | Nov 23 | L5-lite Multiplicity-lite (vs B1) | `--multi-lite` | ML rule (c9c595c) + 70% naming bar | +0.5 [+0.0, +1.9] | +3.0 [+0.0, +6.3] | +0.0 [0, 0] / -1.1 [-7.2, +3.4]; naming precision 54% (dev20) / 35% (dev-fast) | **n: naming precision < 70% on both** | this session |
+| Nov 23 | Fallback 3a naming strictness (vs B1) | `--placeholder-split --trade-learn sweep,queue,name --name-strict N1/N2/N3` | 3a rule (d6ca88c) | N1 +0.5 [+0.0, +1.9] (54%); N2 +0.5 [+0.0, +1.9] (53%); N3 +0.0 (names nothing) | N1/N2 +3.0 [+0.0, +6.3]; N3 +0.0 | not run (no level reaches 70% on dev20) | **n: rule picks N3, which has no named fills and no contested gain** | this session |
 
 ## Rules written before each item (Nov 23 session)
 
@@ -399,4 +400,15 @@ check cannot tell candidates apart (every candidate also had a seeded order ther
 
 The scored change equals A4(b1)'s to the third decimal: the phantom forks close mostly on owners' cancels (E2) and
 rewrite few levels, so the effect is the naming, and the naming is wrong about half the time. Not adopted.
+
+### Fallback 3a results (dev20 vs B1; `python -m analysis.named_screen ~/hl-data/mac3/dev20 ... --name-strict N<k> --out report/validate/a3a_N<k>_dev20`, logs `handoff/a3a/`)
+| level | pieces named | fills on named pieces | right maker | contested | uncontested |
+|---|---|---|---|---|---|
+| N1 one distinct maker | 79 | 135 | 73 (54%) | +0.5 [+0.0, +1.9] | +3.0 [+0.0, +6.3] |
+| N2 + fits the seeded piece | 78 | 132 | 70 (53%) | +0.5 [+0.0, +1.9] | +3.0 [+0.0, +6.3] |
+| N3 + size habit | 0 | 0 | - | +0.0 | +0.0 |
+No level reaches 70%, so the rule picks N3; N3 names nothing (a split piece's size practically never equals one of
+the maker's own order sizes) and has no contested gain. Not adopted; dev-fast not run (it cannot change the outcome).
+The single-maker and size-fit checks barely filter (9 and 3 namings skipped): the wrong names are not ambiguous
+cases, the trade-learn `name` premise (the last real maker at w still rests at the front) is wrong about half the time.
 
