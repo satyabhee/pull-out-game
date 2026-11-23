@@ -44,6 +44,7 @@ reported, and the dev-fast clause (upper bound >= 0) still applies.
 | Nov 23 | A5 Part 1 oid counting test | - | A5 rule (ce533a8) | **no scope holds**: best = V0 same block, 89.1% of 312,162 pairs r = 0 (bar 99%) | | | n/a: Part 2 (resolver) not built, per the rule | this session |
 | Nov 23 | L5-lite Multiplicity-lite (vs B1) | `--multi-lite` | ML rule (c9c595c) + 70% naming bar | +0.5 [+0.0, +1.9] | +3.0 [+0.0, +6.3] | +0.0 [0, 0] / -1.1 [-7.2, +3.4]; naming precision 54% (dev20) / 35% (dev-fast) | **n: naming precision < 70% on both** | this session |
 | Nov 23 | Fallback 3a naming strictness (vs B1) | `--placeholder-split --trade-learn sweep,queue,name --name-strict N1/N2/N3` | 3a rule (d6ca88c) | N1 +0.5 [+0.0, +1.9] (54%); N2 +0.5 [+0.0, +1.9] (53%); N3 +0.0 (names nothing) | N1/N2 +3.0 [+0.0, +6.3]; N3 +0.0 | not run (no level reaches 70% on dev20) | **n: rule picks N3, which has no named fills and no contested gain** | this session |
+| Nov 23 | Fallback 3b A3 ioc_reject classifier (vs B1) | `--taker-reject margin,ioc_model --ioc-model report/validate/a3/model.json` | 3b rule (a751296) | **-54.1 [-66.6, -41.9]** | -67.1 [-77.5, -57.2] | -25.6 [-45.5, -4.7] / -50.0 [-63.4, -37.4]; engine-only 738 -> 73, real-only -> 396 | **n** (dev_margin60 not run) | this session |
 
 ## Rules written before each item (Nov 23 session)
 
@@ -411,4 +412,15 @@ No level reaches 70%, so the rule picks N3; N3 names nothing (a split piece's si
 the maker's own order sizes) and has no contested gain. Not adopted; dev-fast not run (it cannot change the outcome).
 The single-maker and size-fit checks barely filter (9 and 3 namings skipped): the wrong names are not ambiguous
 cases, the trade-learn `name` premise (the last real maker at w still rests at the front) is wrong about half the time.
+
+### Fallback 3b results (`python -m analysis.a3_ioc_model ~/hl-data/mac3/windows --out report/validate/a3/model.json`; screens `report/validate/a3b_{dev20,devfast}`, logs `handoff/a3b/`)
+Training (orders before Nov 19 15:22:47 UTC): fit 22,271 / validation 5,568 / test 232,353 orders; 21 users in the
+fit part; no-fill base rate 98.8% (fit), 99.4% (validation, test). Validation AUC 0.960; leakage tests pass (all
+fit / validation timestamps before the split; permuted-label refit, user rates from the permuted labels too, AUC 0.540;
+user rates from the fit part only). Test AUC 0.954. The registered cutoff (lowest p whose skipped set is >= 99% no-fill)
+is p = 0.280, which skips 232,306 of 232,353 test orders, i.e. almost every one that really filled.
+Screen: dev20 contested 0.587 -> 0.046, txs we no longer fill (real-only) 18 -> 853, engine-only 518 -> 10; dev-fast contested
+0.460 -> 0.204, engine-only 738 -> 73, real-only 396. Fails the default rule by a wide margin; dev_margin60 not run.
+The model ranks well; the cutoff rule (precision on a 99%-negative population) was the wrong target: a skipped
+IOC that really fills costs a scored tx, so the cutoff has to be set on the cost of skipped real fills (NS-3 (b)).
 
