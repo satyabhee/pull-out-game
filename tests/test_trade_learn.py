@@ -235,3 +235,27 @@ def test_trade_learn_at_bad_value_fails_loudly(tmp_path):
     window, hl = sweep_window(tmp_path)
     with pytest.raises(ValueError):
         Replay(window, hl, listing, trade_learn="sweep", trade_learn_at="midway")
+
+
+def _one_maker_window(tmp_path, makers=(M,), m_places=False):
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 50, [], [("60010", "0.005")])
+    txs = [place_tx(M, "0xm0", 0, order(buy=False, px="60500", sz="0.005", tif="Alo"))] if m_places else []
+    h0 = w.block(txs, dt_ms=0)
+    h1 = w.block([place_tx(A, "0xa1", 0, order(px="60010", sz="0.002", tif="Ioc"))], dt_ms=500)
+    for i, mk in enumerate(makers):
+        w.trade("BTC", "B", "60010", "0.001", w.time_of(h1), "0xa1", i + 1, A, mk)
+    w.block([], dt_ms=1000)
+    return w.write()
+
+
+@pytest.mark.parametrize("level_, makers, m_places, named", [
+    ("N1", (M,), False, 1), ("N1", (M, B), False, 0),
+    ("N2", (M,), False, 1),
+    ("N3", (M,), False, 0), ("N3", (M,), True, 1)])
+def test_name_strict_levels(tmp_path, level_, makers, m_places, named):
+    """fallback 3a: N1 one distinct maker; N2 + fits the seeded piece; N3 + a size M has placed (0.005 = seeded)."""
+    window, hl = _one_maker_window(tmp_path, makers, m_places)
+    r = Replay(window, hl, listing, trade_learn="name", name_strict=level_)
+    list(r)
+    assert r.learn_stats["named_orders:BTC"] == named

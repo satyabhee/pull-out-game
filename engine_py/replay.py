@@ -277,7 +277,7 @@ class Replay:
                  other_position: str = "end",
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
                  placeholder_cap: str | None = None, reseed_keep_known: bool = False, placeholder_split: bool = False,
-                 named_cancel: bool = False, multi_lite: bool = False,
+                 named_cancel: bool = False, multi_lite: bool = False, name_strict: str | None = None,
                  trade_learn: str | None = None, trade_learn_at: str = "tx", oid_guard: str | None = None,
                  refill_position: str = "front",
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
@@ -433,6 +433,11 @@ class Replay:
         self.placeholder_cap, self.reseed_keep_known = placeholder_cap, reseed_keep_known   # alias, see keep_known
         # multi_lite (L5-lite, docs/scoreboard.md): per-level alternatives; implies placeholder_split + trade-learn name
         self.multi_lite = multi_lite
+        # fallback 3a (docs/scoreboard.md): trade-learn name only at strictness N1 / N2 / N3 (None = A4(b1) as is)
+        if name_strict not in (None, "N1", "N2", "N3"):
+            raise ValueError(f"unknown name_strict {name_strict!r}")
+        self.name_strict = name_strict
+        self._sizes: dict[tuple[str, int], set] = {}     # (user, asset) -> sizes of their window placements (N3)
         self.placeholder_split = placeholder_split or multi_lite  # A4a: a snapshot level's uncovered size = its uncovered orders
         # A4b2: an unresolvable cancel of user U on asset a removes U's trade-named piece on a if exactly one rests
         self.named_cancel = named_cancel
@@ -1001,6 +1006,8 @@ class Replay:
                 if any(nd.order.user == maker for nd in nodes) or nodes[0].order.user != PLACEHOLDER:
                     continue
                 ph, q = nodes[0].order, nodes[0].remaining
+                if self.name_strict is not None and not self._name_ok(trs, w, maker, ph.oid, q, asset):
+                    continue
                 if self._name_clip:                 # name only M's just-filled size; the rest stays anonymous
                     q = min(q, sum(t.sz for t in trs if t.px == w and t.maker == maker))
                 if q == nodes[0].remaining:
@@ -1018,6 +1025,27 @@ class Replay:
                     makers = list(dict.fromkeys(t.maker for t in at_w))
                     if len(makers) >= 2:
                         self._ml.owner_fork(asset, side, w, order.oid, makers, self._block.height)
+
+    def _name_ok(self, trs, w: int, maker: str, ph_oid: int, rem: int, asset: int) -> bool:
+        """name_strict levels (fallback 3a): N1 one distinct real maker at w; N2 + M's filled size fits the piece's
+        seeded size; N3 + size habit (seeded size, or filled + remaining, is one of M's window placement sizes)."""
+        coin = ASSETS[asset].name
+        at_w = [t for t in trs if t.px == w]
+        if len({t.maker for t in at_w}) != 1:
+            self.learn_stats[f"name_skip_N1:{coin}"] += 1
+            return False
+        if self.name_strict in ("N2", "N3"):
+            meta = self.ph_meta.get(ph_oid)
+            filled = sum(t.sz for t in at_w if t.maker == maker)
+            if meta is None or filled > meta[2]:
+                self.learn_stats[f"name_skip_N2:{coin}"] += 1
+                return False
+            if self.name_strict == "N3":
+                sizes = self._sizes.get((maker, asset), ())
+                if meta[2] not in sizes and filled + rem not in sizes:
+                    self.learn_stats[f"name_skip_N3:{coin}"] += 1
+                    return False
+        return True
 
     def _cancel_named(self, action) -> None:
         """named_cancel (A4b2): U's cancel found no order; if U has exactly one trade-named piece resting on that
@@ -1228,6 +1256,9 @@ class Replay:
         created = before if self.engine.next_oid > before and isinstance(action, (Place, Modify)) else None
         if created is not None:
             self.placed[created] = action.new if isinstance(action, Modify) else action
+            if self.name_strict == "N3":
+                q = self.placed[created]
+                self._sizes.setdefault((q.user, q.asset), set()).add(q.sz)
             self.placed_by[created] = action
             if self.resolver is not None:
                 self.resolver.note(action, created)
