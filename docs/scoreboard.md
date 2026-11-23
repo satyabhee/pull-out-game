@@ -302,3 +302,9 @@ Two stages, so no hypothesis is tested on the data that suggested it.
 - **Stage 3.** Each supported rule goes behind a switch; default adoption rule (dev20 contested point > 0, lower
   >= 0, dev-fast upper >= 0; uncontested upper >= -1.0). If no hypothesis survives Stage 1 or 2: report, build nothing.
 
+**A8b status (10:23Z):** not triggered. Yuta's phantom-vs-queue result on dev_margin60 (mail 2): ours > n 39.0%,
+ours == n 12.6%, ours < n 16.3%, level not in the 5-level feed 31.9%; with chain truth, 19 of 20 filled orders were live.
+By the protocol branch Yuta builds A6-feed; whether A8b starts anyway is NS-2 (handoff/NEEDS_SATYA.md; QUESTIONS
+Q17). Stage 1 script: `~/book-replay-data/handoff/a8b/stage1.sh` (not run). The dev_margin60 queue cases stay unopened
+(Stage 2 test set).
+

@@ -242,3 +242,9 @@ interpolation resolver already does). (b) Pre-register a corrected count (IOC / 
 tested on dev-fast) as a better interpolation prior, then rerun the resolver's held-out check. (c) Wait for Yuta's
 unmatched-cancel cases from dev_margin60 and decide from them whether cancel matching is worth more work.
 
+## Q17. Start A8b although queue priority is not the largest bucket? (= handoff/NEEDS_SATYA.md NS-2)
+Yuta's buckets put "ours > n" (phantom-like) first at 39% and "ours == n" (queue priority) at 12.6%, so the protocol
+does not start A8b; but 19 of 20 filled orders with chain truth were live at fill time. **Options.** (a) start A8b
+Stage 1 now; (b) wait for Yuta's A6-feed result, then run A8b on the misses that remain (**recommended**); (c) drop it.
+Q16 is NS-1.
+
