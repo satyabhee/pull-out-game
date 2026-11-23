@@ -64,11 +64,44 @@ def design(rows, rates, glob_rate):
     return sm.add_constant(X, has_constant="add")
 
 
+def cost_cutoff(y, p, R: float, fs_cap: float):
+    """A3 / I12: skip iff p >= c0 = R/(R+1); if more than fs_cap of the filled IOCs (y == 0) would be skipped, raise
+    the cutoff to the lowest p that meets the cap. Not used (None) unless no-fill skipped - R x filled skipped > 0."""
+    y = np.asarray(y)
+    p = np.asarray(p)
+    c0 = R / (R + 1)
+    n_filled = int((y == 0).sum())
+    cap = math.floor(fs_cap * n_filled)
+
+    def stats(c):
+        m = p >= c
+        return int(((y == 1) & m).sum()), int(((y == 0) & m).sum())
+
+    c = c0
+    tn, fs = stats(c)
+    if fs > cap:                                             # candidates: the distinct p values above c0
+        for v in sorted(set(p[p > c0].tolist())):
+            tn, fs = stats(v)
+            if fs <= cap:
+                c = v
+                break
+        else:
+            c, (tn, fs) = float("inf"), (0, 0)
+    net = tn - R * fs
+    info = {"R": R, "c0": c0, "fs_cap": fs_cap, "cap_count": cap, "cutoff": c if math.isfinite(c) else None,
+            "val_skipped_nofill": tn, "val_skipped_filled": fs, "val_filled_total": n_filled, "val_net": net,
+            "used": bool(math.isfinite(c) and net > 0)}
+    return (float(c) if info["used"] else None), info
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("windows")
     ap.add_argument("--split-ms", type=int, default=1795101767239, help="dev20 / final240 first block (Nov 19 15:22:47 UTC)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--cost-ratio", type=float, default=None,
+                    help="A3 / I12: Bayes cutoff R/(R+1) with a false-skip cap (default: the 3b precision cutoff)")
+    ap.add_argument("--fs-cap", type=float, default=0.05, help="max share of validation's filled IOCs skipped")
     a = ap.parse_args(argv)
     rows = [r for r in load(Path(a.windows)) if r["ntl"] > 0]
     train = [r for r in rows if r["ts"] < a.split_ms]
@@ -114,10 +147,16 @@ def main(argv=None) -> int:
         prec = hits[i] / (i + 1)
         if prec >= 0.99 and (i + 1 == len(order) or pv[order[i + 1]] < pv[order[i]]):
             cutoff, best_recall = float(pv[order[i]]), float(hits[i] / max(1, yv.sum()))
+    cost = None
+    if a.cost_ratio is not None:                             # A3 / I12 rule (docs/scoreboard.md), replaces the 3b cutoff
+        cutoff, cost = cost_cutoff(yv, pv, a.cost_ratio, a.fs_cap)
+        best_recall = cost["val_skipped_nofill"] / max(1, int(yv.sum())) if cutoff is not None else 0.0
     out = {"split_ms": a.split_ms, "fit_until_ms": cut, "n": {"fit": len(fit), "val": len(val), "test": len(test)},
            "users_fit": len(rates), "global_rate": glob_rate, "coef": [float(c) for c in res.params],
            "val_auc": auc(yv, pv), "perm_auc": perm_auc, "reliability": bins, "cutoff": cutoff,
            "val_recall_at_cutoff": best_recall, "val_base_rate": float(yv.mean())}
+    if cost is not None:
+        out["cost_rule"] = cost
     if test:
         yt = np.array([r["y"] for r in test])
         pt = res.predict(design(test, rates, glob_rate))
@@ -125,6 +164,7 @@ def main(argv=None) -> int:
         if cutoff is not None:
             m = pt >= cutoff
             out["test_at_cutoff"] = {"skipped": int(m.sum()), "precision": float(yt[m].mean()) if m.any() else None,
+                                     "filled_skipped": int((yt[m] == 0).sum()), "filled_total": int((yt == 0).sum()),
                                      "recall": float(yt[m].sum() / max(1, yt.sum())), "base_rate": float(yt.mean())}
     if cutoff is not None:                                   # exact thresholds: skip iff notional (>= | <=) T
         b0, b1, b2, b3, b4 = out["coef"]

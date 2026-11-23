@@ -100,3 +100,16 @@ def test_ioc_model_threshold_skips_only_users_without_a_margin_snapshot():
     assert r._taker_skip(ioc("m", "60000", "0.01")) is None                   # has a margin snapshot (and passes)
     assert r._taker_skip(ioc("new", "60000", "0.01")) is None                 # global: >= 10 M only
     assert r._taker_skip(ioc("u", "60000", "0.01", side=Side.SELL)) is None   # no threshold for sells
+
+
+def test_a3_cost_cutoff_rule():
+    from analysis.a3_ioc_model import cost_cutoff
+    # y = 1 no-fill, 0 filled; R = 3 -> c0 = 0.75
+    y = [1, 1, 1, 0, 1, 0, 1, 1]
+    p = [0.99, 0.95, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4]
+    c, info = cost_cutoff(y, p, 3.0, 0.5)          # cap = floor(0.5 * 2) = 1 filled skip allowed
+    assert info["c0"] == 0.75 and info["cutoff"] == 0.75
+    assert (info["val_skipped_nofill"], info["val_skipped_filled"]) == (3, 1) and info["val_net"] == 0
+    assert c is None and not info["used"]            # net 0 -> not used
+    c, info = cost_cutoff(y, p, 3.0, 0.0)          # cap 0: raise to the lowest p above c0 with no filled skip
+    assert c == 0.9 and info["val_skipped_filled"] == 0 and info["val_net"] == 3 and info["used"]
