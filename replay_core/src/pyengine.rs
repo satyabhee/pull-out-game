@@ -186,9 +186,13 @@ impl PyEngine {
         Ok(counts(c))
     }
 
-    fn refill(&mut self, py: Python<'_>, asset: u32, bids: Vec<(i64, i64)>, asks: Vec<(i64, i64)>)
-        -> PyResult<Vec<(String, i64)>> {
-        let c = self.inner.refill(asset, &bids, &asks).map_err(|e| engine_err(py, e))?;
+    #[pyo3(signature = (asset, bids, asks, counts_n=None))]
+    fn refill(&mut self, py: Python<'_>, asset: u32, bids: Vec<(i64, i64)>, asks: Vec<(i64, i64)>,
+              counts_n: Option<(Vec<i64>, Vec<i64>)>) -> PyResult<Vec<(String, i64)>> {
+        let c = match &counts_n {
+            Some((b, a)) => self.inner.refill_counts(asset, &bids, &asks, Some((b.as_slice(), a.as_slice()))),
+            None => self.inner.refill(asset, &bids, &asks),
+        }.map_err(|e| engine_err(py, e))?;
         Ok(counts(c))
     }
 

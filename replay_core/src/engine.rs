@@ -577,16 +577,31 @@ impl Engine {
     /// Engine.refill: where a snapshot level holds more than we do, one placeholder for the difference, at the
     /// FRONT of that level (it rested before anything we saw placed).
     pub fn refill(&mut self, asset: u32, bids: &[(i64, i64)], asks: &[(i64, i64)]) -> R<Counts> {
+        self.refill_counts(asset, bids, asks, None)
+    }
+
+    /// Engine.refill(counts=...) (A4a, --placeholder-split): with per-level snapshot order counts, each gap becomes
+    /// k = max(1, min(gap, n - orders held)) equal placeholders (larger parts first), added at the front.
+    pub fn refill_counts(&mut self, asset: u32, bids: &[(i64, i64)], asks: &[(i64, i64)],
+                         counts: Option<(&[i64], &[i64])>) -> R<Counts> {
         let (mut refilled, mut refilled_orders) = (0, 0);
-        for (side, levels) in [(Side::Buy, bids), (Side::Sell, asks)] {
-            for &(px, sz) in levels {
-                let have = self.book(asset)?.level(side, px).map(|l| l.total).unwrap_or(0);
+        let (bn, an): (&[i64], &[i64]) = counts.unwrap_or((&[], &[]));
+        for (side, levels, ns) in [(Side::Buy, bids, bn), (Side::Sell, asks, an)] {
+            for (i, &(px, sz)) in levels.iter().enumerate() {
+                let (have, held) = self.book(asset)?.level(side, px)
+                    .map(|l| (l.total, l.nodes.len() as i64)).unwrap_or((0, 0));
                 let gap = sz - have;
                 if gap > 0 {
-                    let o = self.new_order(Arc::from(PLACEHOLDER), asset, side, px, gap, TIF_GTC, None);
-                    self.book_mut(asset)?.add(Arc::new(o), gap, Some(0))?;
+                    let k = if counts.is_some() && i < ns.len() { (ns[i] - held).min(gap).max(1) } else { 1 };
+                    let (q, r) = (gap / k, gap % k);
+                    // parts larger first (front to back); added at the front, so the last part goes in first
+                    for j in (0..k).rev() {
+                        let piece = if j < r { q + 1 } else { q };
+                        let o = self.new_order(Arc::from(PLACEHOLDER), asset, side, px, piece, TIF_GTC, None);
+                        self.book_mut(asset)?.add(Arc::new(o), piece, Some(0))?;
+                        refilled_orders += 1;
+                    }
                     refilled += gap;
-                    refilled_orders += 1;
                 }
             }
         }

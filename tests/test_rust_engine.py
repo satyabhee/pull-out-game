@@ -198,3 +198,24 @@ def test_resolver_naming_another_users_order_raises_the_same():
     a = Cancel(**meta("u1", 1), asset=0, oid=1)
     assert outcome(lambda: py.apply(a)) == outcome(lambda: rs.apply(a)) == \
         ("error", "BookError", "resolver mapped u1's oid 1 to u0's order")
+
+
+@settings(max_examples=150, deadline=None)
+@given(st.data())
+def test_refill_with_counts_matches_python(d):
+    """A4(a) --placeholder-split port: RustEngine.refill(counts=...) == Engine.refill(counts=...)."""
+    py, rs = Engine(), RustEngine()
+    for _ in range(d.draw(st.integers(0, 6))):
+        side = d.draw(st.sampled_from([Side.BUY, Side.SELL]))
+        px = d.draw(st.integers(94, 99) if side is Side.BUY else st.integers(101, 106))
+        a = Place(**meta(d.draw(st.sampled_from(USERS)), 1), asset=0, side=side, px=px,
+                  sz=d.draw(st.integers(1, 5)), tif=Tif.ALO, cloid=None, reduce_only=False)
+        for e in (py, rs):
+            e.apply(a)
+    bids, asks = snapshot_levels(d, Side.BUY), snapshot_levels(d, Side.SELL)
+    counts = (tuple(d.draw(st.integers(0, 6)) for _ in bids), tuple(d.draw(st.integers(0, 6)) for _ in asks))
+    if d.draw(st.booleans()):
+        counts = (counts[0][:1], ())                 # fewer counts than levels: the rest get one piece
+    assert outcome(lambda: py.refill(0, bids, asks, counts=counts)) == \
+        outcome(lambda: rs.refill(0, bids, asks, counts=counts))
+    assert state(py) == state(rs)

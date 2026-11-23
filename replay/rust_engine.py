@@ -162,8 +162,9 @@ class RustEngine:
     def evict(self, oid: int) -> Order:
         return _to_order(self._core.evict(oid))
 
-    def refill(self, asset: int, bids, asks) -> dict[str, int]:
-        return dict(self._core.refill(asset, [tuple(x) for x in bids], [tuple(x) for x in asks]))
+    def refill(self, asset: int, bids, asks, counts=None) -> dict[str, int]:
+        cn = None if counts is None else (list(counts[0]), list(counts[1]))
+        return dict(self._core.refill(asset, [tuple(x) for x in bids], [tuple(x) for x in asks], cn))
 
     def clear(self, asset: int) -> dict[str, int]:
         return dict(self._core.clear(asset))
