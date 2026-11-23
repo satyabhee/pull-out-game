@@ -98,3 +98,34 @@ ONE tx (60% of the notional). Without it: A4 (48.8%) > A5 (2.8%) > A3 (0%). The 
 notional without the outlier, **queue order at the right price (44% of misses), is not targeted by any A item** in the
 plan (QUESTIONS Q11). L5 gate quantity (placeholder + queue): 35.4% of missed notional (>= 30%), but the plan
 evaluates the gate only after A2-A4 have landed.
+
+## Rules written before each item (Nov 23, second session)
+
+### A8 · Queue order among known orders: sub-causes (written before the A8 run)
+Population: A0's 26 "queue order at the right price" misses (dev20; `report/validate/a0_retriage_dev20/misses.csv`).
+For each, at its first divergence (real fill: maker M at price p; ours: maker E at price p'), the orders in our book
+just before the tx are read with their origin (placed in the window by a Place or a Modify: block, listing position,
+time, priority p; or not placed in the window: placeholder, named-from-trades, kept pre-window). One sub-cause each,
+first match wins:
+1. **partial fill / size**: E = M (same maker; our size differs from the chain's).
+2. **price**: p' != p (we filled a different price level first).
+3. **named order placement**: E's order was created from trades (named post-snapshot liquidity, put at the FRONT of
+   its level) or is a pre-window order we keep, and sits ahead of M.
+4. **modify semantics**: M's order or E's order was created by a modify / batchModify (our engine: modify = cancel +
+   new order at the back).
+5. **priority window**: E and M are both ALOs placed within 400 ms of each other and our docs priority rule changed
+   their order (E has the higher p and was placed after M).
+6. **placement order within a block**: E and M were placed in the same block (listing order decides).
+7. **older order the chain did not fill**: E was placed before M in an earlier block, yet the chain filled M first:
+   on chain E was not resting there (cancelled / rejected / moved): a phantom we cannot see.
+8. **other**.
+A hypothesis is "supported by the chain's fills" when the real fills of the miss (and of other txs at that level)
+order the makers the way the hypothesis predicts; each supported sub-cause gets a fix behind a switch, scored with
+the adoption rule above.
+
+### A4 (a)-(c) · Placeholder owners (written before the A4 run)
+Switch `--placeholder-split` (default off). (a) split each placeholder level into its snapshot count n of orders
+(sizes from the feed's count changes where available, else equal parts), keeping one queue; (b) name owners from
+later trades and cancels (a real maker filled at that level in a later tx takes the placeholder order of the matching
+size); (c) ties broken by the account's habitual order size (median size of its window orders at that asset).
+Adoption: the rule above (dev20 rule AND dev-fast contested CI upper bound >= 0).
