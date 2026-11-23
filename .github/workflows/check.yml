@@ -1,7 +1,8 @@
-# MAHITO_PLAN §0b in CI: the same `make check` the pre-commit hook runs.
-# Rust vs Python parity runs here through the differential tests (tests/test_rust_engine.py, test_rust_book.py,
-# test_replay_core.py). Tests that need the dev20 data (~/hl-data/mac3) skip themselves on CI; full dev20 parity
-# is `make checkpoint`, run locally where the data lives.
+# MAHITO_PLAN §0b in CI: the same `make check` the pre-commit hook runs, with NO real data.
+# Rust vs Python parity runs here on seeded simulated chunks (tests/test_sim_parity.py: full replays, all 8 switch
+# combinations; the simulator writes the real formats) and through the differential tests (test_rust_engine.py,
+# test_rust_book.py, test_replay_core.py). Tests that need the dev20 data (~/hl-data/mac3) skip themselves
+# (checked: 541 passed, 19 skipped with no data); full dev20 parity is `make checkpoint`, run where the data lives.
 name: check
 on:
   push:
