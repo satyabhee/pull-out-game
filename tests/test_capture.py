@@ -532,3 +532,98 @@ def test_load_suspects(tmp_path):
     p.write_text(json.dumps({"time": 1, "users": ["0xAB", "0xcd"]}))
     assert cap.load_suspects(str(p)) == ["0xab", "0xcd"]
     assert cap.load_suspects(str(tmp_path / "none.json")) == []
+
+
+# ---- 2026-11-23 open-margin capture: resting-order margin + suspect orderStatus lookups
+
+def cs_answer(av, mu, ntl, wd):
+    return {"marginSummary": {"accountValue": av, "totalMarginUsed": mu, "totalNtlPos": ntl}, "withdrawable": wd}
+
+
+def test_order_margin_matches_the_live_probe():
+    from decimal import Decimal as D
+    # 0x3ff5 on 2026-11-23: 8 resting BTC sells 900008.63 at 13x -> 69231.43; base is 10% of notional
+    free, om = cap.order_margin(cs_answer("14966555.8377960008", "5272632.3617690001", "68544220.7029999942",
+                                          "8042902.3345210003"))
+    assert round(om, 2) == D("69231.43")
+    assert free == D("14966555.8377960008") - D("5272632.3617690001") - om
+    _, om0 = cap.order_margin(cs_answer("150133.574824", "960.606014", "38424.24058", "146291.150766"))
+    assert round(om0, 2) == 0                                        # no orders: gap is the 10% notional rule
+    assert cap.order_margin({"error": "x"}) is None and cap.order_margin(None) is None
+
+
+def test_open_margin_users_keeps_users_with_order_margin_least_free_first():
+    recs = [{"user": "0xa", "answer": cs_answer("1000", "100", "1000", "800")},     # om 100, free 800
+            {"user": "0xb", "answer": cs_answer("1000", "100", "1000", "500")},     # om 400, free 500
+            {"user": "0xc", "answer": cs_answer("1000", "100", "1000", "900")},     # om 0: skipped
+            {"user": "0xd", "answer": {"error": "429"}}]
+    out = cap.open_margin_users(recs, 5)
+    assert [u for u, _, _ in out] == ["0xb", "0xa"] and out[0][2] == "400"
+    assert cap.open_margin_users(recs, 1) == [out[0]]
+
+
+def test_ask_open_margin_later_stores_both_answers_and_drain_waits():
+    calls = {"clearinghouseState": lambda u: {"cs": u}, "frontendOpenOrders": lambda u: [{"oid": 1, "u": u}]}
+    budget = FakeBudget()
+    w = cap.Writer(lookup=lambda u, o: {}, info_gap_s=0, budget=budget, calls=calls)
+    slept = []
+    cap.ask_open_margin_later(w, [("0xa", "5", "1"), ("0xb", "6", "2")], 777, at_s=100.0,
+                              now=lambda: 90.0, sleep=slept.append)
+    w.drain()
+    recs = sorted(w.take_info()["margin_open"], key=lambda r: r["user"])
+    assert slept == [10.0] and budget.took == [22, 22]
+    assert recs[0]["answer"] == {"clearinghouseState": {"cs": "0xa"}, "frontendOpenOrders": [{"oid": 1, "u": "0xa"}]}
+    assert recs[1]["snapshot_time"] == 777 and recs[1]["plan_free"] == "6" and recs[1]["plan_order_margin"] == "2"
+    assert w.snapshot() == []                                        # never an anchor
+
+
+def test_status_lookups_are_info_records_not_anchors(tmp_path):
+    w = cap.Writer(lookup=lambda u, o: {"status": "order", "o": o}, info_gap_s=0, budget=FakeBudget())
+    w.ask_status("0xu", "0xc1", {"placed_height": 5})
+    w.drain()
+    got = w.take_info()["suspect_status"]
+    assert got[0]["oid"] == "0xc1" and got[0]["placed_height"] == 5 and got[0]["answer"]["o"] == "0xc1"
+    assert w.snapshot() == []
+    meta = {}
+    cap.save_info(str(tmp_path), {"suspect_status": got}, meta)
+    assert os.path.exists(tmp_path / "suspect_status.json") and meta["info_suspect_status"] == 1
+
+
+def test_suspect_candidates_and_round_robin_pick():
+    b = block_of(9, [px_tx("0xS1", 9, [item("0x1"), item("0x2", tif="Gtc"), item("0x3")]),
+                     px_tx("0xother", 9, [item("0x4")]),
+                     px_tx("0xS2", 9, [item("0x5")])])
+    cands = cap.suspect_candidates(b, 9, {"0xs1", "0xs2"})
+    assert [c[4] for c in cands] == ["0x1", "0x3", "0x5"] and cands[0][:3] == (9, 0, 0)
+    rank = {"0xs2": 0, "0xs1": 1}
+    assert [c[4] for c in cap.pick_suspect_lookups(cands, rank, 2)] == ["0x5", "0x3"]
+    assert [c[4] for c in cap.pick_suspect_lookups(cands, rank, 9)] == ["0x5", "0x3", "0x1"]
+    assert [c[4] for c in cap.pick_suspect_lookups(cands, rank, 9, skip={("0xS1", "0x3")})] == ["0x5", "0x1"]
+    import collections
+    seen = collections.Counter({("0xs2", "0x5"): 2})
+    assert [c[4] for c in cap.pick_suspect_lookups(cands, rank, 9, seen=seen)] == ["0x3", "0x1"]
+
+
+def test_chunk_capture_asks_suspect_lookups_in_scored_blocks_only_and_keeps_anchors_unchanged(tmp_home, monkeypatch):
+    sus = tmp_home / "suspects.json"
+    sus.write_text(json.dumps({"users": ["0xu1", "0xu3"]}))
+    monkeypatch.setattr(cap, "SUSPECTS_FILE", str(sus))
+    asked = []
+    w = cap.Writer(lookup=lambda u, k: asked.append((u, k)) or {"status": "order"}, info_gap_s=0)
+    base_meta = {"kind": "chunk"}
+    cap.capture(PlacementFetcher(), 1000, 1179, base_meta, writer=w, state={}, warmup=150, max_anchors=20)
+    d = tmp_home / "windows" / "1000-1179"
+    base_anchors = (d / "anchors.json").read_text()
+    for f in d.iterdir():
+        f.unlink()
+    monkeypatch.setattr(cap, "SUSPECT_LOOKUPS", 4)
+    asked.clear()
+    meta = {"kind": "chunk"}
+    assert cap.capture(PlacementFetcher(), 1000, 1179, meta, writer=w, state={}, warmup=150, max_anchors=20) == "complete"
+    strip = lambda t: [{k: v for k, v in a.items() if k != "asked_at"} for a in json.loads(t)]
+    assert strip((d / "anchors.json").read_text()) == strip(base_anchors)   # the replay's input is unchanged
+    st = json.loads((d / "suspect_status.json").read_text())
+    assert meta["suspect_lookups"] == 4 == len(st) and meta["suspect_candidates"] == 12   # 30 scored blocks, h%5 in {1,3}
+    assert [r["user"] for r in st] == ["0xu1", "0xu3", "0xu1", "0xu3"]
+    assert all(r["placed_height"] >= 1150 for r in st)
+    assert not {(r["user"], r["oid"]) for r in st} & {(a["user"], a["oid"]) for a in json.loads(base_anchors)}

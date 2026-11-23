@@ -321,6 +321,39 @@ def load_margin(window_dir, spot: bool = False) -> dict:
     return out
 
 
+def load_margin_ext(window_dir) -> dict:
+    """margin_lev / margin_levom: user -> ({coin: the user's leverage, from assetPositions}, resting-order margin)
+    from the same clearinghouseState.json, as Decimals. Order margin = accountValue - withdrawable -
+    max(totalMarginUsed, totalNtlPos / 10), floored at 0 (Hyperliquid's withdrawable keeps the transfer margin
+    max(initial margin, 10% of notional) plus the margin of resting orders; checked live 2026-11-23 for 6 of 7 users,
+    handoff/prereg_margin_lev_2026-11-23.md). A coin without a position has no leverage here (rules fall back to the
+    max leverage). Missing file: {}."""
+    path = Path(window_dir) / "clearinghouseState.json"
+    if not path.exists():
+        return {}
+    out = {}
+    for r in json.load(open(path)):
+        ans = r.get("answer")
+        if not isinstance(ans, dict) or "marginSummary" not in ans:
+            continue
+        lev = {}
+        for p in ans.get("assetPositions", []):
+            v = ((p.get("position") or {}).get("leverage") or {}).get("value")
+            if v:
+                lev[p["position"]["coin"]] = Decimal(str(v))
+        om = Decimal(0)
+        ms = ans["marginSummary"]
+        if "withdrawable" in ans and "totalNtlPos" in ms:
+            om = max(Decimal(0), Decimal(ms["accountValue"]) - Decimal(ans["withdrawable"])
+                     - max(Decimal(ms["totalMarginUsed"]), Decimal(ms["totalNtlPos"]) / 10))
+        out[r["user"].lower()] = (lev, om)
+    return out
+
+
+MARGIN_RULES = {"margin": (False, False), "margin_spot": (False, False), "margin_lev": (True, False),
+                "margin_levom": (True, True)}        # rule -> (user leverage, minus resting-order margin)
+
+
 class Replay:
     def __init__(self, window_dir, hl_data, policy: Policy, *, anchors=None, use_resolver: bool = True,
                  nearest_ratio: int = 0, check_permutation: bool = True, hasher: Hasher | None = None,
@@ -504,7 +537,7 @@ class Replay:
         self.refill_position = refill_position
         self.learn_stats: Counter = Counter()
         self.taker_reject = frozenset(x for x in (taker_reject or "").split(",") if x)
-        bad = self.taker_reject - {"min10", "learn", "margin", "margin_spot", "hist"}
+        bad = self.taker_reject - {"min10", "learn", "hist"} - set(MARGIN_RULES)
         if bad:
             raise ValueError(f"unknown taker_reject rules {sorted(bad)}")
         self.taker_stats: Counter = Counter()
@@ -529,10 +562,14 @@ class Replay:
                         (key not in self._truth or o["status_ts"] >= self._truth[key][0]):
                     self._truth[key] = (o["status_ts"], o["status"])
         self.alo_reject = frozenset(x for x in (alo_reject or "").split(",") if x)
-        if self.alo_reject - {"margin"}:
-            raise ValueError(f"unknown alo_reject rules {sorted(self.alo_reject - {'margin'})}")
+        if self.alo_reject - {"margin", "margin_lev", "margin_levom"} or len(self.alo_reject) > 1:
+            raise ValueError(f"alo_reject takes one of margin, margin_lev, margin_levom, not {sorted(self.alo_reject)}")
+        if len(self.taker_reject & set(MARGIN_RULES)) > 1:
+            raise ValueError(f"taker_reject takes at most one margin rule, not {sorted(self.taker_reject & set(MARGIN_RULES))}")
         self._margin = load_margin(self.window_dir, spot="margin_spot" in self.taker_reject) \
-            if self.taker_reject & {"margin", "margin_spot"} or self.alo_reject else {}
+            if self.taker_reject & set(MARGIN_RULES) or self.alo_reject else {}
+        self._margin_x = load_margin_ext(self.window_dir) \
+            if (self.taker_reject | self.alo_reject) & {"margin_lev", "margin_levom"} else {}
         self._hist_rej = load_hist_rejects(self.window_dir) if "hist" in self.taker_reject else {}
         self._real_trades: dict[str, list] = {}
         if self._rules or "learn" in self.taker_reject:
@@ -969,14 +1006,16 @@ class Replay:
                 return "skip_min10"
         if "learn" in self.taker_reject and p.user in self._taker_blocked:
             return "skip_learn"
-        if self.taker_reject & {"margin", "margin_spot"} and self._margin_short(p, "margin"):
+        rule = next(iter(self.taker_reject & set(MARGIN_RULES)), None)
+        if rule and self._margin_short(p, "margin", *MARGIN_RULES[rule]):
             return "skip_margin"
         return None
 
-    def _margin_short(self, p: Place, tag: str) -> bool:
+    def _margin_short(self, p: Place, tag: str, own_lev: bool = False, minus_orders: bool = False) -> bool:
         """True when placement p grows the user's position and their plan-time free margin (load_margin) is under
         the grown notional / max leverage. Reduce-only orders and users without a snapshot pass (counted in
-        taker_stats as <tag>_unknown; checked ones as <tag>_checked)."""
+        taker_stats as <tag>_unknown; checked ones as <tag>_checked). own_lev: divide by the user's leverage on the
+        coin (load_margin_ext) instead of the max leverage when known; minus_orders: free minus resting-order margin."""
         if not self._margin or p.reduce_only:
             return False
         st = self._margin.get(p.user.lower())
@@ -989,7 +1028,16 @@ class Replay:
         szi = pos.get(a.name, Decimal(0))
         signed = Decimal(a.lots_to_sz(p.sz)) * (1 if p.side is Side.BUY else -1)
         grow = abs(signed) if szi == 0 or (szi > 0) == (signed > 0) else max(Decimal(0), abs(signed) - abs(szi))
-        return grow > 0 and free * MAX_LEVERAGE[a.name] < grow * Decimal(a.ticks_to_px(p.px))
+        lev = Decimal(MAX_LEVERAGE[a.name])
+        if own_lev or minus_orders:
+            x = self._margin_x.get(p.user.lower())
+            if x is not None:
+                if own_lev and a.name in x[0]:
+                    lev = x[0][a.name]
+                    self.taker_stats[f"{tag}_own_lev"] += 1
+                if minus_orders:
+                    free -= x[1]
+        return grow > 0 and free * lev < grow * Decimal(a.ticks_to_px(p.px))
 
     def _taker_learn(self) -> None:
         """taker_reject learn, once per block from that block's real trades (policy-independent): a real fill
@@ -1323,7 +1371,7 @@ class Replay:
                 self._blk_ioc[action.hash] = (action.user, True)
                 return [], []
         if self.alo_reject and isinstance(action, Place) and action.tif is Tif.ALO \
-                and self._margin_short(action, "alo_margin"):
+                and self._margin_short(action, "alo_margin", *MARGIN_RULES[next(iter(self.alo_reject))]):
             self.taker_stats["skip_alo_margin"] += 1     # alo_reject margin: the chain rejects it; it never rests
             return [], []
         before = self.engine.next_oid

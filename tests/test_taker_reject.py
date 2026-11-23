@@ -101,3 +101,32 @@ def test_alo_margin_uses_same_rule_and_own_stats():
     assert not r._margin_short(alo("nobody", "60000", "1"), "alo_margin")
     assert r.taker_stats["alo_margin_unknown"] == 1 and r.taker_stats["alo_margin_checked"] == 3
     assert r._taker_skip(ioc("broke", "60000", "0.01")) is None      # alo_reject alone leaves IOCs alone
+
+
+def test_margin_lev_uses_the_users_leverage_and_levom_subtracts_order_margin():
+    coin = ASSETS[0].name                       # BTC, max leverage 40
+    r = bare({"margin_lev"}, margin={"u": (D(100), {coin: D("0.1")}), "nolev": (D(100), {})})
+    r._margin_x = {"u": ({coin: D(3)}, D(60)), "nolev": ({}, D(0))}
+    # 0.01 BTC at 60000 = 600 notional: needs 15 at 40x (old rule passes), 200 at the user's 3x
+    assert r._taker_skip(ioc("u", "60000", "0.01")) == "skip_margin"
+    assert r._taker_skip(ioc("u", "60000", "0.001")) is None                 # needs 20 of 100
+    assert r._taker_skip(ioc("nolev", "60000", "0.01")) is None              # no leverage known: 40x, needs 15
+    assert r.taker_stats["margin_own_lev"] == 2
+    r.taker_reject = frozenset({"margin_levom"})
+    assert r._taker_skip(ioc("u", "60000", "0.001")) is None                 # needs 20 of 100 - 60 = 40
+    assert r._taker_skip(ioc("u", "60000", "0.0025")) == "skip_margin"       # 150/3 = 50 > 100 - 60
+    r.taker_reject = frozenset({"margin_lev"})
+    assert r._taker_skip(ioc("u", "60000", "0.0025")) is None                # without order margin: 50 < 100
+
+
+def test_load_margin_ext(tmp_path):
+    import json
+    from engine_py.replay import load_margin_ext
+    st = {"marginSummary": {"accountValue": "14966555.8377960008", "totalMarginUsed": "5272632.3617690001",
+                            "totalNtlPos": "68544220.7029999942"}, "withdrawable": "8042902.3345210003",
+          "assetPositions": [{"position": {"coin": "BTC", "szi": "-1115.26555", "leverage": {"type": "cross", "value": 13}}}]}
+    json.dump([{"user": "0xAB", "answer": st}], open(tmp_path / "clearinghouseState.json", "w"))
+    lev, om = load_margin_ext(tmp_path)["0xab"]
+    assert lev == {"BTC": D(13)} and round(om, 2) == D("69231.43")
+    assert load_margin_ext(tmp_path / "missing") == {}
+

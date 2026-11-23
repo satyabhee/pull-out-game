@@ -45,6 +45,16 @@ Settings (environment variables):
                        the previous chunk's top post-only (ALO) makers at the touch (within TOUCH_BP of the last
                        trade), half the SUSPECTS_FILE users (makers the replay filled with no real trade,
                        analysis/suspect_makers.py); a short half is filled from the other (replay --alo-reject margin)
+  OPEN_MARGIN_USERS=0  chunks: frontendOpenOrders + a fresh clearinghouseState (weight 22 per user) of this many
+                       margin-snapshot users, OPEN_MARGIN_DELAY_S after the plan-time snapshot (out of its burst
+                       minute): users with resting-order margin (accountValue - withdrawable - max(totalMarginUsed,
+                       totalNtlPos / 10) > 0), least free margin for orders first. margin_open.json (not read by the
+                       replay); meta open_margin_users
+  OPEN_MARGIN_DELAY_S=62
+  SUSPECT_LOOKUPS=0    chunks: orderStatus (weight 2) by cloid of this many post-only placements by SUSPECTS_FILE
+                       users in the scored blocks, asked as soon as the blocks are fetched, one user at a time in
+                       suspect order (round robin): chain truth for phantom/queue cases. suspect_status.json (not
+                       anchors.json, so the replay never reads it); meta suspect_lookups / suspect_candidates
   TOUCH_BP=1           post-only placement counts as "at the touch" within this many bp of the coin's last trade
   SUSPECTS_FILE=suspects.json
   HIST_END_USERS=6     chunks: historicalOrders (~120 weight each, reserved up front so they queue under the
@@ -83,10 +93,14 @@ HIST_END_USERS = int(os.environ.get("HIST_END_USERS", 6))
 TRACKERS_FILE = os.environ.get("TRACKERS_FILE", "trackers.json")
 HIST_END_RANDOM = os.environ.get("HIST_END_RANDOM") == "1"
 HIST_IOC_USERS = int(os.environ.get("HIST_IOC_USERS", 0))   # chunks: historicalOrders at chunk end for the top IOC senders
-CAPTURE_VERSION = "2026-11-23-alo-margin"      # written into every chunk's window.json (capture_version)
+CAPTURE_VERSION = "2026-11-23-open-margin"     # written into every chunk's window.json (capture_version)
+CAPTURE_SUPERSET_OF = "2026-11-23-alo-margin"  # same files as that version plus new ones the replay does not read
 ALO_MARGIN_USERS = int(os.environ.get("ALO_MARGIN_USERS", 0))
 TOUCH_BP = float(os.environ.get("TOUCH_BP", 1))
 SUSPECTS_FILE = os.environ.get("SUSPECTS_FILE", "suspects.json")
+OPEN_MARGIN_USERS = int(os.environ.get("OPEN_MARGIN_USERS", 0))
+OPEN_MARGIN_DELAY_S = float(os.environ.get("OPEN_MARGIN_DELAY_S", 62))
+SUSPECT_LOOKUPS = int(os.environ.get("SUSPECT_LOOKUPS", 0))
 MARGIN_USERS = int(os.environ.get("MARGIN_USERS", 0))   # chunks: clearinghouseState + spot of this many IOC users at plan time
 TARGET_LOOKUPS = int(os.environ.get("TARGET_LOOKUPS", 0))    # orderStatus of int-oid cancel targets in the SCORED blocks   # experiment: per-chunk coin flip (seeded by the snapshot)
 INFO_FILES = {"userFillsByTime": "fills.json", "frontendOpenOrders": "open_orders.json",
@@ -165,6 +179,7 @@ class Writer:
         self.calls = calls or info.CALLS
         self.budget = budget or info.Budget()
         self._last_info = 0.0
+        self.pending = []                              # background info threads drain() must wait for
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
@@ -185,6 +200,18 @@ class Writer:
                     with self.lock:
                         self.info[kind].append({**extra, "user": user, "kind": kind, "args": list(args),
                                                 "asked_at": t, "answered_at": time.time(), "answer": r})
+                elif job[0] == "status":                 # orderStatus kept as an info record, not an anchor
+                    _, user, oid, extra = job
+                    self.budget.take(info.weight_of("orderStatus"))
+                    t = time.time()
+                    try:
+                        r = self.lookup(user, oid)
+                    except Exception as e:
+                        r = {"error": repr(e)}
+                    with self.lock:
+                        self.info["suspect_status"].append({**extra, "user": user, "oid": oid,
+                                                            "kind": "suspect_status", "asked_at": t,
+                                                            "answered_at": time.time(), "answer": r})
                 else:
                     _, user, oid, ch, extra, paced = job
                     wait = self._last_info + self.info_gap_s - time.time()
@@ -212,6 +239,10 @@ class Writer:
         """extra: more fields stored on the anchor record (never a "height" key: data/oids.py reads that
         as its own anchor format). paced=False: only the weight budget paces it (no info_gap_s)."""
         self.q.put(("anchor", user, oid, cancel_height, extra or {}, paced))
+
+    def ask_status(self, user, oid, extra=None):
+        """orderStatus by (user, oid or cloid), budget-paced only; stored in info["suspect_status"]."""
+        self.q.put(("status", user, oid, extra or {}))
 
     def ask_info(self, kind, user, args=(), extra=None):
         """One info lookup (collect/info.py CALLS[kind](user, *args)); the answer is kept raw in info[kind]."""
@@ -255,6 +286,10 @@ class Writer:
         return out
 
     def drain(self):
+        with self.lock:
+            pending, self.pending = self.pending, []
+        for th in pending:
+            th.join()
         self.q.join()
         with self.lock:
             errs, self.errors = self.errors, []
@@ -501,6 +536,104 @@ def margin_users(prev_iocs, trades, n):
     return out[:n]
 
 
+def order_margin(answer):
+    """(free margin for new orders, resting-order margin) from one clearinghouseState answer, as Decimals, or None.
+    Hyperliquid's withdrawable = accountValue - max(totalMarginUsed, totalNtlPos / 10) - resting-order margin
+    (checked live on 2026-11-23: matches the open orders' position-increasing side / leverage for 6 of 7 users), so
+    order margin = accountValue - withdrawable - max(...) and free for orders = accountValue - totalMarginUsed -
+    order margin."""
+    from decimal import Decimal, InvalidOperation
+    try:
+        ms = answer["marginSummary"]
+        av, mu = Decimal(ms["accountValue"]), Decimal(ms["totalMarginUsed"])
+        ntl, wd = Decimal(ms["totalNtlPos"]), Decimal(answer["withdrawable"])
+    except (KeyError, TypeError, InvalidOperation):
+        return None
+    om = av - wd - max(mu, ntl / 10)
+    return av - mu - om, om
+
+
+def open_margin_users(records, n):
+    """Users for the open-orders snapshot: those with resting-order margin, least free margin for orders first.
+    records: this chunk's clearinghouseState info records. Returns [(user, free, order_margin)] as strings."""
+    rows = []
+    for r in records:
+        fm = order_margin(r.get("answer"))
+        if fm and fm[1] > 0:
+            rows.append((fm[0], r["user"], fm[1]))
+    rows.sort()
+    seen, out = set(), []
+    for free, u, om in rows:
+        if u not in seen:
+            seen.add(u); out.append((u, str(free), str(om)))
+    return out[:n]
+
+
+def ask_open_margin_later(writer, users, snap_ms, at_s, now=time.time, sleep=time.sleep):
+    """At time at_s, clearinghouseState then frontendOpenOrders for every user (one thread each, weight 22 booked
+    first), stored as info["margin_open"]. Runs in the background; writer.drain() waits for it."""
+    def one(u, extra):
+        writer.budget.take(info.weight_of("clearinghouseState") + info.weight_of("frontendOpenOrders"))
+        t = now()
+        try:
+            r = {"clearinghouseState": writer.calls["clearinghouseState"](u),
+                 "frontendOpenOrders": writer.calls["frontendOpenOrders"](u)}
+        except Exception as e:
+            r = {"error": repr(e)}
+        with writer.lock:
+            writer.info["margin_open"].append({**extra, "user": u, "kind": "margin_open", "args": [],
+                                               "asked_at": t, "answered_at": now(), "answer": r})
+
+    def run():
+        wait = at_s - now()
+        if wait > 0:
+            sleep(wait)
+        ths = [threading.Thread(target=one, args=(u, {"snapshot_time": snap_ms, "plan_free": f,
+                                                       "plan_order_margin": om}), daemon=True)
+               for u, f, om in users]
+        for th in ths:
+            th.start()
+        for th in ths:
+            th.join()
+
+    th = threading.Thread(target=run, daemon=True)
+    with writer.lock:
+        writer.pending.append(th)
+    th.start()
+    return th
+
+
+def suspect_candidates(block, height, suspects):
+    """[(height, tx, item, user, cloid)] of the post-only placements with a cloid by `suspects` users in one block."""
+    out = []
+    for t, tx in enumerate(block.get("txs", [])):
+        u = tx.get("user", "").lower()
+        if u not in suspects:
+            continue
+        for i, o in placement_items(tx):
+            if ((o.get("t") or {}).get("limit") or {}).get("tif") == "Alo":
+                out.append((height, t, i, tx["user"], o["c"]))
+    return out
+
+
+def pick_suspect_lookups(cands, rank, n, skip=(), seen=None):
+    """Up to n candidates, one user at a time in suspect rank order (round robin), each user's middle remaining
+    candidate first; skips (user, cloid) pairs in `skip` and cloids seen more than once (seen: Counter)."""
+    by = collections.defaultdict(list)
+    for c in cands:
+        key = (c[3], c[4])
+        if key in skip or (seen is not None and seen[(c[3].lower(), c[4])] > 1):
+            continue
+        by[c[3].lower()].append(c)
+    order = sorted(by, key=lambda u: (rank.get(u, len(rank)), u))
+    out = []
+    while len(out) < n and any(by[u] for u in order):
+        for u in order:
+            if by[u] and len(out) < n:
+                out.append(by[u].pop(len(by[u]) // 2))
+    return out
+
+
 def ask_margin(writer, snap_ms, users, alo_users=()):
     """clearinghouseState and spotClearinghouseState of `users`, asked at once when the chunk is planned (the
     scored blocks are a few seconds after the snapshot), plus clearinghouseState only of `alo_users` (spot added
@@ -576,6 +709,8 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
     meta.setdefault("failed_heights", [])
     fetched_now, t0, status = 0, time.time(), None
     cancels = collections.Counter()
+    suspects = load_suspects() if SUSPECT_LOOKUPS else []
+    suspect_set, scands = set(suspects), []
     alos = []
     iocs = collections.Counter()
     for i, h in enumerate(range(start, end + 1)):
@@ -628,6 +763,8 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
             if ALO_MARGIN_USERS:
                 alos += alo_placements(b)
             if h >= start + warmup:
+                if suspect_set:
+                    scands += suspect_candidates(b, h, suspect_set)
                 for u, oid in int_oid_targets(b):
                     scored_targets.setdefault((u, oid), h)
         # one orderStatus lookup at the end of every `every`-block segment; the writer paces them >= 2 s apart
@@ -648,6 +785,13 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
                                                                             max(a[4] for a in alos)))
         except Exception as e:                       # never lose a chunk over the next chunk's user choice
             meta["alo_touch_error"] = repr(e)
+    if SUSPECT_LOOKUPS and status is None:
+        picks = pick_suspect_lookups(scands, {u: i for i, u in enumerate(suspects)}, SUSPECT_LOOKUPS,
+                                     skip=picker.asked, seen=picker.seen)
+        meta["suspect_candidates"] = len(scands)
+        meta["suspect_lookups"] = len(picks)
+        for h, t, i, u, c in picks:
+            writer.ask_status(u, c, {"placed_height": h, "tx": t, "item": i})
     if extras and status is None:
         ask_extras(writer, extras, meta, cancels)
     if TARGET_LOOKUPS and status is None and scored_targets:
@@ -932,7 +1076,9 @@ def run_chunks(fetcher, state, writer, cancellers=None):
             time.sleep(0.5); continue
         last_snap, last_start = snap, time.time()
         start, end, warmup = with_lead_in(span, LEAD_IN_BLOCKS)
-        meta = {"kind": "chunk", "snapshot_time": snap, "lead_in_blocks": warmup, "capture_version": CAPTURE_VERSION}
+        meta = {"kind": "chunk", "snapshot_time": snap, "lead_in_blocks": warmup, "capture_version": CAPTURE_VERSION,
+                "capture_superset_of": CAPTURE_SUPERSET_OF}
+        t_plan = time.time()
         if OPEN_LEAD_MS and CHUNK_OPEN_USERS:
             if answered:
                 meta["open_orders_lead_ms"] = snap - answered
@@ -960,6 +1106,16 @@ def run_chunks(fetcher, state, writer, cancellers=None):
             iu = [u for u, _ in sorted(prev_iocs.items(), key=lambda x: (-x[1], x[0]))][:HIST_IOC_USERS]
             if iu and ask_hist_at_end(writer, end, iu):
                 meta["hist_ioc_users"] = iu
+        if OPEN_MARGIN_USERS and meta.get("margin_users"):
+            try:                                     # never lose a chunk over the extra snapshot
+                with writer.lock:
+                    recs = [r for r in writer.info.get("clearinghouseState", []) if r.get("snapshot_time") == snap]
+                om = open_margin_users(recs, OPEN_MARGIN_USERS)
+                meta["open_margin_users"] = [u for u, _, _ in om]
+                if om:
+                    ask_open_margin_later(writer, om, snap, t_plan + OPEN_MARGIN_DELAY_S)
+            except Exception as e:
+                meta["open_margin_error"] = repr(e)
         status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=warmup, max_anchors=CHUNK_ANCHORS,
                          extras=chunk_extras())
         cancellers.add(meta.get("int_cancel_users"))
