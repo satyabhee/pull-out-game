@@ -22,6 +22,8 @@ Analyses that need more than the yielded tuple subclass `Observer`; every hook i
 
 from __future__ import annotations
 
+from dataclasses import replace as dc_replace
+
 import bisect
 from decimal import Decimal
 import json
@@ -374,7 +376,7 @@ class Replay:
                  facts_exclude: tuple = (), use_bbo: bool = True, anchor_drop_kinds: tuple = (),
                  oid_bracket: bool = False, taker_reject: str | None = None, alo_reject: str | None = None,
                  deep_ledger: str | None = None,
-                 taker_seed=None):
+                 taker_seed=None, alo_distrust: str | None = None):
         """oid_bracket: reference points from the tracked users' orders on every coin + the monotone c(k) bracket
         rule in the resolver (data/oids.py).
         anchors: path to an anchors file; None = the window's anchors.json if present.
@@ -562,6 +564,15 @@ class Replay:
                         (key not in self._truth or o["status_ts"] >= self._truth[key][0]):
                     self._truth[key] = (o["status_ts"], o["status"])
         self.alo_reject = frozenset(x for x in (alo_reject or "").split(",") if x)
+        # alo_distrust "back:FILE" | "reject:FILE" (I23, handoff/prereg_alo_distrust_2026-11-23.md): post-only orders of
+        # the users in FILE ({"users": [...]}) get priority 0 (back) or are treated as rejected (reject, Places only)
+        self.alo_distrust_mode, self._distrust = None, frozenset()
+        if alo_distrust:
+            mode, _, path = alo_distrust.partition(":")
+            if mode not in ("back", "reject") or not path:
+                raise ValueError(f"alo_distrust must be back:FILE or reject:FILE, not {alo_distrust!r}")
+            self.alo_distrust_mode = mode
+            self._distrust = frozenset(u.lower() for u in json.load(open(path))["users"])
         if self.alo_reject - {"margin", "margin_lev", "margin_levom"} or len(self.alo_reject) > 1:
             raise ValueError(f"alo_reject takes one of margin, margin_lev, margin_levom, not {sorted(self.alo_reject)}")
         if len(self.taker_reject & set(MARGIN_RULES)) > 1:
@@ -1370,6 +1381,16 @@ class Replay:
                 self.taker_stats[skip] += 1
                 self._blk_ioc[action.hash] = (action.user, True)
                 return [], []
+        if self._distrust and action.user.lower() in self._distrust:
+            p = action.new if isinstance(action, Modify) else action
+            if isinstance(p, Place) and p.tif is Tif.ALO:
+                if self.alo_distrust_mode == "reject" and isinstance(action, Place):
+                    self.taker_stats["skip_alo_distrust"] += 1
+                    return [], []
+                if self.alo_distrust_mode == "back" and p.priority:
+                    self.taker_stats["alo_distrust_back"] += 1
+                    action = dc_replace(action, new=dc_replace(p, priority=0)) if isinstance(action, Modify) \
+                        else dc_replace(action, priority=0)
         if self.alo_reject and isinstance(action, Place) and action.tif is Tif.ALO \
                 and self._margin_short(action, "alo_margin", *MARGIN_RULES[next(iter(self.alo_reject))]):
             self.taker_stats["skip_alo_margin"] += 1     # alo_reject margin: the chain rejects it; it never rests

@@ -493,7 +493,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         trade_learn=None, trade_learn_at="tx", oid_guard=None, refill_position="front", oid_facts=False,
         name_prewindow=False, named_anon="front", deep_book=False,
         learn_keep_known=False, facts_exclude=(), use_bbo=True, anchor_drop_kinds=(), oid_bracket=False, p_priority=None,
-        evict_arrival=False, taker_reject=None, taker_seed=None, alo_reject=None, deep_ledger=None):
+        evict_arrival=False, taker_reject=None, taker_seed=None, alo_reject=None, deep_ledger=None, alo_distrust=None):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     # A replay holds millions of long-lived objects (oid facts, books, placed actions); CPython's full collections
     # re-scan all of them and were ~65% of a chunk's runtime. Young generations still collect cycles; outputs are
@@ -510,7 +510,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap,
                 reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, trade_learn_at=trade_learn_at, oid_guard=oid_guard, refill_position=refill_position, oid_facts=oid_facts,
                 name_prewindow=name_prewindow and oid_facts, named_anon=named_anon, deep_book=deep_book, learn_keep_known=learn_keep_known, facts_exclude=facts_exclude,
-                use_bbo=use_bbo, anchor_drop_kinds=anchor_drop_kinds, oid_bracket=oid_bracket, taker_reject=taker_reject, alo_reject=alo_reject, deep_ledger=deep_ledger, taker_seed=_seed_for(taker_seed, window), engine=engine if engine is not None else Engine(stp=stp, p_priority=p_priority, evict_arrival=evict_arrival))
+                use_bbo=use_bbo, anchor_drop_kinds=anchor_drop_kinds, oid_bracket=oid_bracket, taker_reject=taker_reject, alo_reject=alo_reject, deep_ledger=deep_ledger, alo_distrust=alo_distrust, taker_seed=_seed_for(taker_seed, window), engine=engine if engine is not None else Engine(stp=stp, p_priority=p_priority, evict_arrival=evict_arrival))
     heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
     real_by_hash: dict[str, list] = defaultdict(list)
     for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
@@ -888,6 +888,9 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     ap.add_argument("--alo-reject", metavar="RULES", default=None,
                     help="treat post-only (ALO) placements as rejected by the chain, so they never rest: "
                          "margin = grows the position past the plan-time free margin (clearinghouseState.json)")
+    ap.add_argument("--alo-distrust", metavar="MODE:FILE", default=None,
+                    help="I23: post-only orders of the users in FILE get priority 0 (back:FILE) or are treated as "
+                         "rejected (reject:FILE, Places only)")
     ap.add_argument("--taker-seed", metavar="JSON", default=None,
                     help="with --taker-reject learn: start each chunk with these users blocked "
                          "({chunk: [users]}, built from EARLIER chunks by analysis/taker_seed.py)")
@@ -951,7 +954,8 @@ def replay_kwargs(a) -> dict:
                 facts_exclude=tuple(x for x in a.facts_exclude.split(",") if x), use_bbo=not a.no_bbo,
                 anchor_drop_kinds=("target",) if a.no_target_lookups else (), oid_bracket=a.oid_bracket,
                 p_priority=a.p_priority, evict_arrival=a.evict_arrival, taker_reject=a.taker_reject,
-                taker_seed=a.taker_seed, alo_reject=a.alo_reject, deep_ledger=a.deep_ledger)
+                taker_seed=a.taker_seed, alo_reject=a.alo_reject, deep_ledger=a.deep_ledger,
+                alo_distrust=a.alo_distrust)
 
 
 def _seed_for(path, window):
@@ -998,7 +1002,8 @@ def options_tag(a) -> str:
                     f"-trej{a.taker_reject.replace(',', '+')}" if a.taker_reject else "",
                     "-tseed" if a.taker_seed else "",
                     f"-arej{a.alo_reject.replace(',', '+')}" if a.alo_reject else "",
-                    f"-dl{a.deep_ledger}" if a.deep_ledger else ""])
+                    f"-dl{a.deep_ledger}" if a.deep_ledger else "",
+                    f"-distrust{a.alo_distrust.split(':')[0]}" if a.alo_distrust else ""])
 
 
 def main(argv=None):
