@@ -3,7 +3,7 @@
 Qualifying chunk (same filter as Yuta's confirm_alo2 set, prereg_alo_margin Amendment 1/2): complete chunk,
 capture_version "2026-11-23-alo-margin" (or its superset "2026-11-23-open-margin"), non-empty alo_margin_users, info_clearinghouseState_errors == 0, no ingest
 gap (analysis.validate_chunks.find_chunks). Ordered by start height: 1-10 = dev_alo10, 11-70 = confirm_alo2 (Yuta),
-71 .. 70+N = THIS benchmark (N >= 120, default 120). Writes the list only when all of it exists; reads only
+71 .. 70+N = THIS benchmark (N >= 120, default 120), skipping chunks in REPLAYED. Writes the list only when all of it exists; reads only
 window.json files (no replay).
 
 usage: python -m scripts.benchmark_postchange [--windows ~/hl-data/mac3/windows] [--n 120]
@@ -23,6 +23,10 @@ VERSION = "2026-11-23-alo-margin"
 # before and v3 output is byte-identical with or without the new files (mail to_mahito #16), so it qualifies too
 VERSIONS = (VERSION, "2026-11-23-open-margin")
 FIRST = 71                      # 1-based rank of the first benchmark chunk among qualifying chunks
+# chunks already replayed by anyone; skipped inside the benchmark range (ranks 1-70, Yuta's lists, never shift)
+REPLAYED = {
+    "1232104843-1232105052",    # Yuta's open-margin identity check, 17:57Z Nov 23 (cmp only; mail to_mahito #19)
+}
 
 
 def qualifying(windows: Path) -> list[Path]:
@@ -45,6 +49,7 @@ def main(argv=None) -> int:
     if a.n < 120:
         raise SystemExit("--n must be >= 120 (protocol)")
     q = qualifying(Path(a.windows))
+    q = q[:FIRST - 1] + [c for c in q[FIRST - 1:] if c.name not in REPLAYED]
     need = FIRST - 1 + a.n
     print(f"qualifying post-change chunks: {len(q)}; need {need} (benchmark = ranks {FIRST}..{need})", file=sys.stderr)
     out = Path(a.out)
