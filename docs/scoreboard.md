@@ -308,3 +308,37 @@ By the protocol branch Yuta builds A6-feed; whether A8b starts anyway is NS-2 (h
 Q17). Stage 1 script: `~/book-replay-data/handoff/a8b/stage1.sh` (not run). The dev_margin60 queue cases stay unopened
 (Stage 2 test set).
 
+### L5-lite · Multiplicity-lite `--multi-lite` (Satya, Nov 23 ~10:40Z: scoped L5; full M2 stays parked). Rule written ~10:55Z, before any build or run
+**What.** Alternatives per price level only (no forking anywhere else), at most 4 per level, at most one open fork per
+level (a second trigger at a level with an open fork is skipped and counted). The engine book always holds the
+highest-weight alternative ("primary"; ties: the B1 choice, then the newest candidate); fills are recorded from the
+primary BEFORE any evidence (rule 1). `--multi-lite` implies `--placeholder-split` and trade-learn `name` (owner hook).
+Budget (M2 rules): alternatives giving the same queue (user, size sequence) are merged (weights added); weight < 1e-4
+is dropped; weights renormalised after every update.
+- **Phantom-or-real hook.** At every re-seed snapshot (the l2Book snapshots B1 already re-seeds from; they carry the
+  per-level order count n), after B1's reconcile + refill, for each level of the snapshot: c = orders we hold there
+  (placeholder pieces count one each; with the split they stand for the snapshot's uncovered orders). If c > n and
+  the level holds >= 2 known window orders: candidates = those known orders, newest first (by engine seq), top 3.
+  Alternatives: keep all (= B1) and "drop candidate i" for each candidate; uniform prior weights.
+- **Owner-of-piece hook.** Where trade-learn `name` would name the front placeholder piece at w: if the tx's real
+  trades at w have exactly ONE distinct maker, name it (A4(b1)); if 2+ distinct makers, fork the piece's owner over
+  the up-to-3 most recent of them (uniform; primary = the most recent maker, = A4(b1)'s choice).
+- **Evidence and collapse.** (E1) the next tx with real trades at that level (at block end, as B1's corrections): from
+  the level's queue just before that tx, each alternative's FIFO prefix covering the real size traded there scores
+  one point per real fill whose maker owns an order in that prefix (any placeholder in the prefix matches one fill);
+  alternatives below the best score are dropped; for an owner fork, a candidate appearing as a real maker at w while
+  the piece is in the prefix collapses to that owner. (E2) owner's cancel: a cancel / modify that removes candidate i
+  drops "drop i" (owners don't cancel phantoms); an unresolvable cancel of an owner-fork candidate collapses to that
+  owner and removes the piece (A4(b2) logic). (E3) feed counts: at each later snapshot, alternatives whose count is
+  not the closest to n are halved; after 3 consecutive snapshots with the same best set the fork collapses to its
+  highest-weight alternative. Collapse = the chosen alternative's queue is written into the level (orders removed /
+  re-added in engine seq order / relabelled); nothing scored is changed.
+- **Tests (before the screen).** Switch off -> byte-identical to B1 (unit tests + a B1 rerun on dev-fast compared with
+  `report/validate/margin_devfast`). Full-visibility sim (`~/hl-data/sim/m1_fv`) -> strict 1.0 with the switch on.
+  Calibrated sim (`~/hl-data/sim/m1`): share of forks whose collapse picks the truth (phantom = the sim's rejected
+  order; owner = the sim's seeded owner), per hook and per evidence type. Reported, decides nothing.
+- **Screen.** dev20 + dev-fast vs B1, default rule (dev20 contested point > 0 AND lower >= 0; dev-fast contested upper
+  >= 0; dev20 uncontested upper >= -1.0) PLUS naming precision >= 70% on both sets for owner-labelled fills (fills on
+  owner-forked or named pieces whose label at fill time is the real maker / all such fills). No confirm runs. The
+  phantom hook overlaps Yuta's A6-feed: whichever passes first becomes the baseline the other is tested on (mailbox).
+
