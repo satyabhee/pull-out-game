@@ -127,3 +127,22 @@ def test_docs_window_configurable():
                                       (450, place("0xb", Side.SELL, 100, 1, p=3))]), 100) == ["0xb", "0xa"]
     with pytest.raises(ValueError):
         Engine(p_priority="docs:-1")
+
+
+def test_touch_trades_first_keeps_post_block_bbo():
+    """I25: a block's trades and its post-block bbo share the block time; with trades_first the bbo (state AFTER the
+    block) wins, so a level the block consumed is not reported as the touch. Default keeps the historical order."""
+    from engine_py.replay import RealTouch
+    from engine_py.types import Side
+
+    class T:
+        def __init__(self, t, px):
+            self.time_ms, self.asset, self.seq, self.taker_side, self.px = t, 0, 0, Side.BUY, px
+    trades = [T(1000, 100)]                         # a taker buy consumed the ask at 100 during block t=1000
+    bbos = [(1000, 0, (95, 1, 1), (104, 1, 1))]     # after the block: bid 95, ask 104
+    old = RealTouch((), trades, bbos)
+    old.advance(1100)
+    assert old.get(0, 1100)[:2] == (95, 100)        # B1: the intra-block trade price overwrites the bbo
+    new = RealTouch((), trades, bbos, trades_first=True)
+    new.advance(1100)
+    assert new.get(0, 1100)[:2] == (95, 104)

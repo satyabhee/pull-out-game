@@ -619,3 +619,15 @@ Both become IDEAS rows (I25, I26).
 - **After a promotion:** confirm per Addendum 1 (sign test on flipped contested txs, min evidence 10 flips or 8 changed
   chunks, written before the first look), or the bug-fix track (its checks written before computing them). Check 2
   (sim 1.0 under all combos) cannot pass until the touch gate's sim shortfall (I25) is fixed.
+
+### I25: touch evidence in time order (`--touch-trades-first`), pre-registered 23:52Z Nov 23 (before any I25 run on real data)
+- **Mechanism / citation:** RealTouch ranked equal-time events SNAP < BBO < TRADE; a block's trades (intra-block) and its
+  bbo / l2 snapshot (post-block) share the block time (real data: all bbo and trade times equal block times), so trade
+  prices of consumed levels overwrote the post-block touch. Full-visibility sim (`analysis.sim_switch_check`, 10
+  seeds): `--alo-gate touch` 391 / 394 with 92 wrong rejects -> 394 / 394, 0 wrong rejects; B1 390 -> 393; B1 + switch
+  + `--stp expire_maker` 394 / 394 (handoff/i21/sim_check_tf.json). Test: tests/test_p_priority.py.
+- **Screen:** B1 vs B1 + `--touch-trades-first`, dev20 + dev-fast + dev_margin60 (same B1 references as I26),
+  `analysis.pooled_paired`; promote iff pooled contested point >= +1.0, lower >= -1.0, no acting set < 0. One variant.
+  Reported: changed chunks, contested txs up / down per set, uncontested, gate counters.
+- **After a promotion:** bug-fix track (Addendum 1.4) is the intended route (documented-data fact + sim); its checks will
+  be written before they are computed. I25 and I26 are screened separately; their combination only after both.

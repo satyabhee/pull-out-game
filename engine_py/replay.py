@@ -71,11 +71,17 @@ class RealTouch:
 
     SNAP, BBO, TRADE = 0, 1, 2      # rank at equal time
 
-    def __init__(self, snapshots=(), trades=(), bbos=()):
-        ev = [(s.time_ms, self.SNAP, s.asset, 0, s.bids[0][0] if s.bids else None,
+    def __init__(self, snapshots=(), trades=(), bbos=(), trades_first: bool = False):
+        # I25 (BLITZ, Nov 23): snapshots, bbo records and trades of one block all carry that block's time, but the
+        # trades happened DURING the block and the book records show the state AFTER it. trades_first ranks the
+        # trades first at equal time, so intra-block trade prices never overwrite the post-block touch.
+        # Default (False) keeps the historical rank SNAP < BBO < TRADE (B1).
+        snap, bbo, trade = (1, 2, 0) if trades_first else (self.SNAP, self.BBO, self.TRADE)
+        self.SNAP, self.BBO, self.TRADE = snap, bbo, trade
+        ev = [(s.time_ms, snap, s.asset, 0, s.bids[0][0] if s.bids else None,
                s.asks[0][0] if s.asks else None) for s in snapshots]
-        ev += [(t, self.BBO, a, 0, b, k) for t, a, b, k in bbos]      # b, k = (px, sz, n) | None
-        ev += [(t.time_ms, self.TRADE, t.asset, t.seq, t.taker_side, t.px) for t in trades]
+        ev += [(t, bbo, a, 0, b, k) for t, a, b, k in bbos]      # b, k = (px, sz, n) | None
+        ev += [(t.time_ms, trade, t.asset, t.seq, t.taker_side, t.px) for t in trades]
         ev.sort(key=lambda e: e[:4])
         self.events = ev
         self.i = 0
@@ -269,6 +275,7 @@ class Replay:
                  nearest_ratio: int = 0, check_permutation: bool = True, hasher: Hasher | None = None,
                  observer: Observer | None = None, engine: Engine | None = None,
                  alo_gate: str | None = None, gate_max_age_ms: int | None = None, gate_spare_after: bool = False,
+                 touch_trades_first: bool = False,
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
                  keep_known: bool = False, skip_lead_in: bool = False, lead_in_keep: int | None = None,
@@ -548,6 +555,7 @@ class Replay:
         # I21 (tournament, Nov 23): the gate's touch evidence cannot disprove an order placed after it; if an admitted
         # ALO would cross such an order, evict nothing and let the engine decide (it rejects the ALO as would-cross)
         self.gate_spare_after = gate_spare_after
+        self.touch_trades_first = touch_trades_first
         self._height_ms: dict[int, int] | None = None
         self.reseed, self.keep_known = reseed, keep_known
         if outside_position not in ("end", "start"):
@@ -583,7 +591,8 @@ class Replay:
             self.touch = RealTouch(
                 [s for coin in COINS for s in iter_books(self.hl_data, coin, lo, self.t1)],
                 iter_trades(self.hl_data, COINS, lo, self.t1),
-                [x for coin in COINS for x in iter_bbo(self.hl_data, coin, lo, self.t1)] if self.use_bbo else [])
+                [x for coin in COINS for x in iter_bbo(self.hl_data, coin, lo, self.t1)] if self.use_bbo else [],
+                trades_first=touch_trades_first)
         self.gate_stats: Counter = Counter()
         self.reconciled: Counter = Counter()        # (coin, trimmed|drift|missing|evicted...) -> lots
         self.outside_fill_log: list[tuple[int, int, int]] = []   # (height, tid, lots unmatched)
