@@ -24,7 +24,7 @@ both dev20 and dev-fast (engine fills on named pieces whose named owner is the r
 fills on named pieces).** Reason (Satya): a wrong owner name biases per-maker results in the IE 498 study, and
 maker-strict does not penalise it.
 
-**Data-gated switches (Satya, Nov 23):** for a switch that needs data only some chunks have (margin snapshots, the post-only margin snapshots, ...), the dev20 "point > 0" requirement is replaced by: (i) byte-identical output on the sets where the switch cannot act (dev20, dev-fast, whichever lack that data), AND (ii) a passing pre-registered confirm on chunks where it can act (contested point estimate > 0, Holm p < .05). All other switches keep the dev20 rule. Where a set CAN act (e.g. dev-fast for `--taker-reject margin`), it is not part of (i); it is
+**Data-gated switches (Satya, Nov 23; tightened in the overnight instructions):** for a switch that needs data only some chunks have (margin snapshots, the post-only margin snapshots, the 5-level feed, ...), the dev20 "point > 0" requirement is replaced by: (1) on the sets where the switch cannot act, byte-identical output, OR every differing tx traced to a case where its data exists, plus contested not worse; AND (2) a passing pre-registered confirm on chunks where it can act (contested point estimate > 0, Holm p < .05). All other switches keep the default rule. Where a set CAN act (e.g. dev-fast for `--taker-reject margin`), it is not part of (i); it is
 reported, and the dev-fast clause (upper bound >= 0) still applies.
 
 ## Attempts
@@ -87,6 +87,23 @@ the rule since Nov 23 (dev20 rule AND dev-fast contested paired CI upper bound >
 Expected: dev20 a no-op (0 of 20 chunks have clearinghouseState.json; sanity check); dev-fast is the real test (20 of
 20 have it). If it passes: into docs/baseline.md (B1), Rust parity checked (the rule is in the Python Replay layer,
 which drives both engines), row here.
+
+### Overnight protocol (Satya, Nov 23; `~/book-replay-data/handoff/OVERNIGHT_PROTOCOL.md`, recorded before the next run)
+- Ownership: mahito = A4 (placeholders / pre-window naming) and A5 (cancel matching / exact oid counting); Yuta = A6
+  (post-only margin gate + phantom orders) and the data-side diagnostics; Yuta sends unmatched-cancel examples via
+  `handoff/`.
+- Mailboxes `handoff/mail/to_<name>.md` (append-only, numbered); read pointer `handoff/mail/<name>.read`; inbox checked
+  after every finished step.
+- One big run at a time: a run expected to use > 1 GB takes `mkdir handoff/RUN_LOCK` (name + start time inside;
+  `rmdir` when done); held lock: non-run work or wait <= 20 min; a lock older than 3 h is broken only after asking.
+- Adoption without Satya only by the rules above (default; data-gated). Yuta's switches: Yuta hands over, mahito
+  runs the B0 check, adopts into docs/baseline.md, checks parity; Yuta mirrors FROZEN_CONFIG.md. Both re-read
+  docs/baseline.md before every run.
+- Never: final240, confirm68, the reserved post-change benchmark set, pushing, touching main, changing a rule after
+  its results are seen, pausing the ingest. 3 failed attempts at one thing -> QUESTIONS + next item.
+- mahito queue: 1 A5 · 2 B0 checks of handed-over switches · 3 A8b (queue order among real orders) if Yuta reports
+  queue priority as the main cause · 4 reserve >= 120 post-change chunks after Yuta's confirm set in
+  `handoff/benchmark_postchange.txt` (never replayed).
 
 ### A5 · Exact oid counting (Satya, Nov 23, session 5; written before any A5 run)
 Owner: mahito (Yuta sizes unresolved-cancel misses on dev_margin60 and sends cases). Baseline: B1.

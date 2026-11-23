@@ -226,6 +226,7 @@ cannot pass; that would also have held A4(a).
 
 **Answer (Satya, Nov 23).** (b): hold (b1) / (b2). Rule change (scoreboard, before the next run): adopt only if dev20
 contested point estimate > 0 AND lower bound >= 0 AND dev-fast contested upper bound >= 0; owner-naming switches
-also need naming precision >= 70% on dev20 and dev-fast. Ownership: mahito owns A5 (exact oid counting + resolver);
+also need naming precision >= 70% on dev20 and dev-fast. Ownership: mahito owns A4 (placeholders / pre-window naming) and A5 (exact oid counting + resolver);
 Yuta sizes unresolved-cancel misses on dev_margin60 and sends cases; A6 (post-only margin gate) is Yuta's, not mahito's.
-
+Data-gated rule tightened (overnight instructions): where the switch cannot act, byte-identical OR every differing tx
+traced to a case where its data exists, plus contested not worse; and a passing pre-registered confirm where it can.
