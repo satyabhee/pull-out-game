@@ -8,7 +8,7 @@ trader profiles and a testnet probe lab.
 
 ## 0. How to work through this document
 
-- Work one milestone at a time, in order: **M0 → M5 → M1 → M2 → M3**. M5 (Rust core) is numbered last but runs second. **M4** is independent and can start any time after M0.
+- **The plan now runs in two tracks, and §00 overrides the milestone order below.** Every work session pairs a **lab** step with an **accuracy** step and ends with `docs/scoreboard.md` updated. Done so far: M0 · Idle, M5 · Isomer, M1 · Transfigure (all tagged).
 - At the end of each milestone, stop and report: what you built, the test results, and anything in this spec that turned out wrong for the real code. Wait for review before the next milestone.
 - If the real engine contradicts this spec, the real engine wins. Write the difference down in `docs/deviations.md`, don't force the spec onto it.
 - Ask before changing anything in the scoring code, the answer key, or the chunk sets (dev20, 68-chunk confirm, 240-chunk final).
@@ -33,6 +33,50 @@ The user is working on a feature branch. Rules:
 
   Add these to `.gitignore` in M0. Add a check that refuses a commit containing something that looks like a hex private key.
 - **Keep this file current:** record in `docs/deviations.md` any change to this spec that the real code forces, and commit it together with the change.
+
+---
+
+## 00. Two-track plan (v2, Nov 22): improve the lab AND the score
+
+**Why this changed:** M0, M5 and M1 made the lab faster and more trustworthy, but contested strict on dev20 is still about 0.587, the same as before the plan. The big gaps (placeholders, margin-rejected IOCs, lost orders) are **missing-information** problems. From now on, every lab step must make an accuracy step possible, and every session must try to move the score.
+
+### Current baseline (keep this definition exact)
+Real engine on `mahito`, Rust backend, block-end correction, `--p-priority docs`, `--learn-evidence tx`, `order=proposer` (explorer listing order), `stp=taker`. dev20 contested strict ≈ 0.587. The old 0.588 on final240 used mid-block correction and is kept for the record only. Every change is compared with **this** baseline, and `docs/scoreboard.md` records each time the baseline moves.
+
+### Session rules
+1. **Pairing.** Each session does one or more **A** (accuracy) items **and** one or more **L** (lab) items. Do not spend a whole session on lab work unless every open A item is blocked; if so, say which A item it unblocks.
+2. **Write the decision rule down before the run.** Every A item writes its adoption rule into `docs/scoreboard.md` before looking at results. The default rule: adopt if dev20 contested strict improves with a paired 95% CI lower bound ≥ 0 **and** uncontested doesn't drop by more than 1 point (CI upper bound). On dev-fast (A1), the same rule applies.
+3. **Each fix goes behind a switch**, default off, then becomes the baseline only if it passes its rule. Update the Rust/Python parity checks for the new baseline.
+4. **The scoreboard** (`docs/scoreboard.md`) holds one row per attempt: date, item, switch, rule, dev20 contested / uncontested with CIs, dev-fast too if run, adopted (y/n), commit. Failed attempts stay in the table. They're results too.
+5. **Hold-out sets:** confirm68 runs only with the user's OK. final240 runs only once per semester-level claim, with the user's OK.
+6. **Budget:** each A item should take at most one session to get a first measured result. If it doesn't, write what's blocking it in `docs/QUESTIONS.md` and move on.
+
+### Accuracy track (A), in priority order
+- **A0 · Re-triage (do first).** Classify every contested miss on the current baseline by cause: placeholder maker, margin-rejected IOC or ALO we filled, lost order / wrong cancel target, queue order at the right price, phantom order (we hold, chain doesn't), ordering inside a block, other. Report counts, share of missed notional, and 3 examples per cause. This replaces the old 135-miss breakdown and **sets the order of A2–A7**: work on the biggest causes first.
+- **A1 · dev-fast set.** Build a new development set (~20 chunks) from windows recorded after Nov 21 22:56 UTC, so it has the 5-level `l2Book fast` feed and no ingest gaps. Add a loader for that feed. Score the baseline on it. From then on, report dev-fast next to dev20 for every A item. (dev20 still decides adoption, until the user says otherwise.)
+- **A2 · Lead-in length.** Try 300 and 600 blocks (150 beat 75 by +2.6). This is only a config change. Watch the runtime cost.
+- **A3 · IOC margin classifier (P2).** The first piece of M3 · Polymorphic, trained on **real** labels. Train `ioc_reject` on the de-duplicated order histories (time-based split, calibrated, leakage test, as in M3). In replay: if the predicted rejection probability is ≥ a cutoff chosen on training days, skip the IOC. This replaces the `learn` rule's first-IOC leak. Report engine-only trades too (213 before).
+- **A4 · Placeholder owners (lightweight P1).**
+  - (a) Split each snapshot level into its `n` orders using the feed's count changes, as P1's logic does, but keep only the single most likely queue (no particle filter).
+  - (b) Name owners from later trades and cancels.
+  - (c) Break ties with each account's habitual order sizes.
+  - (d) On dev-fast, extend the touch ledger to all 5 levels with sizes and counts.
+- **A5 · Exact oid counting (P3).** If L1 confirms that the listing is execution order, oids may be countable exactly between anchors (P3's follow-up question). Test whether every order item takes the next oid (rejected orders, triggers, both coins) and use counting in place of interpolation where it holds.
+- **A6 · Margin-rejected post-only orders (P4).** Train the `alo_reject` classifier, the same way as A3. On dev-fast, use deeper levels to remove post-only orders that never rested.
+- **A7 · Silent reduce-only cancels (P6).** Small. Only if A0 shows it's worth any points.
+
+### Lab track (L), each item tied to what it unblocks
+- **L1 · Is the listing execution order?** (Unblocks A5 and the simulator's truth ordering; it's also IE 498's key premise.) Count runs of the class sequence per block vs a shuffled null, with the decision rule written down first. Check whether the 6 conflicting blocks' run boundaries fall inside their one-cut ranges. Then set the simulator truth to per-batch class sort with a measured batch rate, or to proposer, by the rule.
+- **L2 · Simulator difficulty.** (Unblocks M2 tuning.) Add maker concentration and baseline contested strict as calibration targets, and calibrate toward dev20 and dev-fast. Stop after 3 rounds and report.
+- **L3 · Arrival-order source.** (Unblocks the IE 498 counterfactual.) List any captured data with per-tx arrival times or mempool data. Don't build anything.
+- **L4 · Minimal M4 ordering probe.** (Unblocks IE 498 and confirms L1 directly.) The testnet experiment: a cancel and an IOC in the same block, in both listing orders. Only with the user's testnet keys and OK.
+- **L5 · M2 · Multiplicity, gated.** Build M2 only if A0 shows that misses needing several hypotheses at once (ambiguous queue splits, ambiguous cancel targets) are **≥ 30% of missed contested notional** after A2–A4 have landed. Otherwise M2 waits until after the semester.
+
+### What happened to the original milestones
+- M2 → **L5**, gated on A0.
+- M3 → split. Its classifiers become **A3 and A6** (now). The full profile store comes later, only if A4(c) shows size habits help.
+- M4 → **L4**, minimal probe only, for IE 498.
+- Hard rules (§2) and budgets (§2b) still apply to everything.
 
 ---
 
