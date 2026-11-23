@@ -47,6 +47,9 @@ reported, and the dev-fast clause (upper bound >= 0) still applies.
 | Nov 23 | Fallback 3b A3 ioc_reject classifier (vs B1) | `--taker-reject margin,ioc_model --ioc-model report/validate/a3/model.json` | 3b rule (a751296) | **-54.1 [-66.6, -41.9]** | -67.1 [-77.5, -57.2] | -25.6 [-45.5, -4.7] / -50.0 [-63.4, -37.4]; engine-only 738 -> 73, real-only -> 396 | **n** (dev_margin60 not run) | this session |
 | Nov 23 | A3 / I12 cost-based cutoff R = 130 (vs B1) | `--taker-reject margin,ioc_model --ioc-model report/validate/a3c/model_R130.json` | I12 rule (56f74cc) | **-16.0 [-22.2, -8.0]** | -21.3 [-30.7, -12.9] | -0.7 [-2.1, +0.0] / -22.6 [-31.4, -12.6]; dev_margin60 contested -15.5 [-23.8, -7.9] (n 159); pooled -13.4 [-18.2, -8.5] | **n** | this session |
 | Nov 23 | A8b queue order among real orders (Stage 1 + 2) | none | A8b rule (536b57a) + H1-H3 (ad3bf32) | no hypothesis supported on dm60 chain fills (H1 16%, H2 58%, H3 78.8%; bar 80%) | | | n (nothing built) | this session |
+| Nov 23 | I01 V1 docs window 300 ms (vs B1, tournament) | `--p-priority docs:300` | I01 rule (ac1d885) | -2.3 [-6.7, +0.0] | | -3.3 [-8.8, +0.0] / -; dm60 -1.1 [-4.0, +1.4]; pooled -1.8 [-4.0, -0.0], uncontested -3.3 [-5.3, -1.4] | **n** (bar) | this session |
+| Nov 23 | I01 V2 docs window 500 ms | `--p-priority docs:500` | I01 rule (ac1d885) | -2.4 [-4.7, -0.4] | | -1.0 [-3.4, +0.0] / -; dm60 -0.6 [-2.3, +0.0]; pooled -1.3 [-2.5, -0.3], uncontested -1.4 [-2.3, -0.6] | **n** (bar) | this session |
+| Nov 23 | I01 V3 docs for any resting tif | `--p-priority docsall` | I01 rule (ac1d885) | +0.0 [0, 0] | | +0.0 / -; dm60 +0.0; pooled +0.0 (changes only warm-up txs: dev20 2, dev-fast none) | **n** (bar: point < +1.0) | this session |
 
 ## Rules written before each item (Nov 23 session)
 
