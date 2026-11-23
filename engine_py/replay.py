@@ -277,7 +277,7 @@ class Replay:
                  other_position: str = "end",
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
                  placeholder_cap: str | None = None, reseed_keep_known: bool = False, placeholder_split: bool = False,
-                 named_cancel: bool = False,
+                 named_cancel: bool = False, multi_lite: bool = False,
                  trade_learn: str | None = None, trade_learn_at: str = "tx", oid_guard: str | None = None,
                  refill_position: str = "front",
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
@@ -431,7 +431,9 @@ class Replay:
             raise ValueError("reseed_keep_known needs reseed=True")
         self.placeholder_ttl_ms, self.placeholder_queue = placeholder_ttl_ms, placeholder_queue
         self.placeholder_cap, self.reseed_keep_known = placeholder_cap, reseed_keep_known   # alias, see keep_known
-        self.placeholder_split = placeholder_split  # A4a: a snapshot level's uncovered size = its uncovered orders
+        # multi_lite (L5-lite, docs/scoreboard.md): per-level alternatives; implies placeholder_split + trade-learn name
+        self.multi_lite = multi_lite
+        self.placeholder_split = placeholder_split or multi_lite  # A4a: a snapshot level's uncovered size = its uncovered orders
         # A4b2: an unresolvable cancel of user U on asset a removes U's trade-named piece on a if exactly one rests
         self.named_cancel = named_cancel
         self._trade_named: dict[tuple[str, int], list[int]] = {}   # (user, asset) -> engine oids named by trade_learn
@@ -441,6 +443,10 @@ class Replay:
         if trade_learn_at not in ("tx", "block-end"):
             raise ValueError(f"unknown trade_learn_at {trade_learn_at!r}")
         self.trade_learn_at = trade_learn_at
+        if multi_lite:
+            if "name-clip" in self._rules:
+                raise ValueError("multi_lite uses trade-learn name, not name-clip")
+            self._rules = self._rules | {"name"}
         self._name_clip = "name-clip" in self._rules
         self.learn_keep_known = learn_keep_known
         # trade_learn evidence (Satya Q7, docs/deviations.md D33):
@@ -461,6 +467,10 @@ class Replay:
             raise ValueError(f"unknown refill_position {refill_position!r}")
         self.refill_position = refill_position
         self.learn_stats: Counter = Counter()
+        self._ml = None
+        if multi_lite:
+            from engine_py.multi_lite import MultiLite
+            self._ml = MultiLite(self)
         self.taker_reject = frozenset(x for x in (taker_reject or "").split(",") if x)
         bad = self.taker_reject - {"min10", "learn", "margin", "margin_spot", "hist"}
         if bad:
@@ -955,6 +965,8 @@ class Replay:
         trades = self._real_trades.get(tx_hash)
         if not trades:
             return
+        if self._ml is not None:
+            self._ml.on_real_trades(tx_hash, trades)
         eng = self.engine
         groups: dict[tuple[int, Side], list] = {}
         for tr in trades:
@@ -1001,6 +1013,11 @@ class Replay:
                 self.learn_stats[f"named_orders:{coin}"] += 1
                 self.learn_stats[f"named_lots:{coin}"] += q
                 self._trade_named.setdefault((maker, asset), []).append(order.oid)
+                if self._ml is not None:
+                    at_w = [t for t in sorted(trs, key=lambda t: -t.seq) if t.px == w]
+                    makers = list(dict.fromkeys(t.maker for t in at_w))
+                    if len(makers) >= 2:
+                        self._ml.owner_fork(asset, side, w, order.oid, makers, self._block.height)
 
     def _cancel_named(self, action) -> None:
         """named_cancel (A4b2): U's cancel found no order; if U has exactly one trade-named piece resting on that
@@ -1197,9 +1214,12 @@ class Replay:
         before = self.engine.next_oid
         self._block = block
         self.engine.block_time_ms = block.time_ms
+        ml_info = self._ml.before_action(action) if self._ml is not None else None
         deep = self._deep_in(action) if self.deep_book else None
         gated = self._apply_gated(action) if self.touch is not None else None
         fills, rejects = gated if gated is not None else self.engine.apply(action)
+        if ml_info is not None:
+            self._ml.after_action(action, rejects, ml_info)
         if deep:
             self._deep_out(deep)
         if (self.named_cancel and isinstance(action, (Cancel, CancelByCloid))
@@ -1280,6 +1300,8 @@ class Replay:
         else:
             self._blk_ioc.clear()
         eng.end_block(b.height, b.time_ms)
+        if self._ml is not None:
+            self._ml.end_block()
         minute = self.minute(b.time_ms)
         self.observer.after_block(self, b, minute)
         for s in at_block.get(bi, ()):
@@ -1293,6 +1315,8 @@ class Replay:
                 self._note_refill(s, first)
                 if self.refill_position == "back":
                     self._refill_to_back(s.asset, first)
+                if self._ml is not None:
+                    self._ml.on_snapshot(s, b.height)
             elif self.reseed:
                 res = eng.reconcile(s.asset, s.bids, s.asks)     # measure drift, then rebuild
                 res.update(eng.clear(s.asset), reseed=1)

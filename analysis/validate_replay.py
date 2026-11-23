@@ -481,7 +481,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
         outside_other_txs=False, other_position="end", placeholder_ttl_ms=None,
         placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False,
-        placeholder_split=False, named_cancel=False,
+        placeholder_split=False, named_cancel=False, multi_lite=False,
         trade_learn=None, trade_learn_at="tx", oid_guard=None, refill_position="front", oid_facts=False,
         name_prewindow=False, named_anon="front", deep_book=False,
         learn_keep_known=False, learn_evidence="loose", facts_exclude=(), use_bbo=True, anchor_drop_kinds=(), oid_bracket=False, p_priority=None,
@@ -499,7 +499,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 keep_known=keep_known, skip_lead_in=skip_lead_in,
                 snapshot_shift=snapshot_shift, outside_position=outside_position, outside_other_txs=outside_other_txs,
                 other_position=other_position, placeholder_ttl_ms=placeholder_ttl_ms,
-                placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap, placeholder_split=placeholder_split, named_cancel=named_cancel,
+                placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap, placeholder_split=placeholder_split, named_cancel=named_cancel, multi_lite=multi_lite,
                 reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, trade_learn_at=trade_learn_at, oid_guard=oid_guard, refill_position=refill_position, oid_facts=oid_facts,
                 name_prewindow=name_prewindow and oid_facts, named_anon=named_anon, deep_book=deep_book, learn_keep_known=learn_keep_known, learn_evidence=learn_evidence, facts_exclude=facts_exclude,
                 use_bbo=use_bbo, anchor_drop_kinds=anchor_drop_kinds, oid_bracket=oid_bracket, taker_reject=taker_reject, taker_seed=_seed_for(taker_seed, window), engine=engine if engine is not None else Engine(stp=stp, p_priority=p_priority, evict_arrival=evict_arrival))
@@ -855,6 +855,8 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="H11, LOOK-AHEAD (measurement only): cap re-seeded levels by the next snapshot + real trades")
     ap.add_argument("--placeholder-split", action="store_true",
                     help="A4a: each snapshot level's uncovered size becomes its uncovered ORDER COUNT of equal placeholders")
+    ap.add_argument("--multi-lite", action="store_true",
+                    help="L5-lite: per-level alternatives (phantom-or-real, owner-of-piece); implies --placeholder-split + name")
     ap.add_argument("--named-cancel", action="store_true",
                     help="A4b2: an unresolvable cancel of U removes U's one trade-named piece on that asset (needs trade-learn name)")
     ap.add_argument("--reseed-keep-known", action="store_true",
@@ -925,7 +927,7 @@ def replay_kwargs(a) -> dict:
                 outside_other_txs=a.outside_other_txs, other_position=a.other_position,
                 placeholder_ttl_ms=a.placeholder_ttl_ms, placeholder_queue=a.placeholder_queue,
                 placeholder_cap=a.placeholder_cap, reseed_keep_known=a.reseed_keep_known,
-                placeholder_split=a.placeholder_split, named_cancel=a.named_cancel,
+                placeholder_split=a.placeholder_split, named_cancel=a.named_cancel, multi_lite=a.multi_lite,
                 wildcard_pre_reseed_known=a.wildcard_pre_reseed_known,
                 trade_learn=None if a.trade_learn == "off" else a.trade_learn, trade_learn_at=a.trade_learn_at,
                 oid_guard=a.oid_guard, refill_position=a.refill_position,
@@ -963,7 +965,7 @@ def options_tag(a) -> str:
                     f"-phttl{a.placeholder_ttl_ms}" if a.placeholder_ttl_ms is not None else "",
                     "-phbehind" if a.placeholder_queue == "behind" else "",
                     "-phcapnext" if a.placeholder_cap else "", "-keepknown" if a.reseed_keep_known else "",
-                    "-phsplit" if a.placeholder_split else "", "-namedcancel" if a.named_cancel else "",
+                    "-phsplit" if a.placeholder_split else "", "-namedcancel" if a.named_cancel else "", "-multilite" if a.multi_lite else "",
                     "-wcknown" if a.wildcard_pre_reseed_known else "",
                     "-tloff" if a.trade_learn == "off" else
                     f"-tl{a.trade_learn.replace(',', '+')}" if a.trade_learn != DEFAULT_TRADE_LEARN else "",

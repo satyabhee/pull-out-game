@@ -126,3 +126,16 @@ def test_listing_is_execution_order_class_sorted_per_batch(tmp_path):
     for f in window.glob("*.json.gz"):
         h = int(f.name.split(".")[0])
         assert descents(block_classes(f)) <= n_batches[h] - 1
+
+
+def test_full_visibility_multi_lite_is_exact(tmp_path):
+    """L5-lite (docs/scoreboard.md): with nothing hidden, --multi-lite (forks + their collapses) keeps strict
+    recall at exactly 1.0 on top of the tx-evidence corrections, with re-seeding on so the phantom hook can fire."""
+    cfg = SimConfig.full_visibility(seed=2, n_blocks=120, lead_in=40)
+    generate_chunk(cfg, tmp_path)
+    kw = dict(stp="expire_maker", p_priority="docs", oid_facts=True, trade_learn="sweep,queue",
+              trade_learn_at="block-end", learn_evidence="tx", reseed=True, keep_known=True)
+    res, rows = vr.run(tmp_path / "windows" / chunk_name(cfg), tmp_path / "hl_data", "class", quiet=True,
+                       multi_lite=True, **kw)
+    scored = scored_rows(rows)
+    assert scored and all(r["match_full"] for r in scored)
