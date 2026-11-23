@@ -277,6 +277,7 @@ class Replay:
                  other_position: str = "end",
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
                  placeholder_cap: str | None = None, reseed_keep_known: bool = False, placeholder_split: bool = False,
+                 named_cancel: bool = False,
                  trade_learn: str | None = None, trade_learn_at: str = "tx", oid_guard: str | None = None,
                  refill_position: str = "front",
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
@@ -431,6 +432,9 @@ class Replay:
         self.placeholder_ttl_ms, self.placeholder_queue = placeholder_ttl_ms, placeholder_queue
         self.placeholder_cap, self.reseed_keep_known = placeholder_cap, reseed_keep_known   # alias, see keep_known
         self.placeholder_split = placeholder_split  # A4a: a snapshot level's uncovered size = its uncovered orders
+        # A4b2: an unresolvable cancel of user U on asset a removes U's trade-named piece on a if exactly one rests
+        self.named_cancel = named_cancel
+        self._trade_named: dict[tuple[str, int], list[int]] = {}   # (user, asset) -> engine oids named by trade_learn
         self.ph_stats: Counter = Counter()          # placeholder flag effects (lots / counts)
         self.trade_learn = trade_learn
         self._rules = self.parse_trade_learn(trade_learn)
@@ -996,6 +1000,22 @@ class Replay:
                 eng.by_user.setdefault(maker, {})[order.oid] = None
                 self.learn_stats[f"named_orders:{coin}"] += 1
                 self.learn_stats[f"named_lots:{coin}"] += q
+                self._trade_named.setdefault((maker, asset), []).append(order.oid)
+
+    def _cancel_named(self, action) -> None:
+        """named_cancel (A4b2): U's cancel found no order; if U has exactly one trade-named piece resting on that
+        asset, the cancel was most likely for it (a named piece has no oid / cloid for the cancel to match)."""
+        key = (action.user, action.asset)
+        book = self.engine.books[action.asset]
+        alive = [oid for oid in self._trade_named.get(key, ()) if oid in book]
+        self._trade_named[key] = alive
+        coin = ASSETS[action.asset].name
+        if len(alive) != 1:
+            self.learn_stats[f"named_cancel_{'none' if not alive else 'ambiguous'}:{coin}"] += 1
+            return
+        self.engine._remove(alive[0])
+        self._trade_named[key] = []
+        self.learn_stats[f"named_cancel_removed:{coin}"] += 1
 
     def minute(self, time_ms: int) -> int:
         """Minute of window time, 0-based from the first block."""
@@ -1182,6 +1202,9 @@ class Replay:
         fills, rejects = gated if gated is not None else self.engine.apply(action)
         if deep:
             self._deep_out(deep)
+        if (self.named_cancel and isinstance(action, (Cancel, CancelByCloid))
+                and any(r.reason is RejectReason.UNKNOWN_ORDER for r in rejects)):
+            self._cancel_named(action)
         created = before if self.engine.next_oid > before and isinstance(action, (Place, Modify)) else None
         if created is not None:
             self.placed[created] = action.new if isinstance(action, Modify) else action

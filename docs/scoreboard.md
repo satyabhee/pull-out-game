@@ -75,7 +75,22 @@ Expected: dev20 a no-op (0 of 20 chunks have clearinghouseState.json; sanity che
 20 have it). If it passes: into docs/baseline.md (B1), Rust parity checked (the rule is in the Python Replay layer,
 which drives both engines), row here.
 
-### A4(b) · naming placeholder pieces: rule written before building (see A4(b) section when added)
+### A4(b) · Name placeholder pieces from later trades and cancels (Satya, Nov 23; written before building)
+Builds on A4(a) (`--placeholder-split`: each snapshot level is split into its uncovered order count, so one
+placeholder piece ~ one real order). Q13: (a) is adopted only together with (b).
+- **(b1) name from trades** = `--placeholder-split` + trade-learn rule `name` (B0's `sweep,queue` become
+  `sweep,queue,name`). After a tx's real trades (block end, as B0), at the tx's worst price w on a maker side, the
+  last real maker M at w (highest seq) may still rest there with a partial remainder. If our queue at w has no order
+  of M and its FRONT order is a placeholder piece, that one piece becomes M's order (same size, same place). With the
+  split, a piece is one order, not the whole level (the whole-level version, `name`, was dropped Nov 19).
+- **(b2) name from cancels** = (b1) + `--named-cancel`: a cancel / cancelByCloid of user U on asset a that our book
+  cannot resolve (UNKNOWN_ORDER) removes U's trade-named piece on a if U has exactly ONE such piece resting there
+  (none or several: nothing happens). A named piece has no oid / cloid, so this is the only way U's own cancels reach it.
+- Rule: the rule since Nov 23, each of (b1) and (b2) vs the current baseline in docs/baseline.md at run time. If both
+  pass, adopt the larger dev20 contested point estimate, unless within 0.5 points: then (b1) (simpler).
+  Counters reported: pieces named, named pieces later filled in the engine (and whether by the real maker),
+  named pieces removed by (b2).
+- Parity: the naming lives in the Python Replay layer (drives both engines); an adopted part gets a Rust parity run.
 
 ## Results
 
