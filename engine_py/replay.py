@@ -278,6 +278,7 @@ class Replay:
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
                  placeholder_cap: str | None = None, reseed_keep_known: bool = False, placeholder_split: bool = False,
                  named_cancel: bool = False, multi_lite: bool = False, name_strict: str | None = None,
+                 ioc_model: str | None = None,
                  trade_learn: str | None = None, trade_learn_at: str = "tx", oid_guard: str | None = None,
                  refill_position: str = "front",
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
@@ -477,7 +478,7 @@ class Replay:
             from engine_py.multi_lite import MultiLite
             self._ml = MultiLite(self)
         self.taker_reject = frozenset(x for x in (taker_reject or "").split(",") if x)
-        bad = self.taker_reject - {"min10", "learn", "margin", "margin_spot", "hist"}
+        bad = self.taker_reject - {"min10", "learn", "margin", "margin_spot", "hist", "ioc_model"}
         if bad:
             raise ValueError(f"unknown taker_reject rules {sorted(bad)}")
         self.taker_stats: Counter = Counter()
@@ -486,6 +487,12 @@ class Replay:
         self._margin = load_margin(self.window_dir, spot="margin_spot" in self.taker_reject) \
             if self.taker_reject & {"margin", "margin_spot"} else {}
         self._hist_rej = load_hist_rejects(self.window_dir) if "hist" in self.taker_reject else {}
+        self._ioc_thr = {}                       # fallback 3b: "user|coin|B/A" -> (op, Decimal notional | None)
+        if "ioc_model" in self.taker_reject:
+            if not ioc_model:
+                raise ValueError("taker_reject ioc_model needs ioc_model=<model.json>")
+            thr = json.load(open(ioc_model)).get("thresholds") or {}
+            self._ioc_thr = {k: (op, None if t is None else Decimal(t)) for k, (op, t) in thr.items()}
         self._real_trades: dict[str, list] = {}
         if self._rules or "learn" in self.taker_reject:
             for tr in iter_trades(self.hl_data, COINS, self.t0, self.t1):
@@ -950,6 +957,15 @@ class Replay:
                 grow = abs(signed) if szi == 0 or (szi > 0) == (signed > 0) else max(0.0, abs(signed) - abs(szi))
                 if grow > 0 and free < grow * float(a.ticks_to_px(p.px)) / MAX_LEVERAGE[a.name]:
                     return "skip_margin"
+        if self._ioc_thr and (not self._margin or p.user.lower() not in self._margin):
+            a = ASSETS[p.asset]
+            side = "B" if p.side is Side.BUY else "A"
+            t = self._ioc_thr.get(f"{p.user.lower()}|{a.name}|{side}") or self._ioc_thr.get(f"*|{a.name}|{side}")
+            if t is not None:
+                op, x = t
+                ntl = Decimal(a.ticks_to_px(p.px)) * Decimal(a.lots_to_sz(p.sz))
+                if op == "all" or (op == "ge" and ntl >= x) or (op == "le" and ntl <= x):
+                    return "skip_ioc_model"
         return None
 
     def _taker_learn(self) -> None:

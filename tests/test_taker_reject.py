@@ -11,6 +11,7 @@ def bare(rules, real=None, margin=None):
     r.taker_reject = frozenset(rules)
     r.taker_stats, r._taker_blocked, r._blk_ioc = Counter(), set(), {}
     r._real_trades = real or {}
+    r._ioc_thr = {}
     return r
 
 
@@ -88,3 +89,14 @@ def test_hist_rejects_match_by_cloid_or_shape_within_2s(tmp_path):
     assert not hist_rejected(rej, ioc("0xu", "60000", "0.01"), 5_000_000)          # iocCancelRejected: engine decides
     assert not hist_rejected(rej, ioc("0xu", "60000", "0.02"), 1_000_000)          # other size
     assert load_hist_rejects(tmp_path / "none") == {}
+
+
+def test_ioc_model_threshold_skips_only_users_without_a_margin_snapshot():
+    from decimal import Decimal
+    r = bare({"margin", "ioc_model"}, margin={"m": (10**9, {})})
+    r._ioc_thr = {"u|BTC|B": ("le", Decimal("1000")), "*|BTC|B": ("ge", Decimal("10**6".replace("**6", "000000")))}
+    assert r._taker_skip(ioc("u", "60000", "0.01")) == "skip_ioc_model"      # 600 USD <= 1000
+    assert r._taker_skip(ioc("u", "60000", "0.1")) is None                    # 6000 USD > 1000
+    assert r._taker_skip(ioc("m", "60000", "0.01")) is None                   # has a margin snapshot (and passes)
+    assert r._taker_skip(ioc("new", "60000", "0.01")) is None                 # global: >= 10 M only
+    assert r._taker_skip(ioc("u", "60000", "0.01", side=Side.SELL)) is None   # no threshold for sells
