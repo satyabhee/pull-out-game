@@ -361,3 +361,25 @@ is the real maker at that price / all fills on named pieces) is >= 70%; if none 
 uncontested upper >= -1.0; naming precision >= 70% on dev20 AND dev-fast. Baseline: whatever docs/baseline.md says at
 run time (B1 now).
 
+### Fallback 3b · A3 `ioc_reject` classifier for users WITHOUT margin snapshots (Satya, Nov 23; rule written ~11:30Z, before any training)
+Facts seen before writing this (data inventory only, no model fit): the de-duplicated order histories
+(`windows/*/hist_orders.json`, 466 chunks, 46 users) hold 257,550 BTC/ETH IOC / FrontendMarket orders, Jun 5 - Nov 23;
+final statuses: iocCancelRejected 255,830, filled 1,714, minTradeNtlRejected 4, reduceOnlyRejected 2 (no margin
+rejections). Every dev / hold-out set starts at or after Nov 19 15:22 UTC (dev20 and final240 first block).
+- **Label**: 1 = the chain filled nothing (any status but filled), 0 = filled.
+- **Time split**: train = orders with timestamp < Nov 19 15:22 UTC; within it, fit on the first 80% by time and choose
+  calibration + cutoff on the last 20% (validation); test (report only) = orders after Nov 19 15:22 UTC.
+- **Features** (all known at replay time, nothing from the order's future): the user's no-fill rate in the FIT part
+  (Laplace (k+1)/(n+2); users without history get the global rate), coin, side, log10 notional (limit px x size).
+- **Model**: logistic regression (statsmodels), calibration checked by 10 reliability bins on validation.
+- **Cutoff (validation only)**: the lowest predicted p whose skipped set has precision (no-fill among skipped) >= 0.99;
+  if none, the classifier is not used.
+- **Leakage tests**: (i) every fit / validation timestamp < the split time; (ii) permuted-label refit: validation AUC
+  within 0.5 +- 0.05; (iii) user rates computed from the fit part only.
+- **Replay switch** `--taker-reject ioc_model --ioc-model FILE`: an IOC / FrontendMarket of a user WITHOUT a margin
+  snapshot in the chunk is skipped iff its predicted p >= cutoff; evaluated as an exact per-(user, coin, side)
+  notional threshold, so no floats in the replay. On top of B1 (margin gate stays first).
+- **Adopt iff** the default rule (dev20 contested point > 0 AND lower >= 0; dev-fast contested upper >= 0; dev20
+  uncontested upper >= -1.0) AND not worse on dev_margin60 (contested paired CI upper >= 0). Engine-only txs reported
+  (dev-fast B1: 738).
+
