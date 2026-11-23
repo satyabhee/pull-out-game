@@ -424,6 +424,28 @@ Screen: dev20 contested 0.587 -> 0.046, txs we no longer fill (real-only) 18 -> 
 The model ranks well; the cutoff rule (precision on a 99%-negative population) was the wrong target: a skipped
 IOC that really fills costs a scored tx, so the cutoff has to be set on the cost of skipped real fills (NS-3 (b)).
 
+### A3 / I12 · cost-based cutoff for the `ioc_reject` classifier (NS-3 answer, Satya 17:24Z; rule written ~17:55Z, before any new computation)
+Facts known before writing this: only the 3b results above (model, validation AUC, the degenerate 0.28 cutoff and its screens).
+- **Model: unchanged** (fit, features, coefficients of `report/validate/a3/model.json`, commit 179cac8). Only the cutoff rule changes.
+- **Cost ratio, written first: R = 130** = cost of a false skip / cost of a false keep, in scored-tx units.
+  False skip (skip an IOC that really filled): loses that tx's score if it is scored, ≈ B1's mean strict 0.65 (taken
+  as the full cost: conservative, i.e. toward fewer skips). False keep (fill an IOC the chain rejected): from the
+  recorded B0 -> B1 adoption (a different switch, numbers fixed before this item): removing 895 such engine-only txs
+  on dev-fast gained ≈ 0.029 x 50 + 0.034 x 83 ≈ 4.3 tx-units, ≈ 0.0048 per tx. 0.65 / 0.0048 ≈ 135, rounded to 130.
+- **Cutoff (training days only)**: Bayes decision under R: skip iff p >= c0 = R / (R + 1) = 0.99237 (model p as is).
+  **False-skip cap** on validation (last 20% of the pre-split period): skipped filled IOCs <= 5% of validation's filled
+  IOCs; if c0 breaks the cap, raise the cutoff to the lowest p that meets it. **Net check** on validation:
+  (no-fill IOCs skipped) - R x (filled IOCs skipped) must be > 0 at the chosen cutoff, else the classifier is not
+  used and the item fails without a screen. Test period (after the split) is reported only.
+- **Variants (tournament, chosen now, max 3):** primary R = 130 decides; R = 40 and R = 400 (x 1/3, x 3) are
+  reported as sensitivity only and cannot be adopted from this screen.
+- **Replay switch**: the existing `--taker-reject margin,ioc_model --ioc-model FILE` on top of B1 (users with a
+  margin snapshot are never touched by the model).
+- **Adopt iff** (primary only) the default rule (dev20 contested point > 0 AND lower >= 0; dev-fast contested
+  upper >= 0; dev20 uncontested upper >= -1.0) AND not worse on dev_margin60 (contested paired 95% CI upper >= 0).
+  Engine-only and real-only tx counts reported. Pooled screen (dev20 + dev-fast + dev_margin60) reported for the
+  tournament promotion bar as well.
+
 **NS-1 defaulted 13:14Z (3-hour rule, reversible):** A5 exact oid counting closed; today's resolver stays; next step = trace Yuta's 17 dev_margin60 lost-order cases by removal mechanism (analysis only).
 **NS-2 defaulted 13:23Z (Satya's set default):** A8b waits; Stage 1 script ready, Yuta's dev_margin60 queue cases unopened.
 **Benchmark check 13:24Z:** `scripts.benchmark_postchange` ranks reproduce Yuta's dev_alo10 (1-10) and confirm_alo2 (11-70) lists exactly; 71 qualifying chunks exist; nothing written.
