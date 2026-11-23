@@ -73,6 +73,13 @@ class Engine:
         evict_arrival (off by default): reconcile(known="oldest"|"newest") picks known orders by arrival
         (Order.seq) instead of queue position. Under p_priority the queue head is the highest-p order, not
         the oldest one, so queue order would trim the freshest high-p orders first."""
+        self.docs_t_ms = DOCS_T_MS
+        if isinstance(p_priority, str) and p_priority.startswith(("docs:", "docsall:")):
+            # I01 (tournament, Nov 23): "docs:<ms>" / "docsall:<ms>" = the docs rule with window T = <ms>
+            p_priority, t = p_priority.split(":")
+            self.docs_t_ms = int(t)
+            if self.docs_t_ms < 0:
+                raise ValueError(f"docs window must be >= 0 ms, not {t}")
         if not (p_priority is None or p_priority in ("always", "known", "knownpos", "docs", "docsall")
                 or (isinstance(p_priority, int) and p_priority >= 0)):
             raise ValueError(f"p_priority must be None, 'always', 'known', 'knownpos', 'docs', 'docsall' or ms >= 0, "
@@ -273,9 +280,9 @@ class Engine:
     def _rest(self, order: Order, remaining: int, p: int | None = None) -> None:
         jumps = None
         if self.p_priority is not None and p:
-            t, window, meta = self.block_time_ms, self.p_priority, self.p_meta
+            t, window, meta, docs_t = self.block_time_ms, self.p_priority, self.p_meta, self.docs_t_ms
 
-            def jumps(node, p=p, t=t, window=window, meta=meta):
+            def jumps(node, p=p, t=t, window=window, meta=meta, docs_t=docs_t):
                 m = meta.get(node.order.oid)
                 if window == "always":
                     return p > (m[0] if m else 0)
@@ -284,7 +291,7 @@ class Engine:
                 if window == "knownpos":
                     return m is not None and 0 < m[0] < p
                 if window in ("docs", "docsall"):
-                    return (m is not None and p > m[0] and t - m[1] < DOCS_T_MS
+                    return (m is not None and p > m[0] and t - m[1] < docs_t
                             and (window == "docsall" or (order.tif is Tif.ALO and node.order.tif is Tif.ALO)))
                 return m is not None and m[0] > 0 and p > m[0] and t - m[1] <= window
         if self.p_priority is not None and order.user != PLACEHOLDER and p is not None and (p or self.p_priority in ("known", "knownpos", "docs", "docsall")):

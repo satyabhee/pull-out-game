@@ -113,3 +113,17 @@ def test_docs_alo_only_docsall_any_tif():
     seq = [(0, place("0xa", Side.SELL, 100, 1, tif=Tif.GTC)), (10, place("0xb", Side.SELL, 100, 1, p=3))]
     assert queue(run("docs", seq), 100) == ["0xa", "0xb"]
     assert queue(run("docsall", seq), 100) == ["0xb", "0xa"]
+
+
+def test_docs_window_configurable():
+    # I01: "docs:<ms>" changes only T; docs:400 == docs
+    seq = [(0, place("0xa", Side.SELL, 100, 1)), (350, place("0xb", Side.SELL, 100, 1, p=3))]
+    assert queue(run("docs:400", seq), 100) == queue(run("docs", seq), 100) == ["0xb", "0xa"]
+    assert queue(run("docs:300", seq), 100) == ["0xa", "0xb"]          # 350 ms old: locked under T = 300
+    seq2 = [(0, place("0xa", Side.SELL, 100, 1)), (450, place("0xb", Side.SELL, 100, 1, p=3))]
+    assert queue(run("docs", seq2), 100) == ["0xa", "0xb"]
+    assert queue(run("docs:500", seq2), 100) == ["0xb", "0xa"]
+    assert queue(run("docsall:500", [(0, place("0xa", Side.SELL, 100, 1, tif=Tif.GTC)),
+                                      (450, place("0xb", Side.SELL, 100, 1, p=3))]), 100) == ["0xb", "0xa"]
+    with pytest.raises(ValueError):
+        Engine(p_priority="docs:-1")

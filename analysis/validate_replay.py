@@ -917,7 +917,12 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
 
 
 def _p_priority_arg(v: str):
-    return v if v in ("always", "known", "knownpos", "docs", "docsall") else int(v)
+    if v in ("always", "known", "knownpos", "docs", "docsall"):
+        return v
+    if v.startswith(("docs:", "docsall:")):              # I01: docs rule with another window, e.g. docs:300
+        int(v.split(":")[1])
+        return v
+    return int(v)
 
 
 def replay_kwargs(a) -> dict:

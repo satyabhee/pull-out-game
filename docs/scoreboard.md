@@ -446,6 +446,16 @@ Facts known before writing this: only the 3b results above (model, validation AU
   Engine-only and real-only tx counts reported. Pooled screen (dev20 + dev-fast + dev_margin60) reported for the
   tournament promotion bar as well.
 
+### I01 · docs priority window T (tournament; rule written ~18:30Z, before any run)
+Switch: `--p-priority docs:<ms>` / `docsall:<ms>` (engine_py/matching.py; `docs` = `docs:400` byte-for-byte, test).
+Variants (max 3, fixed now), each replacing B1's `--p-priority docs`: **V1 docs:300**, **V2 docs:500**, **V3 docsall**
+(T 400, every resting tif may be jumped). Screen: each variant vs B1 on dev20 + dev-fast + dev_margin60, pooled
+(`analysis.pooled_paired`, chunk-cluster bootstrap 4000). Every set can act (no data gate).
+**Promote** (DAYTIME_PROTOCOL tournament) iff pooled maker-strict contested point >= +1.0 pt AND lower >= -1.0 pt AND no
+set's contested point < 0; if two or more pass, the best pooled point goes first. Promoted variants go to a fresh
+confirm (list + Holm fixed before that run); only a passing confirm leads to a B1 check and adoption. Python engine for
+the screen (the Rust port of `docs:<ms>` is built only if a variant is promoted).
+
 **NS-1 defaulted 13:14Z (3-hour rule, reversible):** A5 exact oid counting closed; today's resolver stays; next step = trace Yuta's 17 dev_margin60 lost-order cases by removal mechanism (analysis only).
 **NS-2 defaulted 13:23Z (Satya's set default):** A8b waits; Stage 1 script ready, Yuta's dev_margin60 queue cases unopened.
 **Benchmark check 13:24Z:** `scripts.benchmark_postchange` ranks reproduce Yuta's dev_alo10 (1-10) and confirm_alo2 (11-70) lists exactly; 71 qualifying chunks exist; nothing written.

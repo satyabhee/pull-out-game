@@ -1,7 +1,7 @@
 """Reserve the held-out post-change benchmark set (overnight protocol, mahito queue item 4; never replay it).
 
 Qualifying chunk (same filter as Yuta's confirm_alo2 set, prereg_alo_margin Amendment 1/2): complete chunk,
-capture_version "2026-11-23-alo-margin", non-empty alo_margin_users, info_clearinghouseState_errors == 0, no ingest
+capture_version "2026-11-23-alo-margin" (or its superset "2026-11-23-open-margin"), non-empty alo_margin_users, info_clearinghouseState_errors == 0, no ingest
 gap (analysis.validate_chunks.find_chunks). Ordered by start height: 1-10 = dev_alo10, 11-70 = confirm_alo2 (Yuta),
 71 .. 70+N = THIS benchmark (N >= 120, default 120). Writes the list only when all of it exists; reads only
 window.json files (no replay).
@@ -19,6 +19,9 @@ from pathlib import Path
 from analysis.validate_chunks import find_chunks
 
 VERSION = "2026-11-23-alo-margin"
+# open-margin (Yuta, Nov 23 17:52Z) is a strict superset of alo-margin: the replay's inputs are produced exactly as
+# before and v3 output is byte-identical with or without the new files (mail to_mahito #16), so it qualifies too
+VERSIONS = (VERSION, "2026-11-23-open-margin")
 FIRST = 71                      # 1-based rank of the first benchmark chunk among qualifying chunks
 
 
@@ -27,7 +30,7 @@ def qualifying(windows: Path) -> list[Path]:
     out = []
     for c in chunks:
         w = json.load(open(c / "window.json"))
-        if (w.get("capture_version") == VERSION and w.get("alo_margin_users")
+        if (w.get("capture_version") in VERSIONS and w.get("alo_margin_users")
                 and not w.get("info_clearinghouseState_errors", 0)):
             out.append(c)
     return out
