@@ -50,6 +50,7 @@ reported, and the dev-fast clause (upper bound >= 0) still applies.
 | Nov 23 | I01 V1 docs window 300 ms (vs B1, tournament) | `--p-priority docs:300` | I01 rule (ac1d885) | -2.3 [-6.7, +0.0] | | -3.3 [-8.8, +0.0] / -; dm60 -1.1 [-4.0, +1.4]; pooled -1.8 [-4.0, -0.0], uncontested -3.3 [-5.3, -1.4] | **n** (bar) | this session |
 | Nov 23 | I01 V2 docs window 500 ms | `--p-priority docs:500` | I01 rule (ac1d885) | -2.4 [-4.7, -0.4] | | -1.0 [-3.4, +0.0] / -; dm60 -0.6 [-2.3, +0.0]; pooled -1.3 [-2.5, -0.3], uncontested -1.4 [-2.3, -0.6] | **n** (bar) | this session |
 | Nov 23 | I01 V3 docs for any resting tif | `--p-priority docsall` | I01 rule (ac1d885) | +0.0 [0, 0] | | +0.0 / -; dm60 +0.0; pooled +0.0 (changes only warm-up txs: dev20 2, dev-fast none) | **n** (bar: point < +1.0) | this session |
+| Nov 23 | I21 gate spares orders placed after its touch evidence (vs B1, tournament) | `--gate-spare-after` | I21 rule (0272e36) | +2.7 [+0.0, +5.9] | | +4.1 [+0.0, +9.8] / -; dm60 +2.7 [+0.2, +6.4]; **pooled +2.9 [+1.0, +5.1]** (0.527 -> 0.556), uncontested +0.3 [-0.0, +1.0]; engine-only 133 / 208 / 347 -> 133 / 208 / 346 | **promoted** -> fresh confirm (not adopted yet) | this session |
 
 ## Rules written before each item (Nov 23 session)
 
@@ -521,7 +522,28 @@ bar (pooled contested point >= +1.0 pt, lower >= -1.0, no set < 0). dev_margin60
 promotion is only a ticket to the fresh confirm (list + Holm fixed before it); adoption only after a passing confirm,
 then the default rule on B1. Gate counters `spared_after_touch` / `spared_orders` reported.
 
+### Confirm round 1 (tournament): I21 on confirm_alo2_60 (list frozen 22:15Z Nov 23, before any replay of these chunks)
+- **Set:** `~/hl-data/mac3/confirm_alo2_60`, the 60 chunks of `handoff/confirm_alo2_chunks.txt` (qualifying post-change
+  ranks 11-70; frozen by Yuta at 13:18Z for the post-only margin confirm, which was skipped (NS-4), never replayed by
+  either session). The protocol's first fresh set. Used for this one round, then retired to dev.
+- **Ideas in the round (Holm over them):** I21 `--gate-spare-after` only (Yuta's I23 goes to confirm_fast5_60, mail #21),
+  so Holm over 1 = the raw p.
+- **Runs:** B1 (docs/baseline.md flags) and B1 + `--gate-spare-after`, `analysis.validate_chunks`, Python engine, `--jobs 1`,
+  same 60 chunks; one RUN_LOCK hold (< 45 min) or two.
+- **Test:** `analysis.contested_paired` (variant vs B1 base, tx set fixed by the base run), per-tx maker-strict contested,
+  chunk-cluster bootstrap 4000, seed as coded; two-sided p.
+- **Pass** iff contested point estimate > 0 AND Holm p < .05. Uncontested and all-scored reported.
+- **If it passes:** I21 goes to adoption: B1 check by the default rule (screen numbers on dev20 / dev-fast already meet it:
+  dev20 contested +2.7 [+0.0, +5.9], uncontested +1.0 [+0.0, +3.6]; dev-fast contested upper +9.8), Rust parity
+  (byte-identical dev20 + dev-fast with the switch), then B2 = B1 + `--gate-spare-after` in docs/baseline.md.
+- **If it fails:** I21 is not adopted and is not re-tried on this set with a tweak.
+- **Known property of the test, stated before the run:** the coded p is 2 x min(share of bootstrap means <= 0, share >= 0),
+  so resamples whose mean is exactly 0 (chunks where the switch changes no scored tx) count against the effect. With few
+  changed txs this makes p conservative (dev20 screen: lower bound +0.0 but p 0.23). The test is used as coded; no
+  alternative p is computed for the decision.
+
 **NS-1 defaulted 13:14Z (3-hour rule, reversible):** A5 exact oid counting closed; today's resolver stays; next step = trace Yuta's 17 dev_margin60 lost-order cases by removal mechanism (analysis only).
 **NS-2 defaulted 13:23Z (Satya's set default):** A8b waits; Stage 1 script ready, Yuta's dev_margin60 queue cases unopened.
 **Benchmark check 13:24Z:** `scripts.benchmark_postchange` ranks reproduce Yuta's dev_alo10 (1-10) and confirm_alo2 (11-70) lists exactly; 71 qualifying chunks exist; nothing written.
 
+**NS-5 defaulted 21:01Z (3-hour rule, reversible):** A3 closed: the cost-cutoff screen failed and a history-users-only variant is worth ~+0.2 pt at most (below the +1.0 bar); I12b not pre-registered.
