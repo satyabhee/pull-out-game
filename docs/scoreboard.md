@@ -562,3 +562,27 @@ round 1 failed on p with point > 0): same runs and test on confirm_fast5_60, pas
 | R40  | -20.4 [-27.7, -11.5] | -25.0 [-33.6, -17.1] | -6.8 [-18.9, +0.0] | -23.8 [-32.3, -14.0] |
 | R400 | -4.6 [-9.2, +0.0]    | -8.4 [-15.6, -2.7]   | +0.0 [+0.0, +0.0]  | -6.0 [-11.5, +0.0]   |
 No cost ratio helps; agrees with R130 and the closure. handoff/a3c/sensitivity.txt.
+
+### I21 bug-fix-track evaluation (BLITZ Addendum 1.4), written 23:40Z Nov 23, BEFORE the backup confirm result exists
+(confirm2 base finished 23:33Z; variant still running; no confirm_fast5_60 comparison computed). Used only if the
+backup confirm (frozen rule above: point > 0 and p < .025) fails. All five checks must hold:
+1. **Chain behaviour cited.** Mechanism: the ALO gate judged an order with touch evidence older than the order (an
+   order placed in a block later than the touch time cannot have been in the book the touch shows). Chain truth: in
+   the I15 trace (handoff/i15/), ALO-gate evictions were 6 of the 17 dev_margin60 lost-order cases, and in every one the
+   chain later filled the real maker M at p (case definition). Causality argument + that chain truth are the citation.
+2. **Full-visibility sim stays 1.0.** `replay.sim.generate` full-visibility chunks, seeds 0-9 (120 blocks, lead-in 40,
+   as tests/test_sim_generate.py), replayed with (a) the test suite's full-visibility flags, (b) (a) + B1's gate flags
+   (`--alo-gate touch --touch-reconcile --touch-evict ledger --ledger-k 99 --evict-arrival` where the sim supplies the
+   inputs they need), (c) (b) + `--gate-spare-after`: every scored tx strict-matched in (c) and (c) not below (b).
+   If the sim provides no touch feed, (b)/(c) cannot exercise the gate: that is reported and check 2 counts as
+   "not exercised" (= not met) rather than passed.
+3. **Point > 0 on >= 3 sets, none negative:** per-tx maker-strict contested point, B1 vs B1 + switch, on every set with a
+   paired run: dev20, dev-fast, dev_margin60, confirm_alo2_60, confirm_fast5_60 (5 sets). Screen numbers were already
+   seen when this was written (dev20 +2.7, dev-fast +4.1, dev_margin60 +2.7, alo2 +4.1); only fast5 is unseen.
+4. **Uncontested not worse:** pooled per-tx maker-strict uncontested point >= 0 over the same 5 sets
+   (`analysis.pooled_paired`), and no set's uncontested point below -0.5 pt. (dev-fast screen showed -0.0, seen.)
+5. **Flipped txs majority positive:** over the 5 sets' contested txs, count txs whose per-tx maker-strict value rose vs
+   fell; rose > fell.
+Reported next to it (Addendum 1.1): changed chunks and changed contested txs per set.
+If all hold: NEEDS_SATYA entry (reversible, 3-hour default) "bug-fix adoption of I21 as B2", then Rust parity before
+docs/baseline.md changes. If any fails: I21 closed.
