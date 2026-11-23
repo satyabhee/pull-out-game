@@ -342,3 +342,22 @@ is dropped; weights renormalised after every update.
   owner-forked or named pieces whose label at fill time is the real maker / all such fills). No confirm runs. The
   phantom hook overlaps Yuta's A6-feed: whichever passes first becomes the baseline the other is tested on (mailbox).
 
+### Fallback 3a · A4(b) naming precision (Satya, Nov 23; rule written ~10:56Z, before any build or run)
+Runs only while Multiplicity-lite waits (RUN_LOCK) or is blocked. Step 0: port the A4(a) split (`Engine.refill(counts=)`)
+to the Rust engine with parity (Rust = Python on the sim parity tests and on one real chunk with `--placeholder-split`),
+since every A4 adoption needs it.
+Naming = trade-learn `name` on split pieces (A4(b1)), allowed only at a strictness level, using only what is known
+when the name is given (no look-ahead):
+- **N1**: the tx's real trades at w have exactly one distinct maker M.
+- **N2**: N1 AND M's real filled size at w in this tx <= the piece's size when it was seeded (one order of M fits it).
+- **N3**: N2 AND size habit: the piece's seeded size, or M's filled size + the piece's remaining, equals the size of
+  one of M's own placements on that asset in the window so far (exact lots).
+- "Same user later cancels / modifies a matching order" cannot be known when naming, so it is used only as later
+  confirmation: `--named-cancel` (A4(b2): M's unresolvable cancel removes M's one named piece) is added to the chosen
+  level as a second run if that level passes.
+**Choice (dev20 only):** the least strict level whose dev20 naming precision (engine fills on named pieces whose name
+is the real maker at that price / all fills on named pieces) is >= 70%; if none reaches 70%, the strictest (N3).
+**Adopt iff** for the chosen level: dev20 contested point > 0 AND lower >= 0; dev-fast contested upper >= 0; dev20
+uncontested upper >= -1.0; naming precision >= 70% on dev20 AND dev-fast. Baseline: whatever docs/baseline.md says at
+run time (B1 now).
+
