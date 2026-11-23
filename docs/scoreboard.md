@@ -45,6 +45,7 @@ reported, and the dev-fast clause (upper bound >= 0) still applies.
 | Nov 23 | L5-lite Multiplicity-lite (vs B1) | `--multi-lite` | ML rule (c9c595c) + 70% naming bar | +0.5 [+0.0, +1.9] | +3.0 [+0.0, +6.3] | +0.0 [0, 0] / -1.1 [-7.2, +3.4]; naming precision 54% (dev20) / 35% (dev-fast) | **n: naming precision < 70% on both** | this session |
 | Nov 23 | Fallback 3a naming strictness (vs B1) | `--placeholder-split --trade-learn sweep,queue,name --name-strict N1/N2/N3` | 3a rule (d6ca88c) | N1 +0.5 [+0.0, +1.9] (54%); N2 +0.5 [+0.0, +1.9] (53%); N3 +0.0 (names nothing) | N1/N2 +3.0 [+0.0, +6.3]; N3 +0.0 | not run (no level reaches 70% on dev20) | **n: rule picks N3, which has no named fills and no contested gain** | this session |
 | Nov 23 | Fallback 3b A3 ioc_reject classifier (vs B1) | `--taker-reject margin,ioc_model --ioc-model report/validate/a3/model.json` | 3b rule (a751296) | **-54.1 [-66.6, -41.9]** | -67.1 [-77.5, -57.2] | -25.6 [-45.5, -4.7] / -50.0 [-63.4, -37.4]; engine-only 738 -> 73, real-only -> 396 | **n** (dev_margin60 not run) | this session |
+| Nov 23 | A3 / I12 cost-based cutoff R = 130 (vs B1) | `--taker-reject margin,ioc_model --ioc-model report/validate/a3c/model_R130.json` | I12 rule (56f74cc) | **-16.0 [-22.2, -8.0]** | -21.3 [-30.7, -12.9] | -0.7 [-2.1, +0.0] / -22.6 [-31.4, -12.6]; dev_margin60 contested -15.5 [-23.8, -7.9] (n 159); pooled -13.4 [-18.2, -8.5] | **n** | this session |
 
 ## Rules written before each item (Nov 23 session)
 
@@ -424,7 +425,7 @@ Screen: dev20 contested 0.587 -> 0.046, txs we no longer fill (real-only) 18 -> 
 The model ranks well; the cutoff rule (precision on a 99%-negative population) was the wrong target: a skipped
 IOC that really fills costs a scored tx, so the cutoff has to be set on the cost of skipped real fills (NS-3 (b)).
 
-### A3 / I12 · cost-based cutoff for the `ioc_reject` classifier (NS-3 answer, Satya 17:24Z; rule written ~17:55Z, before any new computation)
+### A3 / I12 · cost-based cutoff for the `ioc_reject` classifier (NS-3 answer, Satya 17:24Z; rule committed 17:40Z as 56f74cc, before any new computation)
 Facts known before writing this: only the 3b results above (model, validation AUC, the degenerate 0.28 cutoff and its screens).
 - **Model: unchanged** (fit, features, coefficients of `report/validate/a3/model.json`, commit 179cac8). Only the cutoff rule changes.
 - **Cost ratio, written first: R = 130** = cost of a false skip / cost of a false keep, in scored-tx units.
@@ -446,7 +447,25 @@ Facts known before writing this: only the 3b results above (model, validation AU
   Engine-only and real-only tx counts reported. Pooled screen (dev20 + dev-fast + dev_margin60) reported for the
   tournament promotion bar as well.
 
-### I01 · docs priority window T (tournament; rule written ~18:30Z, before any run)
+### A3 / I12 results (`python -m analysis.a3_ioc_model ~/hl-data/mac3/windows --cost-ratio R --out report/validate/a3c/model_R<R>.json`; screens `report/validate/a3c_*`, logs `handoff/a3c/`)
+Model identical to 179cac8 (fit 22,271 / validation 5,568, same coefficients; only the report-only test period grew
+with new history files). Training side (R = 130): cutoff 0.99237 (c0, cap not binding); validation skips 4,776 of
+5,537 no-fill IOCs and 0 of 31 filled (net 4,776 > 0, so used); test period skips 62 of 3,841 filled (1.6%).
+R = 40 (sensitivity): cap binds, cutoff 0.98968, test 248 / 3,863 filled skipped. R = 400: cutoff 0.99751, 3 / 3,863.
+| set | contested | uncontested |
+|---|---|---|
+| dev20 | -16.0 [-22.2, -8.0] (0.587 -> 0.427) | -21.3 [-30.7, -12.9] |
+| dev-fast | -0.7 [-2.1, +0.0] | -22.6 [-31.4, -12.6] |
+| dev_margin60 (vs B1 run today, `a3c_base_dev_margin60`) | -15.5 [-23.8, -7.9] (0.505 -> 0.350) | -24.9 [-31.7, -18.6] |
+| pooled | -13.4 [-18.2, -8.5] (n 321) | -23.5 [-28.7, -18.9] |
+**Fails** the rule (and the tournament bar). Diagnosis (after the verdict, exploratory): every scored tx we newly lose
+(dev20 90 of 90, dev-fast 28 of 28) has a taker WITHOUT order history, skipped by the global `*` threshold (users
+without history get the global no-fill rate, a 3b design choice); the 21 history users are bots whose IOCs nearly
+never fill, so their rate does not transfer. History users cause only 104 of 518 (dev20) / 44 of 738 (dev-fast) B1
+engine-only txs, worth ~+0.2 pt at B0 -> B1's rate, so a history-users-only variant cannot reach the +1.0 bar (NS-5).
+R = 40 / 400 sensitivity screens: queued after the I01 runs (reported only).
+
+### I01 · docs priority window T (tournament; rule committed 18:05Z as ac1d885, before any run)
 Switch: `--p-priority docs:<ms>` / `docsall:<ms>` (engine_py/matching.py; `docs` = `docs:400` byte-for-byte, test).
 Variants (max 3, fixed now), each replacing B1's `--p-priority docs`: **V1 docs:300**, **V2 docs:500**, **V3 docsall**
 (T 400, every resting tif may be jumped). Screen: each variant vs B1 on dev20 + dev-fast + dev_margin60, pooled
