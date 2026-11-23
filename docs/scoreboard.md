@@ -424,3 +424,5 @@ Screen: dev20 contested 0.587 -> 0.046, txs we no longer fill (real-only) 18 -> 
 The model ranks well; the cutoff rule (precision on a 99%-negative population) was the wrong target: a skipped
 IOC that really fills costs a scored tx, so the cutoff has to be set on the cost of skipped real fills (NS-3 (b)).
 
+**NS-1 defaulted 13:14Z (3-hour rule, reversible):** A5 exact oid counting closed; today's resolver stays; next step = trace Yuta's 17 dev_margin60 lost-order cases by removal mechanism (analysis only).
+
