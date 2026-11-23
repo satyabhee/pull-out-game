@@ -32,7 +32,7 @@ def generate_chunk(cfg: SimConfig, root: Path) -> dict:
     root = Path(root)
     rng = random.Random(cfg.seed)
     sampler = Sampler(cfg, rng)
-    chain = Chain(sampler.accounts)
+    chain = Chain(sampler.accounts, open_order_cap=cfg.open_order_cap)
     chain.burn_before_item = sampler.burn
     h0 = cfg.start_height + cfg.seed * cfg.chunk_spacing_heights
     t0 = cfg.start_time_ms + cfg.seed * cfg.chunk_spacing_ms + 120_000

@@ -7,7 +7,8 @@ Chain rules implemented:
 - Every placed order item takes the next oid from one global counter (rejected items too: historicalOrders lists
   rejected orders with oids). Invisible events can burn oids (`burn_oids`).
 - Order checks, in this order: $10 minimum notional (`minTradeNtlRejected`), reduce-only that cannot reduce
-  (`reduceOnlyRejected`), margin (`perpMarginRejected`), then post-only that would cross (`badAloPxRejected`).
+  (`reduceOnlyRejected`), open-order cap for orders that can rest (`tooManyOpenOrdersRejected`; Hyperliquid's base
+  cap is 1,000), margin (`perpMarginRejected`), then post-only that would cross (`badAloPxRejected`).
 - Post-only priority: at one price, orders placed in the last 400 ms are sorted by priority bid p (higher first,
   ties by arrival); an order older than 400 ms keeps its place ahead of later, higher bids.
 - Takers (IOC, GTC) match best price first, oldest first within a price, at the maker's price. Self-trade: the
@@ -111,10 +112,13 @@ class Trade:
 
 class Chain:
     def __init__(self, accounts: dict[str, Account] | None = None, reduce_only_shrink: str = "leave",
-                 first_oid: int = 1, first_tid: int = 1, min_notional: Decimal = MIN_NOTIONAL):
+                 first_oid: int = 1, first_tid: int = 1, min_notional: Decimal = MIN_NOTIONAL,
+                 open_order_cap: int | None = None):
         self.accounts = accounts or {}
         self.reduce_only_shrink = reduce_only_shrink
         self.min_notional = Decimal(min_notional)
+        self.open_order_cap = open_order_cap                        # resting orders per user (None: no cap)
+        self.open_count: dict[str, int] = {}
         self.open_cloid: dict[tuple, int] = {}                      # (user, asset, cloid) -> resting oid
         self.burn_before_item = None                                # callable -> oids to burn before an item
         self.books = {a: {"B": {}, "A": {}} for a in ASSETS}       # asset -> side -> px -> [Order] (front first)
@@ -181,6 +185,7 @@ class Chain:
                    and o.p > q[i - 1].p):
                 i -= 1
         q.insert(i, o)
+        self.open_count[o.user] = self.open_count.get(o.user, 0) + 1
         if o.cloid is not None:
             self.open_cloid[(o.user, o.asset, o.cloid)] = o.oid
         self.truth.append({"kind": "rested", "oid": o.oid, "queue_pos": i, "level_len": len(q), "height": height})
@@ -188,6 +193,7 @@ class Chain:
     def _unrest(self, o: Order) -> None:
         q = self.books[o.asset][o.side][o.px]
         q.remove(o)
+        self.open_count[o.user] -= 1
         if not q:
             del self.books[o.asset][o.side][o.px]
         if o.cloid is not None and self.open_cloid.get((o.user, o.asset, o.cloid)) == o.oid:
@@ -199,6 +205,7 @@ class Chain:
         o = Order(self._new_oid(), user, asset, side, px, sz, sz, tif, p, t_ms, cloid, reduce_only)
         self.orders[o.oid] = o
         self.books[asset][side].setdefault(px, []).append(o)
+        self.open_count[user] = self.open_count.get(user, 0) + 1
         if cloid is not None:
             self.open_cloid[(user, asset, cloid)] = o.oid
         self.truth.append({"kind": "seeded", "oid": o.oid, "user": user, "asset": asset, "side": side, "px": px,
@@ -258,6 +265,10 @@ class Chain:
             return []
         if o.reduce_only and not self._can_reduce(o.user, o.asset, o.side):
             self._reject(o, "reduceOnlyRejected", height)
+            return []
+        if (self.open_order_cap is not None and o.tif != "Ioc"
+                and self.open_count.get(o.user, 0) >= self.open_order_cap):
+            self._reject(o, "tooManyOpenOrdersRejected", height)
             return []
         grow = 0 if o.reduce_only else self._grows(o.user, o.asset, o.side, o.sz)
         lev = acct.leverage.get(o.asset, MAX_LEVERAGE[o.asset])

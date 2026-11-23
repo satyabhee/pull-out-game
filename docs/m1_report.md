@@ -85,3 +85,33 @@ quoter agent for the post-only margin rate, a per-user open-order cap.
 - Calibration tuning (Q8); parquet truth logs (Q6); the trade-correction finding (Q7).
 - Not modelled: modify / batchModify, scheduleCancel, liquidations / TWAP / triggers, open-interest caps, oracle band
   (D29).
+
+## Update Nov 23 (Satya's Q6-Q9 answers; Q8 calibration done before the m1-transfigure tag)
+
+**Q8 calibration** (`docs/m1_calibration.md`): 3 rounds, r3 is the SimConfig default; 7 of 9 targets within +-25% of
+dev20 (trades per block 1.02x, orders at the touch 0.92x, orders per level 1.02x, |dn| median 1.00x, |dsz|/sz p90
+0.81x, post-only margin rejections 1.02x, open-order cap rejections 1.06x); not met: |dn| p90 0.70x and |dsz|/sz
+median 1.74x. Suites regenerated with r3 (`sim200`: 200 chunks; `fv20`: 20 full-visibility chunks), truth as parquet.
+
+**200-chunk numbers after calibration** (`report/validate/m1c_sim200_cmp`; baseline = the new one, block-end + learn
+evidence tx; paired per-tx maker-strict, chunk-cluster bootstrap 4000):
+
+| scope | before calibration (r0): baseline -> chain rules | after (r3): n txs | baseline | chain rules (class, stp=maker) | diff [95% CI] |
+|---|---|---|---|---|---|
+| contested (union) | 0.376 -> 0.619 | 1,883 | **0.199** | 0.276 | +7.6 [+6.2, +9.2] |
+| contested (real makers) | 0.499 -> 0.771 | 673 | 0.468 | 0.623 | +15.5 [+12.2, +18.9] |
+| uncontested | 0.565 -> 0.587 | 3,235 | 0.328 | 0.328 | +0.0 [-0.3, +0.3] |
+| all scored | 0.481 -> 0.602 | 5,118 | 0.281 | 0.309 | +2.8 [+2.2, +3.4] |
+
+Pooled per-fill strict after calibration: 34.5% (baseline), 37.2% (chain rules). Engine-only share of scored txs:
+sim 14.6% vs real 30.2% (not a calibration target). Reading: with real-like books (12 orders per level, bursty touch,
+fewer takers) the simulated market is now HARDER for the engine than dev20 (contested 0.20 vs ~0.59): fewer trades
+per chunk means each scored tx sits in a deeper, older, more anonymous queue. Which features drive that gap is an
+open question for M2's use of the simulator.
+
+**Full visibility after calibration** (fv20 regenerated): plain engine 1.000 strict (606 / 606 txs); with block-end
+corrections: loose 0.997, tx 1.000.
+
+**Q7** (D33): corrections that use only what each tx shows reach 1.000 on full visibility and change dev20 by +0.04
+[0.00, +0.14] contested, +0.0 uncontested: adopted as the baseline. **Real dev20 switches** (D34, report only): stp=maker
++0.0 (no self-trades), class_sort -6.6 [-10.7, -2.5] contested.

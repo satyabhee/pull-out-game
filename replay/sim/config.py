@@ -1,5 +1,6 @@
 """M1 simulator settings: every sampler and mask parameter in one place (MAHITO_PLAN M1: "every mask parameter
-lives in a config"). Hand-set defaults until M3's profiles exist. Times in ms, prices in ticks, sizes in lots."""
+lives in a config"). Defaults = calibration round r3 against dev20 (Satya Q8; replay/sim/calibration_rounds.py,
+docs/m1_calibration.md). Times in ms, prices in ticks, sizes in lots."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -24,8 +25,8 @@ class SimConfig:
     pre_window_ms: int = 30_000                     # resting orders seeded up to this long before the chunk
 
     # ---- agents
-    n_mm: int = 6
-    mm_levels: int = 4                              # levels quoted per side
+    n_mm: int = 12
+    mm_levels: int = 6                              # levels quoted per side
     mm_sizes: int = 3                               # each MM reuses this many sizes (multiples of maker size)
     mm_requote_prob: float = 0.25                   # per block, a MM cancels and replaces its quotes
     mm_requote_on_move: float = 0.8                 # ... when the mid moved this block
@@ -33,12 +34,21 @@ class SimConfig:
     mm_p_max: int = 200                             # priority bid range for MM post-only orders
     n_bots: int = 4
     bot_broke: int = 1                              # bots with no free margin: their IOCs are rejected
-    bot_ioc_prob: float = 0.20                      # per bot per block
+    bot_ioc_prob: float = 0.04                      # per bot per block
     n_retail: int = 24
-    retail_prob: float = 0.10                       # per retail account per block
+    retail_prob: float = 0.02                       # per retail account per block
     retail_tif: dict = field(default_factory=lambda: {"Gtc": 0.3, "Ioc": 0.4, "Alo": 0.3})
     retail_broke: int = 2                           # retail accounts with no margin (their orders are rejected)
     reduce_only_share: float = 0.05                 # of retail orders
+    n_broke_quoters: int = 2                        # accounts with no margin that keep sending post-only quotes
+    broke_quotes_per_block: float = 1.9             # expected post-only orders per block from them (rejected)
+    n_stackers: int = 1                             # accounts that rest many deep orders and hit the open-order cap
+    stacker_prob: float = 0.2                       # per stacker per block: one more deep post-only order
+    open_order_cap: int = 1000                      # resting orders per user (Hyperliquid's base cap)
+    deep_orders_per_level: int = 10                  # static pre-window orders on each of the 20 levels per side
+    n_flickerers: int = 3                           # fast quoters: each block cancel all and re-place 0..flick_max
+    flick_max: int = 9                              # post-only orders at the touch (bursty joins / leaves)
+    flick_size_max: int = 10                         # their sizes: 1..flick_size_max maker sizes
     taker_sweep_max: int = 3                        # IOC sizes reach up to this many maker sizes
 
     # ---- hidden chain events
@@ -61,10 +71,11 @@ class SimConfig:
 
     @classmethod
     def full_visibility(cls, **kw) -> "SimConfig":
-        """Nothing hidden that the replay cannot see (the M1 property test): no pre-window orders, no margin or
-        reduce-only rejections, no invisible oids, one batch per block, and an anchor (known oid) for every
-        placement, so int-oid cancels are resolvable."""
+        """Nothing hidden that the replay cannot see (the M1 property test): no pre-window orders, no margin,
+        reduce-only or open-order-cap rejections, no invisible oids, one batch per block, and an anchor (known oid)
+        for every placement, so int-oid cancels are resolvable."""
         base = dict(pre_window_ms=0, bot_broke=0, retail_broke=0, reduce_only_share=0.0, batch_cut_prob=0.0,
-                    burn_prob=0.0, anchors_per_chunk=10**9)    # every placement's oid is known
+                    burn_prob=0.0, anchors_per_chunk=10**9,    # every placement's oid is known
+                    n_broke_quoters=0, n_stackers=0)           # their rejections are hidden too
         base.update(kw)
         return cls(**base)

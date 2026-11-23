@@ -190,3 +190,42 @@ and deletes real orders. Python engine behaviour is unchanged (Satya's call, QUE
 **D32. Errored actions are evidence.** In the P5 example the maker's cancel ran after its order filled, so the chain
 rejected the action; the explorer lists it with an error and `data.parse.decode_tx` drops errored txs. An errored
 cancel right after a fill is visible evidence of a batch boundary (useful for M2's `batch_cuts`).
+
+**D33. Trade-correction evidence switch (Satya Q7).** `--learn-evidence loose|tx` (Replay `learn_evidence`; default
+`loose` = unchanged). `tx`: the corrections use only what each tx shows. The queue rule cuts only for makers our
+engine filled LESS than the chain did at that price in that tx; the sweep rule removes only orders that were resting
+before the tx ran (engine seq below the tx's start). Criterion (a), full-visibility sim (fv20, 20 chunks, chain rules):
+plain engine + corrections: loose 95.8% strict, **tx 100.0% (2,904 / 2,904 txs)**, at block end and mid-block alike;
+with the baseline's other heuristics, tx 98.63% = no corrections (the corrections now cost nothing; the remaining
+1.4 points are the other heuristics, outside Q7).
+Adoption rule for criterion (b), written down BEFORE the dev20 paired results were looked at (00:28 UTC):
+adopt `tx` as the baseline iff, on dev20 vs the block-end baseline (paired per-tx maker-strict, chunk-cluster bootstrap
+4000), the 95% CI upper bound is >= 0 for each of contested (union), contested (real makers) and uncontested.
+**Result (Nov 23):** dev20, `tx` vs the block-end baseline (`handoff/q7/levtx.paired.txt`): contested (union)
++0.04 [0.00, +0.14] (n 113), contested (real makers) +0.05 [0.00, +0.17] (n 92), uncontested +0.0 [0.0, 0.0]
+(n 195), all scored +0.02 [0.00, +0.05]. Every CI upper bound >= 0, so by the rule above **`tx` is adopted**:
+`replay.adapter.ENGINE_OPTIONS` now include `--learn-evidence tx`. New dev20 references (Python engine):
+`report/validate/m1_ref_blockend20` (baseline) and `m1_ref_mid20` (correction=midblock); `make checkpoint` uses
+them. Rust on the new baseline is byte-identical to `m1_ref_blockend20` (all CSVs). The CLI default of
+`--learn-evidence` stays `loose`, so old command lines reproduce old numbers.
+
+**D34. stp and order on real dev20 (report only, defaults unchanged).** Paired vs the block-end baseline (corrections
+`loose`, the baseline when these ran; `handoff/q7/switches.paired.txt`):
+
+| maker-strict per tx | contested (union), n 113 | contested (real makers), n 92 | uncontested, n 195 | all scored |
+|---|---|---|---|---|
+| stp=maker | +0.0 [0.0, 0.0] (all CSVs byte-identical) | +0.0 | +0.0 | +0.0 |
+| order=class_sort | **-6.6 [-10.7, -2.5]** | **-8.1 [-13.8, -3.0]** | -1.5 [-4.0, 0.0] | -3.4 [-5.4, -1.4] |
+| both | -6.6 [-10.7, -2.5] | -8.1 [-13.8, -3.0] | -1.5 [-4.0, 0.0] | -3.4 [-5.4, -1.4] |
+
+No scored dev20 tx involves a self-trade, so stp cannot matter there. Class sort (MAHITO_PLAN §1's stated chain
+rule) reproduces the real fills WORSE than proposer order on contested trades. Possible reasons, untested: explorer
+blocks merge several consensus batches (class sort is per batch, Example 8), or the listing already reflects the
+execution order.
+
+**D35. Simulator calibration (Satya Q8).** New mechanisms: an open-order cap in the chain (`tooManyOpenOrdersRejected`,
+resting orders only, cap 1,000 = Hyperliquid's base cap), broke quoters (post-only orders, all margin-rejected),
+a stacker (sits near the cap), a static deep book (10 orders on each of 20 levels), flickering quoters (bursty touch
+liquidity). 3 rounds (the maximum); r3 became the SimConfig default; 7 of 9 targets within +-25% of dev20, 2 not
+(touch order-count change p90 0.70x, median relative size change 1.74x): `docs/m1_calibration.md`.
+`full_visibility()` also switches off the broke quoters and the stacker (their rejections are hidden).

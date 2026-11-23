@@ -30,14 +30,19 @@ class Sampler:
         self.mms = [address(s, "mm", i) for i in range(cfg.n_mm)]
         self.bots = [address(s, "bot", i) for i in range(cfg.n_bots)]
         self.retail = [address(s, "retail", i) for i in range(cfg.n_retail)]
+        self.broke_quoters = [address(s, "brokeq", i) for i in range(cfg.n_broke_quoters)]
+        self.stackers = [address(s, "stacker", i) for i in range(cfg.n_stackers)]
+        self.flickerers = [address(s, "flick", i) for i in range(cfg.n_flickerers)]
+        self.flick_orders: dict[str, list[tuple[int, str]]] = {u: [] for u in self.flickerers}
+        self.deep = [address(s, "deep", i) for i in range(max(1, cfg.deep_orders_per_level))]
         self.mid = {a: m[0] for a, m in cfg.markets.items()}
         self.mm_sizes = {u: [cfg.markets[0][2] * rng.randint(1, 4) for _ in range(cfg.mm_sizes)] for u in self.mms}
         self.mm_p = {u: rng.randint(0, cfg.mm_p_max) for u in self.mms}
         self.mm_orders: dict[str, list[tuple[int, str]]] = {u: [] for u in self.mms}   # (asset, cloid) quoted
         self.cloid_n = 0
-        broke = set(self.bots[:cfg.bot_broke]) | set(self.retail[:cfg.retail_broke])
+        broke = set(self.bots[:cfg.bot_broke]) | set(self.retail[:cfg.retail_broke]) | set(self.broke_quoters)
         self.accounts = {}
-        for u in self.mms + self.bots + self.retail:
+        for u in self.mms + self.bots + self.retail + self.broke_quoters + self.stackers + self.deep + self.flickerers:
             pos = {a: rng.choice([-1, 0, 0, 1]) * cfg.markets[a][2] for a in cfg.markets} if u in self.retail else {}
             self.accounts[u] = Account(free_margin=Decimal(0) if u in broke else Decimal(10**7), position=pos)
 
@@ -73,6 +78,21 @@ class Sampler:
                     chain.seed(u, asset, side, px, sz, t_ms=t0 - self.rng.randint(1, self.cfg.pre_window_ms),
                                p=self.mm_p[u], cloid=c)
                     self.mm_orders[u].append((asset, c))
+        for asset in self.cfg.markets:                          # static deep book: n orders on each of 20 levels
+            step, size = self.cfg.markets[asset][1:]
+            for side in "BA":
+                for k in range(1, 21):
+                    for j in range(self.cfg.deep_orders_per_level):
+                        px = self.mid[asset] + (-1 if side == "B" else 1) * step * (k + self.cfg.mm_levels // 2)
+                        chain.seed(self.deep[j], asset, side, px, size * self.rng.randint(1, 3),
+                                   t_ms=t0 - self.cfg.pre_window_ms)
+        for u in self.stackers:                                 # near the open-order cap before the chunk
+            for k in range(max(0, self.cfg.open_order_cap - 5)):
+                asset = k % len(self.cfg.markets)
+                step, size = self.cfg.markets[asset][1:]
+                side = "B" if k % 2 else "A"
+                px = self.mid[asset] + (-1 if side == "B" else 1) * step * (60 + k // 4 % 200)
+                chain.seed(u, asset, side, px, size, t_ms=t0 - self.cfg.pre_window_ms)
         for u in self.retail:                                   # some deeper anonymous liquidity
             if self.rng.random() < 0.5:
                 asset = self.rng.choice(list(self.cfg.markets))
@@ -122,6 +142,39 @@ class Sampler:
             if rng.random() < cfg.retail_prob:
                 tif = rng.choices(list(cfg.retail_tif), weights=list(cfg.retail_tif.values()))[0]
                 txs.append(self._retail(u, chain, tif))
+        n_broke = 0
+        if self.broke_quoters and cfg.broke_quotes_per_block > 0:  # Poisson-ish: whole part + a coin flip
+            lam = cfg.broke_quotes_per_block
+            n_broke = int(lam) + (1 if rng.random() < lam - int(lam) else 0)
+        for _ in range(n_broke):
+            u = rng.choice(self.broke_quoters)
+            asset = rng.choice(list(cfg.markets))
+            step, size = cfg.markets[asset][1:]
+            side = rng.choice("BA")
+            px = self.mid[asset] + (-1 if side == "B" else 1) * step * rng.randint(1, 3)
+            txs.append(Tx(0, u, "order", [OrderItem(asset, side, px, size, "Alo")]))
+        for u in self.flickerers:                               # bursty touch liquidity
+            if self.flick_orders[u]:
+                txs.append(Tx(0, u, "cancelByCloid", [CancelItem(a, cloid=c) for a, c in self.flick_orders[u]]))
+                self.flick_orders[u] = []
+            items = []
+            for _ in range(rng.randint(0, cfg.flick_max)):
+                asset = rng.choice(list(cfg.markets))
+                step, size = cfg.markets[asset][1:]
+                side = rng.choice("BA")
+                c = self._cloid()
+                items.append(OrderItem(asset, side, self.mid[asset] + (-1 if side == "B" else 1) * step,
+                                       size * rng.randint(1, cfg.flick_size_max), "Alo", cloid=c))
+                self.flick_orders[u].append((asset, c))
+            if items:
+                txs.append(Tx(0, u, "order", items))
+        for u in self.stackers:
+            if rng.random() < cfg.stacker_prob:
+                asset = rng.choice(list(cfg.markets))
+                step, size = cfg.markets[asset][1:]
+                side = rng.choice("BA")
+                px = self.mid[asset] + (-1 if side == "B" else 1) * step * rng.randint(60, 260)
+                txs.append(Tx(0, u, "order", [OrderItem(asset, side, px, size, "Alo")]))
         rng.shuffle(txs)                                        # proposer (arrival) order
         for i, tx in enumerate(txs):
             tx.index = i

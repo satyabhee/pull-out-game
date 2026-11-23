@@ -97,3 +97,13 @@ def test_cancel_by_cloid_and_error_when_nothing_matches():
     ch.run_block(2, 10, [[good]])
     ch.run_block(3, 20, [[bad]])
     assert good.error is None and bad.error and not ch.levels(0, "B")
+
+
+def test_open_order_cap_rejects_resting_orders_only():
+    ch = Chain(min_notional=Decimal(0), open_order_cap=2)
+    ch.run_block(1, 0, [[order("U", "B", 90, 1, "Alo"), order("U", "B", 91, 1, "Alo", idx=1)]])
+    ch.run_block(2, 10, [[order("U", "B", 92, 1, "Alo")]])                   # 3rd resting order: over the cap
+    ch.run_block(3, 20, [[order("M", "A", 95, 1, "Alo")]])
+    ch.run_block(4, 30, [[order("U", "B", 95, 1, "Ioc")]])                   # IOC never rests: no cap check
+    assert ch.orders[3].status == "tooManyOpenOrdersRejected"
+    assert ch.orders[5].status == "filled" and ch.open_count["U"] == 2
