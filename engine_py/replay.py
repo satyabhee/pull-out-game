@@ -281,6 +281,7 @@ class Replay:
                  refill_position: str = "front",
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
                  deep_book: bool = False, deep_lookback_ms: int = 600_000, learn_keep_known: bool = False,
+                 learn_evidence: str = "loose",
                  facts_exclude: tuple = (), use_bbo: bool = True, anchor_drop_kinds: tuple = (),
                  oid_bracket: bool = False, taker_reject: str | None = None,
                  taker_seed=None):
@@ -437,6 +438,16 @@ class Replay:
         self.trade_learn_at = trade_learn_at
         self._name_clip = "name-clip" in self._rules
         self.learn_keep_known = learn_keep_known
+        # trade_learn evidence (Satya Q7, docs/deviations.md D33):
+        #   "loose": the original rules (queue cuts at every real maker's first order; sweep removes every order
+        #            priced better than the tx's real worst fill, as the book stands when the correction runs);
+        #   "tx":    only what the tx itself shows: queue cuts only for makers our engine filled LESS than the chain
+        #            did at that price in that tx; sweep removes only orders that were resting before the tx ran.
+        if learn_evidence not in ("loose", "tx"):
+            raise ValueError(f"unknown learn_evidence {learn_evidence!r}")
+        self.learn_evidence = learn_evidence
+        self._seq_at_tx: dict[str, int] = {}              # this block: engine next_seq when each tx started
+        self._fills_by_hash: dict[str, list] = {}         # this block's engine fills by taker tx hash
         if oid_guard not in OID_GUARDS:
             raise ValueError(f"unknown oid_guard {oid_guard!r}")
         self.oid_guard = oid_guard
@@ -859,6 +870,18 @@ class Replay:
             if level is None:
                 continue
             makers = {t.maker for t in trs if t.px == px}
+            if self.learn_evidence == "tx":
+                real: Counter = Counter()
+                ours: Counter = Counter()
+                for t in trs:
+                    if t.px == px:
+                        real[t.maker] += t.sz
+                for fl in self._fills_by_hash.get(trs[0].hash, ()):
+                    if fl.px == px:
+                        ours[fl.maker_user] += fl.sz
+                makers = {m for m in makers if ours[m] < real[m]}
+                if not makers:
+                    continue                       # our own fills explain every real fill here
             nodes = list(level)
             first_of: dict[str, int] = {}
             for i, nd in enumerate(nodes):
@@ -932,8 +955,12 @@ class Replay:
             w = min(t.px for t in trs) if side is Side.BUY else max(t.px for t in trs)
             if "sweep" in self._rules:
                 better = [px for px in levels.keys() if (px > w if side is Side.BUY else px < w)]
+                before = self._seq_at_tx.get(tx_hash) if self.learn_evidence == "tx" else None
                 for px in better:
                     for nd in list(levels[px]):
+                        if before is not None and nd.order.seq >= before:
+                            self.learn_stats[f"swept_skipped_later:{coin}"] += 1
+                            continue                    # placed after this tx: the tx says nothing about it
                         if self.learn_keep_known and nd.order.user != PLACEHOLDER:
                             self.learn_stats[f"swept_kept_known:{coin}"] += 1
                             continue
@@ -1201,10 +1228,15 @@ class Replay:
         fills: list[Fill] = []
         rejects: list[Reject] = []
         seq = self._sequence(ordered, outside)
+        self._fills_by_hash = {}
+        self._seq_at_tx = {}
         for i, a in enumerate(seq):
+            self._seq_at_tx.setdefault(a.hash, eng.next_seq)
             f, r = self._apply(b, a)
             fills += f
             rejects += r
+            for fl in f:
+                self._fills_by_hash.setdefault(fl.taker_hash, []).append(fl)
             if (self._rules and self.trade_learn_at == "tx" and not isinstance(a, OutsideFill)
                     and (i + 1 == len(seq) or seq[i + 1].hash != a.hash)):
                 self._learn(a.hash)

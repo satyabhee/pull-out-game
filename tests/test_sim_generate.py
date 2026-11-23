@@ -86,3 +86,15 @@ def test_truth_parquet_roundtrip_is_exact(tmp_path):
     write_truth(tmp_path / "t.parquet", recs)
     assert read_truth(tmp_path / "t.parquet") == recs[1:]
     assert read_config(tmp_path / "t.parquet") == {"kind": "config", "seed": 3, "markets": {"0": [1, 2, 3]}}
+
+
+def test_full_visibility_corrections_with_tx_evidence_are_exact(tmp_path):
+    """Q7 (docs/deviations.md D33): trade corrections that use only what each tx shows never remove a real order:
+    with nothing hidden, block-end corrections keep strict recall at exactly 1.0."""
+    cfg = SimConfig.full_visibility(seed=1, n_blocks=120, lead_in=40)
+    generate_chunk(cfg, tmp_path)
+    res, rows = vr.run(tmp_path / "windows" / chunk_name(cfg), tmp_path / "hl_data", "class", quiet=True,
+                       stp="expire_maker", p_priority="docs", oid_facts=True, trade_learn="sweep,queue",
+                       trade_learn_at="block-end", learn_evidence="tx")
+    scored = scored_rows(rows)
+    assert scored and all(r["match_full"] for r in scored)

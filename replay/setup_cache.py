@@ -1,5 +1,7 @@
-"""Per-chunk setup cache (Satya, Q4): the built Replay (decoded blocks, snapshots, oid facts, resolver, touch
-events, seeded engine) saved to disk right after construction, before any block is replayed.
+"""Per-chunk setup cache (Satya, Q4 and Q9): the built Replay (decoded blocks, snapshots, oid facts, resolver, touch
+events, seeded engine) saved to disk right after construction, before any block is replayed, together with the
+recorded inputs scoring reads (analysis/validate_replay.scoring_inputs: real trades, ALO truth). Loading only:
+scoring logic is unchanged, and a cached run's scores are byte-identical (tests/test_setup_cache.py, slow test).
 
 Key = sha256 of four things; any change gives a new key, so a stale entry is never used:
   - chunk:   the chunk folder name, the sha256 of each of its non-block files (window.json, anchors.json, ...) and
@@ -150,18 +152,23 @@ def get_replay(args: tuple, kw: dict, backend: str) -> Replay:
     path = folder / f"{key}.pkl.lz4"
     t = time.perf_counter()
     if path.exists():
-        rp = pickle.loads(lz4.frame.decompress(path.read_bytes()))
+        entry = pickle.loads(lz4.frame.decompress(path.read_bytes()))
         os.utime(path)                                   # most recently used
         stats["hit"] += 1
         stats["load_s"] += time.perf_counter() - t
-        return rp
+        entry["replay"].cached_scoring_inputs = entry["inputs"]
+        return entry["replay"]
     rp = Replay(*args, **kw)
+    # the recorded inputs scoring reads (validate_replay.scoring_inputs): loading only, cached with the Replay
+    from analysis.validate_replay import scoring_inputs
+    inputs = scoring_inputs(rp, args[1], kw.get("oid_facts", False))
     stats["miss"] += 1
     stats["build_s"] += time.perf_counter() - t
     folder.mkdir(parents=True, exist_ok=True)
-    blob = lz4.frame.compress(pickle.dumps(rp, protocol=5))
+    blob = lz4.frame.compress(pickle.dumps({"replay": rp, "inputs": inputs}, protocol=5))
     with tempfile.NamedTemporaryFile(dir=folder, suffix=".tmp", delete=False) as f:
         f.write(blob)
     os.replace(f.name, path)                             # atomic: a reader never sees half a file
     _evict(folder, keep=path)
+    rp.cached_scoring_inputs = inputs
     return rp

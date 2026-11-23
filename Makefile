@@ -29,6 +29,6 @@ M3 ?= $(HOME)/hl-data/mac3
 checkpoint: check
 	RUN_SLOW=1 $(PY) -m pytest -q -p no:cacheprovider tests/test_switch_parity.py
 	$(PY) -m replay.parity $(M3)/dev20 --hl-data $(M3)/hl_data --out report/validate/parity_rust20 \
-		--baseline report/validate/m0_blockend20 --backend rust
+		--baseline report/validate/m1_ref_blockend20 --backend rust
 	$(PY) -m replay.parity $(M3)/dev20 --hl-data $(M3)/hl_data --out report/validate/parity_rust20_mid \
-		--baseline report/validate/m0_base20 --backend rust --correction midblock
+		--baseline report/validate/m1_ref_mid20 --backend rust --correction midblock

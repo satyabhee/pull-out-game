@@ -91,3 +91,21 @@ def test_eviction_keeps_the_cache_under_the_cap(tmp_path, monkeypatch):
         os.utime(p, (i, i))
     sc._evict(tmp_path, keep=tmp_path / "2.pkl.lz4")
     assert sorted(p.name for p in tmp_path.glob("*.pkl.lz4")) == ["2.pkl.lz4"]
+
+
+@needs_data
+@pytest.mark.skipif(os.environ.get("RUN_SLOW") != "1", reason="slow (3 full dev20 runs): set RUN_SLOW=1")
+def test_every_dev20_score_identical_with_and_without_cache(tmp_path, monkeypatch):
+    """Q9: scores are byte-identical without the cache, on a cache miss (build + store) and on a cache hit."""
+    from replay import parity
+    monkeypatch.setenv("BOOK_REPLAY_SETUP_CACHE", str(tmp_path / "cache"))
+    dev20, hl = CHUNK.parent, HL
+    outs = {}
+    for name, extra in (("nocache", ["--no-cache"]), ("miss", []), ("hit", [])):
+        outs[name] = tmp_path / name
+        parity.main([str(dev20), "--hl-data", str(hl), "--out", str(outs[name]),
+                     "--baseline", str(outs["nocache"]), *extra])
+    assert sc.stats["hit"] >= 20
+    assert parity.compare(outs["miss"], outs["nocache"]) == []
+    assert parity.compare(outs["hit"], outs["nocache"]) == []
+    assert len(list(outs["nocache"].glob("*.csv"))) >= 6

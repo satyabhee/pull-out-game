@@ -459,6 +459,21 @@ def book_text(book, side, depth=BOOK_DEPTH) -> str:
 
 # ------------------------------------------------------------------ run
 
+def scoring_inputs(rp, hl_data, oid_facts) -> tuple[dict, dict]:
+    """(real trades by tx hash, ALO truth) for a window: the recorded inputs run() scores against. Loading only;
+    reads the recorder files and the window's decoded blocks, never the replay's changing state."""
+    heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
+    real_by_hash: dict[str, list] = defaultdict(list)
+    for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
+        if tr.hash != ZERO_HASH:
+            real_by_hash[tr.hash].append(tr)
+    alo_truth = load_alo_status(hl_data, heights, rp.t0, rp.t1)
+    if oid_facts:
+        for k, v in stream_order_truth(rp, hl_data).items():
+            alo_truth.setdefault(k, v)                  # a probe answer (orderStatus) wins over the stream
+    return real_by_hash, alo_truth
+
+
 def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
         alo_gate=None, gate_max_age_ms=None, evict_known=None, nearest_ratio=0, reseed=False,
         touch_reconcile=False, touch_n_cap=False, touch_refill=None, keep_known=False, skip_lead_in=False,
@@ -468,7 +483,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         placeholder_queue="ahead", placeholder_cap=None, reseed_keep_known=False, wildcard_pre_reseed_known=False,
         trade_learn=None, trade_learn_at="tx", oid_guard=None, refill_position="front", oid_facts=False,
         name_prewindow=False, named_anon="front", deep_book=False,
-        learn_keep_known=False, facts_exclude=(), use_bbo=True, anchor_drop_kinds=(), oid_bracket=False, p_priority=None,
+        learn_keep_known=False, learn_evidence="loose", facts_exclude=(), use_bbo=True, anchor_drop_kinds=(), oid_bracket=False, p_priority=None,
         evict_arrival=False, taker_reject=None, taker_seed=None):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     # A replay holds millions of long-lived objects (oid facts, books, placed actions); CPython's full collections
@@ -485,17 +500,12 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
                 other_position=other_position, placeholder_ttl_ms=placeholder_ttl_ms,
                 placeholder_queue=placeholder_queue, placeholder_cap=placeholder_cap,
                 reseed_keep_known=reseed_keep_known, trade_learn=trade_learn, trade_learn_at=trade_learn_at, oid_guard=oid_guard, refill_position=refill_position, oid_facts=oid_facts,
-                name_prewindow=name_prewindow and oid_facts, named_anon=named_anon, deep_book=deep_book, learn_keep_known=learn_keep_known, facts_exclude=facts_exclude,
+                name_prewindow=name_prewindow and oid_facts, named_anon=named_anon, deep_book=deep_book, learn_keep_known=learn_keep_known, learn_evidence=learn_evidence, facts_exclude=facts_exclude,
                 use_bbo=use_bbo, anchor_drop_kinds=anchor_drop_kinds, oid_bracket=oid_bracket, taker_reject=taker_reject, taker_seed=_seed_for(taker_seed, window), engine=engine if engine is not None else Engine(stp=stp, p_priority=p_priority, evict_arrival=evict_arrival))
-    heights = range(rp.blocks[0].height, rp.blocks[-1].height + 1)
-    real_by_hash: dict[str, list] = defaultdict(list)
-    for tr in iter_trades(hl_data, COINS, rp.t0, rp.t1):
-        if tr.hash != ZERO_HASH:
-            real_by_hash[tr.hash].append(tr)
-    alo_truth = load_alo_status(hl_data, heights, rp.t0, rp.t1)
-    if oid_facts:
-        for k, v in stream_order_truth(rp, hl_data).items():
-            alo_truth.setdefault(k, v)                  # a probe answer (orderStatus) wins over the stream
+    # Recorded inputs of the scoring (loading only). A Replay from the setup cache carries them already
+    # (replay/setup_cache.py computes them with scoring_inputs at build time).
+    cached = getattr(rp, "cached_scoring_inputs", None)
+    real_by_hash, alo_truth = cached if cached is not None else scoring_inputs(rp, hl_data, oid_facts)
     obs = (observer_cls or ValidateObserver)(real_by_hash, alo_truth)
     obs.wildcard_pre_reseed_known = wildcard_pre_reseed_known
     rp.observer = obs
@@ -885,6 +895,9 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="ignore capture's orderStatus answers for cancel targets (anchors.json kind 'target')")
     ap.add_argument("--learn-keep-known", action="store_true",
                     help="trade_learn's sweep and queue rules remove placeholders only, never an order we saw placed")
+    ap.add_argument("--learn-evidence", choices=("loose", "tx"), default="loose",
+                    help="trade_learn: original rules (loose) or only what each tx shows (tx: queue cuts only for "
+                         "makers our engine under-filled; sweep spares orders placed after the tx; Q7)")
     ap.add_argument("--named-anon", choices=("front", "back"), default="front",
                     help="where the anonymous rest of a level with named pre-window orders queues (default front)")
     ap.add_argument("--wildcard-pre-reseed-known", action="store_true",
@@ -912,7 +925,7 @@ def replay_kwargs(a) -> dict:
                 oid_guard=a.oid_guard, refill_position=a.refill_position,
                 oid_facts=not a.no_resolver and not a.no_oid_facts,
                 name_prewindow=a.name_prewindow, named_anon=a.named_anon,
-                deep_book=a.deep_book, learn_keep_known=a.learn_keep_known,
+                deep_book=a.deep_book, learn_keep_known=a.learn_keep_known, learn_evidence=a.learn_evidence,
                 facts_exclude=tuple(x for x in a.facts_exclude.split(",") if x), use_bbo=not a.no_bbo,
                 anchor_drop_kinds=("target",) if a.no_target_lookups else (), oid_bracket=a.oid_bracket,
                 p_priority=a.p_priority, evict_arrival=a.evict_arrival, taker_reject=a.taker_reject,
@@ -955,6 +968,7 @@ def options_tag(a) -> str:
                     "-anonback" if a.named_anon == "back" else "",
                     "-nodeep" if not a.deep_book else "",
                     "-learnkeep" if a.learn_keep_known else "",
+                    "-levtx" if a.learn_evidence == "tx" else "",
                     f"-fx{a.facts_exclude.replace(',', '+')}" if a.facts_exclude else "",
                     "-nobbo" if a.no_bbo else "",
                     "-notargets" if a.no_target_lookups else "", "-bracket" if a.oid_bracket else "",
