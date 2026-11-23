@@ -118,7 +118,7 @@ def _window_range(window_dir: Path):
     return read_block(files[0][1])["blockTime"], read_block(files[-1][1])["blockTime"]
 
 
-SOURCES = ("fills", "hist", "open", "ws_orders", "ws_fills")
+SOURCES = ("fills", "hist", "open", "ws_orders", "ws_fills", "ws_all")   # ws_all: the bracket's all-coin refs (oids.from_files)
 
 
 def _norm(x) -> str:
