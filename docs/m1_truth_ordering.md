@@ -89,6 +89,10 @@ ran after the taker).
 
 ## 3. Simulator truth ordering
 
+**Superseded by L1 (docs/l1_listing_order.md, Nov 23):** the real explorer lists txs in execution order (class-sorted
+per batch); the candidates below all listed txs in their pre-sort order, so the comparison was between two wrong
+maskings. Kept for the record.
+
 `SimConfig.truth_order` = `class_sort` (default, unchanged) | `proposer`; `batch_cut_prob` = r, the probability
 that a block holds one batch cut (`python -m replay.sim.generate ROOT --truth-order proposer`, `--batch-cut-prob
 0.5`). Each candidate: 200 seeds, r3 calibration otherwise, replayed with the current baseline (log

@@ -495,6 +495,33 @@ def iter_books(hl_data, coin: str, t0_ms: int, t1_ms: int, suffix: str = "") -> 
         yield _snapshot(asset, seen[t])
 
 
+@dataclass(frozen=True)
+class FastBook:
+    """One update of the recorder's 5-level fast book (l2Book, fast=true; from Nov 21 22:56 UTC)."""
+    asset: int
+    time_ms: int                                # the feed's own time (receive times arrive in bursts)
+    bids: tuple[tuple[int, int, int], ...]      # (px ticks, sz lots, order count n), best first, <= 5 levels
+    asks: tuple[tuple[int, int, int], ...]
+
+
+def iter_fast(hl_data, coin: str, t0_ms: int, t1_ms: int) -> Iterator[FastBook]:
+    """5-level fast book updates with t0 <= time <= t1, deduplicated by time, in time order, with order counts."""
+    asset = COIN_TO_ASSET[coin]
+    spec = ASSETS[asset]
+    seen: dict[int, dict] = {}
+    for path in _hour_files(Path(hl_data), f"book_{coin}_fast", t0_ms, t1_ms):
+        for rec in _records(path, t0_ms, t1_ms):
+            d = rec["msg"]["data"]
+            if not d.get("fast"):
+                raise ValueError(f"{path}: book_{coin}_fast record without fast=true at {d.get('time')}")
+            if t0_ms <= d["time"] <= t1_ms:
+                seen[d["time"]] = d
+    conv = lambda lv: tuple((spec.px_to_ticks(x["px"]), spec.sz_to_lots(x["sz"]), int(x["n"])) for x in lv)
+    for t in sorted(seen):
+        d = seen[t]
+        yield FastBook(asset=asset, time_ms=t, bids=conv(d["levels"][0]), asks=conv(d["levels"][1]))
+
+
 NEAREST_RADIUS_MS = 60_000
 
 

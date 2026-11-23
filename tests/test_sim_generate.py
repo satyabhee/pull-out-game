@@ -50,10 +50,12 @@ def test_masked_files_match_truth(tmp_path):
     assert len(trades) == len(fills) == info["trades"] > 0
     assert Counter((t.hash, t.maker, t.px, t.sz) for t in trades) == \
         Counter((f["hash"], f["maker"], f["px"], f["sz"]) for f in fills)
-    placed = {(r["height"], r["tx"], r["item"]): r["oid"] for r in truth if r["kind"] == "placed"}
+    # anchors name a tx by its LISTING position (the explorer lists execution order since L1); truth keys by hash
+    placed = {(r["height"], r["hash"], r["item"]): r["oid"] for r in truth if r["kind"] == "placed"}
+    listed = {b.height: {a.tx_index: a.hash for a in b.actions} for b in blocks}
     anchors = json.loads((window / "anchors.json").read_text())
-    assert len(anchors) == cfg.anchors_per_chunk and all(placed[(a["height"], a["tx"], a["item"])] == a["oid"]
-                                                         for a in anchors)
+    assert len(anchors) == cfg.anchors_per_chunk and all(
+        placed[(a["height"], listed[a["height"]][a["tx"]], a["item"])] == a["oid"] for a in anchors)
     kinds = Counter(r["kind"] for r in truth)
     assert kinds["placed"] == info["orders"] and kinds["block"] == cfg.n_blocks and kinds["burned_oids"] > 0
     statuses = Counter(r["status"] for r in truth if r["kind"] == "order_status")
@@ -110,3 +112,17 @@ def test_truth_study_rule_prefers_closest_difficulty_that_keeps_stats():
     assert ts.choose(real, cands)[0] == "a"
     cands["b"][ts.TARGETS[0]] = 1.0
     assert ts.choose(real, cands)[0] == "b"
+
+
+def test_listing_is_execution_order_class_sorted_per_batch(tmp_path):
+    """L1 (docs/l1_listing_order.md): the explorer lists txs in execution order, so each consensus batch's listing is
+    class-sorted (0 = no GTC/IOC, 1 = cancel, 2 = GTC/IOC) and a block shows at most (batches - 1) class descents."""
+    from analysis.listing_runs import block_classes, descents
+    cfg = SimConfig(seed=4, **SMALL)
+    generate_chunk(cfg, tmp_path)
+    window = tmp_path / "windows" / chunk_name(cfg)
+    truth = read_truth(tmp_path / "truth" / f"{window.name}.parquet")
+    n_batches = {r["height"]: len(r["batches"]) for r in truth if r["kind"] == "block"}
+    for f in window.glob("*.json.gz"):
+        h = int(f.name.split(".")[0])
+        assert descents(block_classes(f)) <= n_batches[h] - 1

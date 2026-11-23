@@ -17,7 +17,10 @@ is not established). dev-fast is reported next to dev20 but does not decide (unt
 
 | date | item | switch | rule | dev20 contested (n 113) | dev20 uncontested (n 195) | dev-fast contested / uncontested | adopted | commit |
 |---|---|---|---|---|---|---|---|---|
-| Nov 23 | B0 baseline | (definition above) | - | 0.587 | 0.713 | (A1) | baseline | 406e25a |
+| Nov 23 | B0 baseline | (definition above) | - | 0.587 | 0.713 | **0.442 (n 50) / 0.694 (n 83)** | baseline | 406e25a |
+| Nov 23 | A0 re-triage | - | analysis only | 59 contested misses classified (below) | | | n/a | this session |
+| Nov 23 | A1 dev-fast | - | analysis only | | | B0 scored (row above); 20 chunks, `docs/devfast_chunks.txt` | n/a | this session |
+| Nov 23 | A2 lead-in 300 / 600 | - | default rule | **not run: no blocks before the 150-block lead-in (QUESTIONS Q10)** | | | n | - |
 
 ## Rules written before each item (Nov 23 session)
 
@@ -57,3 +60,37 @@ baseline's contested / uncontested on it as a B0 row.
 Rule: the default rule, for each length vs B0 (lead-in 150) on dev20. If both pass, adopt the larger point estimate,
 unless the two are within 0.5 points: then the shorter one (cheaper). Runtime cost reported (median of runs,
 ingest running). Status before running: see QUESTIONS.md Q10 (dev20 has no blocks before its 150-block lead-in).
+
+## Results
+
+### A0 (dev20, baseline B0; `python -m analysis.retriage ~/hl-data/mac3/dev20 --hl-data ~/hl-data/mac3/hl_data --audit report/validate/order_audit_dev20 --out report/validate/a0_retriage_dev20`)
+59 contested misses (= the reference run's 59), 2.28 M USD missed notional. Log and examples:
+`handoff/a0/dev20.log`, `handoff/a0/breakdown.txt`, rows `report/validate/a0_retriage_dev20/misses.csv`.
+
+| cause | misses | share of misses | share of missed notional | excl. the one 1.37 M USD tx |
+|---|---|---|---|---|
+| ordering inside a block | 0 | 0% | 0.0% | 0.0% |
+| placeholder maker | 8 | 14% | 16.1% | 40.3% |
+| margin-rejected IOC / ALO we filled | 1 | 2% | **60.1%** | 0.0% |
+| phantom order | 0 | 0% | 0.0% | 0.0% |
+| lost order / wrong cancel target | 14 | 24% | 1.1% | 2.8% |
+| queue order at the right price | 26 | **44%** | 19.3% | **48.4%** |
+| other (M never placed at p in the window, no placeholder fill) | 10 | 17% | 3.4% | 8.5% |
+
+3 examples per cause (block, tx, missed USD; more in breakdown.txt):
+- placeholder: 1227286735 0xe7e56b9b 314k (real maker 0x78dce962 at 62795.0; we filled a placeholder at 62796.0);
+  1227941786 0x6b7b42c9 30k; 1227801425 0x8c4a8801 7k.
+- margin-rejected IOC: 1227973673 0xc82ce3dd 1,370k (a 30-BTC sweep; the real maker 0x721ed8f9's order at 61616.0 was
+  already consumed in our replay by an IOC that printed no trade on chain).
+- lost order: 1227701231 0x10525d7e 9k (2 window orders of 0x2cb56238 at 61519.0, both gone from our book, none
+  filled by us); 1227701227 0x47c42565 6k; 1227701198 0x92827dd8 2k.
+- queue order: 1227701244 0x5a9998a0 291k (real maker 0x0e8836d1 rests at 61507.0 in our book; we filled 0x50d59f4c
+  at 61509.0 first); 1227159780 0x3766f096 50k; 1227159780 0xe609d6c1 34k.
+- other: 1227836325 0xbe3a5439 35k; 1227768212 0x14102769 25k; 1227429869 0x6d11b010 16k.
+
+**Order of A3-A7 by the written rule (share of missed contested notional):** A3 IOC margin (60.1%) > A4 placeholders
+(16.1% + "other" 3.4% = 19.5%) > A5 lost orders (1.1%) > A6 (0%) > A7 (0%, none identified). This ranking rests on
+ONE tx (60% of the notional). Without it: A4 (48.8%) > A5 (2.8%) > A3 (0%). The largest cause by count and by
+notional without the outlier, **queue order at the right price (44% of misses), is not targeted by any A item** in the
+plan (QUESTIONS Q11). L5 gate quantity (placeholder + queue): 35.4% of missed notional (>= 30%), but the plan
+evaluates the gate only after A2-A4 have landed.

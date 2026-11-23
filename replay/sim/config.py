@@ -53,7 +53,9 @@ class SimConfig:
 
     # ---- hidden chain events
     truth_order: str = "class_sort"                 # chain's in-block order: class_sort per batch | proposer
-    batch_cut_prob: float = 0.10                    # a block holds two consensus batches
+    listing: str = "execution"                      # explorer listing: execution order (L1, Nov 23) | proposer
+    batch_cut_prob: float = 1.0                     # a block holds two consensus batches (L1: median 1 class
+                                                    # descent per dev20 block -> 2 batches; was 0.10)
     burn_prob: float = 0.03                         # per placed item, an invisible event burns 1-3 oids
 
     # ---- mask (what the replay sees)

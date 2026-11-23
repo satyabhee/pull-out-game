@@ -237,3 +237,11 @@ sort moves ahead of it (first batch 46%..85% of the block). No misclassified tx 
 `truth_order` (default class_sort, unchanged); by the pre-registered rule the setting closest to real difficulty is
 proposer (baseline contested strict 0.286 vs real 0.587; class r 0.1: 0.199, r 0.5: 0.206). Not adopted as default
 (Satya's call). New reported targets: baseline contested strict, maker concentration (sim 1.5x real).
+
+**D37. The explorer listing is the execution order (L1, Nov 23; docs/l1_listing_order.md).** The class sequence of
+dev20 blocks has 0.6% of a shuffle's runs (median 1 class descent per block): blocks are class-sorted within
+consensus batches and listed in execution order. Replaying the listing (order=proposer, the baseline) therefore is
+per-batch class sort; whole-block class sort is wrong across batch boundaries (the 6 audit blocks: each one-cut range
+holds a real descent). Simulator: truth = class sort per batch, listing written in execution order
+(`SimConfig.listing = "execution"`, new default), one cut per block (`batch_cut_prob` 0.10 -> 1.0). Supersedes the
+truth-ordering pick of D36.

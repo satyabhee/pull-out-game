@@ -35,6 +35,45 @@ the null's (batch boundaries should be rare, not everywhere). Passes if all 6 ar
 proposer, A5 proceeds with listing order; if class sort per batch, oids are assigned in execution (class) order and
 A5 must count in that order.
 
-## Results
+## Results (Nov 23)
 
-(filled in after the run)
+`python -m analysis.listing_runs ~/hl-data/mac3/dev20 --out handoff/l1/dev20_runs.csv` (log `handoff/l1/dev20.log`):
+3,921 blocks with >= 10 txs (median 2,013 txs per block).
+
+| | observed | shuffled null |
+|---|---|---|
+| runs of the class sequence per block (median) | **6** | ~1,000 |
+| rho = runs / null runs: median (p10, p90) | **0.006** (0.002, 0.021) | 1 |
+| class descents per block (median) | **1** | 506 |
+
+Descents per block: 0: 11.3%, 1: 39.1%, 2: 28.9%, 3: 13.0%, 4: 4.8%, 5+: 2.9% (max 10).
+
+**Verdict by the rule: rho_med = 0.006 <= 0.2: the explorer listing is class-sorted within consensus batches, so the
+listing shows the execution order under per-batch class sort.** A block holds a median of 2 visible batches (1
+descent; a boundary where the next batch starts with a class >= the last one's is invisible, so this is a lower
+bound).
+
+**6-block check: 6 / 6 consistent** (`handoff/l1/six_blocks.txt`): every one-cut range from the order audit contains
+1-3 real descents (null expectation 72-1,107), e.g. block 1227317687: range (2537, 5056], descent at 2551; block
+1227701204: (1911, 6510], descents at 1912 and 1916. The batch boundaries the printed trades need are the ones the
+listing shows.
+
+**What this changes.**
+- The two hypotheses of `docs/m1_truth_ordering.md` §1 were not alternatives: replaying the LISTING order already IS
+  per-batch class sort (with the true batch boundaries). That is why proposer order never lost to whole-block class
+  sort, and why whole-block class sort fails exactly where a later batch's cancel gets pulled ahead of an earlier
+  batch's taker. The baseline's order=proposer is the correct execution order; class sort of the whole block is not.
+- **Simulator truth (set by the rule):** class sort per batch, with the explorer listing written in EXECUTION order
+  (`SimConfig.listing = "execution"`, new) and one batch cut in every block (`batch_cut_prob = 1.0`, i.e. 2 batches
+  = median descents + 1). Until now the simulator listed txs in their pre-sort order, which the real explorer never
+  shows: that is what made last session's truth study pick "proposer" (docs/m1_truth_ordering.md §3, superseded).
+- **A5 (exact oid counting):** oids are assigned as orders execute, and the listing is the execution order, so A5
+  can count order items in LISTING order (no re-sorting needed). Caveats for A5's test: invisible batch boundaries
+  do not matter for counting (the listing is still the execution order across them); rejected items and both coins
+  must be checked, as the plan says.
+
+**Simulator under the L1 truth** (sim200 regenerated at `~/hl-data/sim/l1`, fv20 at `~/hl-data/sim/l1_fv`; baseline
+replay `report/validate/l1_sim200_base`, log `handoff/l1/sim200.log`): baseline contested strict **0.262** (n 1,884;
+pooled per-fill strict 37.4%) vs real dev20 0.587. Was 0.199 with the pre-sort listing. Still too hard: L2.
+Simulator tests pass with the new default (35 incl. the full-visibility property test, Rust = Python on all 8 switch
+combinations, and a new test that the listing is class-sorted per batch).

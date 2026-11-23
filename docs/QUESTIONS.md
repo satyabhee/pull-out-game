@@ -127,3 +127,56 @@ files after the Replay is built. Caching them (same key scheme) would likely bri
 block replay. **Options.** (a) Extend the cache to those inputs: a change inside the scoring module's input loading
 (no change to scoring logic), so it needs your OK. (b) Leave scoring untouched (current). **Blocked / done instead.**
 Nothing; the cache covers the built Replay only.
+
+# Plan v2 session questions (Nov 23)
+
+## Q10. A2 (lead-in 300 / 600) needs blocks we do not have. How should we get them?
+
+**Why it matters.** A2 is the only item that could move the baseline tonight. The plan calls it "only a config
+change", but the lead-in is part of each captured chunk: capture.py fetches `LEAD_IN_BLOCKS` (150 since Nov 22
+04:20; 75 before) blocks before the snapshot-aligned span, and nothing else. Measured tonight
+(`handoff/plan_v2/a2_blocked.txt`): 1,149 captured chunks, lead-in 150 (953) or 75 (196), no two chunks adjacent (the
+smallest gap between one chunk's end and the next one's start is 1,386 blocks). So no chunk of dev20 or dev-fast can be
+replayed with 300 or 600 lead-in blocks from data on disk. Fetching the missing blocks now is not possible: they are
+1-5 days old, and the fetcher refuses any block older than 30 min (the explorer's archived-block cap per IP per day
+would otherwise stop the live capture until 00:00 UTC), and the explorer lock belongs to the running capture.
+
+**Options.**
+- (a) Change the live capture to `LEAD_IN_BLOCKS=600` (the env var already exists; it needs a capture restart, a
+  gap of a few seconds in chunk capture only: the recorder keeps running). Each chunk then fetches 810 instead of 210
+  blocks (~12 min instead of ~3 min at ~1.1 blocks/s), so the capture produces ~4x fewer chunks per hour. A 600-block
+  chunk also gives 300 and 150 for free (`--lead-in-keep 300 / 150`), so A2 becomes a PAIRED test on the same
+  scored blocks. ~20 chunks = ~4 h of capture. **Recommended**, but it touches the capture service and costs chunk
+  volume, so it is your call.
+- (b) Alternate: every k-th chunk with 600, the rest 150 (needs a small capture.py change: also your call).
+- (c) Drop A2 for now. The history slope says the gain is small: Nov 20 (older engine, held lead20, pooled
+  strict): 0 blocks 34.5%, 75 blocks 47.6%, 150 blocks 48.4%; the plan's +2.6 is 150 vs 75 on contested.
+
+**Blocked / done instead.** A2's rule is in docs/scoreboard.md; no run, no baseline change. Nothing touched in the
+capture. The new 600-block chunks would also need the dev-fast selection rule re-run on them (a "dev-fast-600" set).
+
+## Q11. A0's ranking hangs on one tx, and the biggest cause has no A item. Which order for A3-A7?
+
+**Why it matters.** The written rule orders A3-A7 by share of missed contested notional. On dev20 one 30-BTC sweep
+(1.37 M USD of 2.28 M) is 60% of all missed notional; it alone puts A3 (IOC margin) first. Without it A3 has 0%.
+By count, 26 of 59 misses (44%; 48% of notional without the outlier) are "queue order at the right price": the real
+maker rests at that price in our book, but our queue fills others first. No A item targets that (A4 splits
+placeholder levels; it does not reorder known orders).
+
+**Options.**
+- (a) Follow the rule literally: A3, A4, A5, A6, A7.
+- (b) Rank by misses (count), which is robust to one tx: A4 (placeholders + pre-window "other": 18 misses) > A5 (14)
+  > A3 (1) > A6 / A7 (0); and add an item for queue order among known orders (e.g. audit priority / evict-arrival /
+  ledger choices on the 26 queue misses). **Recommended**: 44% of misses sit in a cause no item touches, and dev20's
+  small contested set (n 113) makes notional shares fragile.
+- (c) Re-run A0 on dev-fast (50 contested txs) before deciding: cheap (~25 min), more evidence.
+
+**Blocked / done instead.** Nothing started on A3-A7 (out of tonight's scope). A0's counts and examples are in
+docs/scoreboard.md.
+
+## Q12. Commit attribution
+
+A peer session (data-streams) says your rule is no Claude attribution in commits; my session instructions add a
+`Co-Authored-By: Claude` trailer, and commits on mahito so far carry it (incl. d7339e6, plan v2). I have not
+rewritten any history. Options: (a) keep the trailer; (b) drop it from now on (I need it in CLAUDE.md or memory to
+override the session instruction). Your call.

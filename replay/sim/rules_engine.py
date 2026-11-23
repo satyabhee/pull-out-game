@@ -219,11 +219,15 @@ class Chain:
     def run_block(self, height: int, time_ms: int, batches: list[list[Tx]]) -> list[Trade]:
         trades: list[Trade] = []
         for b, batch in enumerate(batches):
-            key = (lambda tx: (tx.klass, tx.index)) if self.order == "class_sort" else (lambda tx: tx.index)
-            for tx in sorted(batch, key=key):
+            for tx in self.exec_order(batch):
                 self.truth.append({"kind": "exec", "height": height, "batch": b, "tx": tx.index, "hash": tx.hash})
                 trades += self._apply(tx, height, time_ms)
         return trades
+
+    def exec_order(self, batch: list[Tx]) -> list[Tx]:
+        """One batch's execution order: class sort (docs) or listing order."""
+        key = (lambda tx: (tx.klass, tx.index)) if self.order == "class_sort" else (lambda tx: tx.index)
+        return sorted(batch, key=key)
 
     def _apply(self, tx: Tx, height: int, time_ms: int) -> list[Trade]:
         trades: list[Trade] = []

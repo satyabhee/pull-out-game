@@ -46,7 +46,7 @@ def generate_chunk(cfg: SimConfig, root: Path) -> dict:
     rec.book(chain, t0 - 1, "sf4")
     next_snap, next_fast = t0 - 1 + cfg.snapshot_every_ms, t0 - 1 + cfg.fast_every_ms
     t = t0
-    placed_items: list[tuple[int, int, int]] = []               # (height, listing index, item) of order items
+    placed_items: list[tuple[int, int, int, int]] = []          # (height, tx index, item, listing position)
     accounts_written = False
     first_t = last_t = None
     n_trades = 0
@@ -63,11 +63,14 @@ def generate_chunk(cfg: SimConfig, root: Path) -> dict:
                             "batches": [[tx.index for tx in batch] for batch in batches]})
         trades = chain.run_block(height, t, batches)
         n_trades += len(trades)
-        listing = sorted(txs, key=lambda tx: tx.index)          # explorer: proposer order, batches merged
+        if cfg.listing == "execution":                          # L1 (Nov 23): the explorer lists execution order
+            listing = [tx for batch in batches for tx in chain.exec_order(batch)]
+        else:                                                   # proposer order, batches merged
+            listing = sorted(txs, key=lambda tx: tx.index)
         mask.write_block(window, height, t, cfg.seed, listing)
-        for tx in listing:
+        for pos, tx in enumerate(listing):
             if tx.kind == "order":
-                placed_items += [(height, tx.index, k) for k in range(len(tx.items))]
+                placed_items += [(height, tx.index, k, pos) for k in range(len(tx.items))]
         rec.add("blocks", t, {"height": height, "blockTime": t, "hash": mask.block_hash(cfg.seed, height),
                               "proposer": mask.PROPOSER, "numTxs": len(txs)})
         rec.trades(trades, t)
@@ -87,7 +90,8 @@ def generate_chunk(cfg: SimConfig, root: Path) -> dict:
     # anchors: a seeded sample of placements whose oid an orderStatus lookup would return
     oid_of = {(r["height"], r["tx"], r["item"]): r["oid"] for r in chain.truth if r["kind"] == "placed"}
     picks = rng.sample(placed_items, min(cfg.anchors_per_chunk, len(placed_items)))
-    anchors = [{"oid": oid_of[p], "height": p[0], "tx": p[1], "item": p[2]} for p in sorted(picks)]
+    anchors = [{"oid": oid_of[p[:3]], "height": p[0], "tx": p[3], "item": p[2]}     # tx = listing position
+               for p in sorted(picks, key=lambda p: (p[0], p[3], p[2]))]
     (window / "anchors.json").write_text(json.dumps(anchors, indent=1))
     meta = {"kind": "chunk", "status": "complete", "sim": True, "seed": cfg.seed,
             "start_height": h0, "end_height": h0 + cfg.n_blocks - 1, "lead_in_blocks": cfg.lead_in,
