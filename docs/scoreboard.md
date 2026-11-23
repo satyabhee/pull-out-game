@@ -280,3 +280,9 @@ least-squares fit of r on item classes (3 dev-fast chunks, gaps <= 40 items) giv
 non-filling BTC/ETH IOC item and -0.06 to -0.16 per modify item (a modify of a missing target takes no id). See
 QUESTIONS Q16.
 
+### Queue item 4 · reserved post-change benchmark (rule fixed Nov 23 ~10:20Z, before the chunks exist)
+`python -m scripts.benchmark_postchange`: qualifying chunks (Yuta's Amendment 1/2 filter) ranked by start height;
+1-10 dev_alo10, 11-70 Yuta's confirm_alo2, **71-190 = the benchmark**, written once to
+`~/book-replay-data/handoff/benchmark_postchange.txt` when all 190 exist (never rewritten, never replayed; Satya
+decides when). At 10:20Z: 21 qualifying chunks (about one per 5 min, so ~14 h to go). Nothing written yet.
+
