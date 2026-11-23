@@ -276,6 +276,7 @@ class Replay:
                  observer: Observer | None = None, engine: Engine | None = None,
                  alo_gate: str | None = None, gate_max_age_ms: int | None = None, gate_spare_after: bool = False,
                  touch_trades_first: bool = False,
+                 oracle_file: str | None = None, oracle: tuple = (),
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
                  keep_known: bool = False, skip_lead_in: bool = False, lead_in_keep: int | None = None,
@@ -556,6 +557,13 @@ class Replay:
         # ALO would cross such an order, evict nothing and let the engine decide (it rejects the ALO as would-cross)
         self.gate_spare_after = gate_spare_after
         self.touch_trades_first = touch_trades_first
+        # ORACLE (look-ahead by design, diagnostic only; engine_py/oracle.py, handoff/ORACLE.md)
+        self.oracle = None
+        if oracle:
+            from engine_py.oracle import Oracle
+            if not oracle_file:
+                raise ValueError("oracle switches need oracle_file")
+            self.oracle = Oracle(oracle_file, Path(window_dir).name, set(oracle))
         self._height_ms: dict[int, int] | None = None
         self.reseed, self.keep_known = reseed, keep_known
         if outside_position not in ("end", "start"):
@@ -1265,14 +1273,56 @@ class Replay:
         st[(name, "ledger_evicted")] += k
         return [(px, sz)]
 
+    def _oracle_before(self, block: Block, action: Action) -> tuple[list[Fill], list[Reject]] | None:
+        """ORACLE (look-ahead by design): the result of an action the oracle decides, or None to apply it normally."""
+        orc, eng = self.oracle, self.engine
+        p = action.new if isinstance(action, Modify) else action
+        if isinstance(p, Place):
+            why = orc.skip_place(action, p.tif is Tif.IOC)
+            if why is None:
+                return None
+            orc.stats[why] += 1
+            self._block = block
+            self.engine.block_time_ms = block.time_ms
+            if isinstance(action, Modify):              # the cancel half still happens
+                meta = dict(user=action.user, block=action.block, tx_index=action.tx_index,
+                            item_index=action.item_index, hash=action.hash, priority=action.priority,
+                            asset=action.asset)
+                cancel = (CancelByCloid(**meta, cloid=action.target) if isinstance(action.target, str)
+                          else Cancel(**meta, oid=action.target))
+                return eng.apply(cancel)
+            if p.tif is Tif.IOC:
+                self._blk_ioc[action.hash] = (action.user, True)
+            return [], []
+        if isinstance(action, Cancel):
+            eoid = orc.cancel_target(action.oid)
+            if eoid is None:
+                return None
+            if any(eoid in bk for bk in eng.books.values()):
+                eng._remove(eoid)
+                orc.stats["oracle_cancel_hit"] += 1
+            else:
+                orc.stats["oracle_cancel_gone"] += 1      # truly targeted order no longer rests here: no-op
+            return [], []
+        return None
+
     def _apply(self, block: Block, action: Action) -> tuple[list[Fill], list[Reject]]:
         self.observer.before_action(self, block, action)
-        if self._hist_rej and isinstance(action, Place) and hist_rejected(self._hist_rej, action, block.time_ms):
+        oracle_ioc_ok = False
+        if self.oracle is not None:
+            out = self._oracle_before(block, action)
+            if out is not None:
+                self.observer.after_action(self, block, action, out[0], out[1], None)
+                return out
+            p = action.new if isinstance(action, Modify) else action
+            oracle_ioc_ok = isinstance(p, Place) and p.tif is Tif.IOC and self.oracle.ioc_known_accepted(action)
+        if (self._hist_rej and not oracle_ioc_ok and isinstance(action, Place)
+                and hist_rejected(self._hist_rej, action, block.time_ms)):
             self.taker_stats[f"skip_hist_{action.tif.name.lower()}"] += 1
             if action.tif is Tif.IOC:
                 self._blk_ioc[action.hash] = (action.user, True)
             return [], []
-        if self.taker_reject and isinstance(action, Place) and action.tif is Tif.IOC:
+        if self.taker_reject and not oracle_ioc_ok and isinstance(action, Place) and action.tif is Tif.IOC:
             skip = self._taker_skip(action)
             if skip:
                 self.taker_stats[skip] += 1
@@ -1299,6 +1349,8 @@ class Replay:
                 q = self.placed[created]
                 self._sizes.setdefault((q.user, q.asset), set()).add(q.sz)
             self.placed_by[created] = action
+            if self.oracle is not None:
+                self.oracle.note_created(action, self.placed[created], created)
             if self.resolver is not None:
                 self.resolver.note(action, created)
             if self.placeholder_queue == "behind":
@@ -1369,6 +1421,11 @@ class Replay:
             self._taker_learn()
         else:
             self._blk_ioc.clear()
+        if self.oracle is not None:
+            for eoid in self.oracle.due_cancels(b.time_ms):
+                if any(eoid in bk for bk in eng.books.values()):
+                    eng._remove(eoid)
+                    self.oracle.stats["oracle_status_cancel"] += 1
         eng.end_block(b.height, b.time_ms)
         if self._ml is not None:
             self._ml.end_block()

@@ -631,3 +631,11 @@ Both become IDEAS rows (I25, I26).
   Reported: changed chunks, contested txs up / down per set, uncontested, gate counters.
 - **After a promotion:** bug-fix track (Addendum 1.4) is the intended route (documented-data fact + sim); its checks will
   be written before they are computed. I25 and I26 are screened separately; their combination only after both.
+
+**Set overlap found (23:58Z Nov 24; fixed in the tool before the I25 / I26 results exist).** dev_margin60 and dev-fast share
+4 chunks (1230748426, 1230805870, 1230864798, 1230924707), so every pooled screen so far counted them twice.
+`analysis.pooled_paired` now pools each distinct chunk once (first set listed wins; shared chunks printed; per-set
+lines unchanged). Corrected I21 screen: pooled contested **+2.7 [+0.8, +4.9]** (n 314, 78 chunks; was +2.9 [+1.0, +5.1]),
+still above the bar; no past promotion decision changes (I01 V1-V3, I23 and A3 failed on per-set or point criteria that
+the duplicates do not flip; to re-check I23: Yuta). Also: **dev20 is a subset of final240** (20 of 240; dev20 ⊂ held67
+⊂ held ⊂ final240), and confirm_margin60 / confirm2_margin60 each share 3 chunks with dev-fast: NS-8.
