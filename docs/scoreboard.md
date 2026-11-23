@@ -547,3 +547,18 @@ then the default rule on B1. Gate counters `spared_after_touch` / `spared_orders
 **Benchmark check 13:24Z:** `scripts.benchmark_postchange` ranks reproduce Yuta's dev_alo10 (1-10) and confirm_alo2 (11-70) lists exactly; 71 qualifying chunks exist; nothing written.
 
 **NS-5 defaulted 21:01Z (3-hour rule, reversible):** A3 closed: the cost-cutoff screen failed and a history-users-only variant is worth ~+0.2 pt at most (below the +1.0 bar); I12b not pre-registered.
+
+**Confirm round 1 result (23:22Z Nov 23): FAIL on p.** confirm_alo2_60, B1 vs B1 + `--gate-spare-after`, per-tx maker-strict
+contested **+4.1 [-0.0, +11.4], p 0.251** (n 125, 41 chunks; 0.562 -> 0.603). Uncontested +1.1 [+0.0, +3.6] p 0.71; all
+scored +2.0 [-0.0, +5.0] p 0.095. Changed txs: 3 contested chunks (+1.0 x4; +1.0, +0.16; one -0.001) and 1 uncontested
+chunk (+1.0 x3). As stated before the run, p is limited by how few chunks the switch touches. Not adopted on round 1;
+no tweak. confirm_alo2_60 retired to dev. Output report/validate/confirm1_{base,i21}, handoff/i21/confirm1_result.txt.
+**Backup confirm triggered** (Yuta's handoff/prereg_i21_second_line_2026-11-23.md, written 22:48Z before this result:
+round 1 failed on p with point > 0): same runs and test on confirm_fast5_60, pass iff point > 0 and p < .025; started 23:22Z.
+
+**A3 sensitivity (reported only, decides nothing; A3 closed by NS-5):** maker-strict vs B1.
+| cost ratio | dev20 contested | dev20 uncontested | dev-fast contested | dev-fast uncontested |
+|---|---|---|---|---|
+| R40  | -20.4 [-27.7, -11.5] | -25.0 [-33.6, -17.1] | -6.8 [-18.9, +0.0] | -23.8 [-32.3, -14.0] |
+| R400 | -4.6 [-9.2, +0.0]    | -8.4 [-15.6, -2.7]   | +0.0 [+0.0, +0.0]  | -6.0 [-11.5, +0.0]   |
+No cost ratio helps; agrees with R130 and the closure. handoff/a3c/sensitivity.txt.
