@@ -20,6 +20,7 @@ import gzip
 import json
 import statistics as st
 import sys
+from collections import Counter
 from pathlib import Path
 
 from engine_py.replay import iter_bbo
@@ -51,7 +52,7 @@ def book_depth_n(root: Path, coin: str, t0: int, t1: int) -> list[float]:
 
 
 def feed_and_trades(root: Path, set_name: str) -> dict:
-    dn, dsz, per_block, touch_n, depth_n = [], [], [], [], []
+    dn, dsz, per_block, touch_n, depth_n, conc = [], [], [], [], [], []
     for c in chunks_of(root, set_name):
         m = json.loads((c / "window.json").read_text())
         t0, t1 = m["first_block_time"], m["last_block_time"]
@@ -68,12 +69,16 @@ def feed_and_trades(root: Path, set_name: str) -> dict:
                             dn.append(abs(b[2] - a[2]))
                             dsz.append(abs(b[1] - a[1]) / max(a[1], 1))
                 prev = cur
-        n_tr = sum(1 for _ in iter_trades(root / "hl_data", ["BTC", "ETH"], t0, t1))
+        makers = Counter(tr.maker for tr in iter_trades(root / "hl_data", ["BTC", "ETH"], t0, t1))
+        n_tr = sum(makers.values())
         per_block.append(n_tr / max(nblocks, 1))
+        if n_tr:
+            conc.append(sum(n for _, n in makers.most_common(5)) / n_tr)
     return {"orders at the touch (median n)": _q(touch_n, .5), "orders per level, 20-level book (median of means)":
             _q(depth_n, .5), "touch |dn| median": _q(dn, .5), "touch |dn| p90": _q(dn, .9),
             "touch |dsz|/sz median": _q(dsz, .5), "touch |dsz|/sz p90": _q(dsz, .9),
             "trades per block (mean of chunks)": st.mean(per_block) if per_block else float("nan"),
+            "maker concentration (top-5 share of fills)": st.mean(conc) if conc else float("nan"),
             "chunks": len(per_block)}
 
 

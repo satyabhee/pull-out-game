@@ -107,3 +107,21 @@ def test_open_order_cap_rejects_resting_orders_only():
     ch.run_block(4, 30, [[order("U", "B", 95, 1, "Ioc")]])                   # IOC never rests: no cap check
     assert ch.orders[3].status == "tooManyOpenOrdersRejected"
     assert ch.orders[5].status == "filled" and ch.open_count["U"] == 2
+
+
+def test_truth_order_proposer_runs_listing_order():
+    """Chain(order="proposer"): the taker listed before the cancel trades with A; class sort cancels first."""
+    def run(order):
+        ch = Chain(min_notional=Decimal(0), order=order)
+        oid_a = ch.seed("A", 0, "A", 100, 1, t_ms=0)
+        txs = [order_tx("T", "B", 100, 1, "Ioc", idx=0, h="t"),
+               Tx(index=1, user="A", kind="cancel", items=[CancelItem(0, oid=oid_a)], hash="c"),
+               order_tx("B", "A", 100, 1, "Alo", idx=2, h="b")]
+        return [t.seller for t in ch.run_block(1, 1000, [txs])]
+    assert run("class_sort") == ["B"]
+    assert run("proposer") == ["A"]
+    with pytest.raises(ValueError):
+        Chain(order="fifo")
+
+
+order_tx = order

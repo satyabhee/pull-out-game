@@ -52,6 +52,7 @@ class SimConfig:
     taker_sweep_max: int = 3                        # IOC sizes reach up to this many maker sizes
 
     # ---- hidden chain events
+    truth_order: str = "class_sort"                 # chain's in-block order: class_sort per batch | proposer
     batch_cut_prob: float = 0.10                    # a block holds two consensus batches
     burn_prob: float = 0.03                         # per placed item, an invisible event burns 1-3 oids
 

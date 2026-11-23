@@ -33,3 +33,15 @@ What each round changed:
 - r3: 3 flickerers, bursts 0..9 orders of 1..10 maker sizes; stacker p 0.2; broke quotes 1.9 per block.
 
 Generation time with r3: 3-5 s per chunk alone (up to 11 s while other jobs ran); budget <= 17.7 s.
+
+## Two more targets (Satya, Nov 23)
+
+Measured on the full 200-chunk suites by `replay/sim/truth_study.py` (log `handoff/order_audit/truth_study.log`):
+
+| target | real (dev20) | sim (r3, class sort, r = 0.1) |
+|---|---|---|
+| baseline contested strict (per-tx maker-strict, contested, current baseline) | 0.587 (n 113) | 0.199 (n 1,883): 0.34x, **out** |
+| maker concentration (share of printed fills whose maker is a chunk's top-5 maker, mean of chunks) | 0.374 | 0.552: 1.48x, **out** |
+
+On 200 chunks r3's 9 statistics stay 7 in band (|dn| p90 6, |dsz|/sz median 0.24: the same two out as on the 30
+calibration chunks). Truth ordering does not close either new gap (docs/m1_truth_ordering.md section 3).

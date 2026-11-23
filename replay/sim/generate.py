@@ -32,7 +32,7 @@ def generate_chunk(cfg: SimConfig, root: Path) -> dict:
     root = Path(root)
     rng = random.Random(cfg.seed)
     sampler = Sampler(cfg, rng)
-    chain = Chain(sampler.accounts, open_order_cap=cfg.open_order_cap)
+    chain = Chain(sampler.accounts, open_order_cap=cfg.open_order_cap, order=cfg.truth_order)
     chain.burn_before_item = sampler.burn
     h0 = cfg.start_height + cfg.seed * cfg.chunk_spacing_heights
     t0 = cfg.start_time_ms + cfg.seed * cfg.chunk_spacing_ms + 120_000
@@ -125,11 +125,15 @@ def main(argv=None) -> int:
     ap.add_argument("--seeds", default="0-199")
     ap.add_argument("--set", default=None)
     ap.add_argument("--full-visibility", action="store_true")
+    ap.add_argument("--truth-order", choices=("class_sort", "proposer"), default=None,
+                    help="the chain's in-block order (default: SimConfig's)")
+    ap.add_argument("--batch-cut-prob", type=float, default=None, help="probability a block holds a batch cut")
     a = ap.parse_args(argv)
+    over = {k: v for k, v in (("truth_order", a.truth_order), ("batch_cut_prob", a.batch_cut_prob)) if v is not None}
     root = Path(a.root).expanduser()
     names = []
     for seed in parse_seeds(a.seeds):
-        cfg = SimConfig.full_visibility(seed=seed) if a.full_visibility else SimConfig(seed=seed)
+        cfg = SimConfig.full_visibility(seed=seed, **over) if a.full_visibility else SimConfig(seed=seed, **over)
         if (root / "windows" / chunk_name(cfg) / "window.json").exists():
             names.append(chunk_name(cfg))                       # reuse the seed instead of storing it twice
             continue

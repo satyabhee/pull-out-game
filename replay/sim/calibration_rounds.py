@@ -23,6 +23,9 @@ TARGETS = ("trades per block (mean of chunks)", "orders at the touch (median n)"
            "orders per level, 20-level book (median of means)", "touch |dn| median", "touch |dn| p90",
            "touch |dsz|/sz median", "touch |dsz|/sz p90", "post-only margin rejection rate", "tooManyOpenOrders rate")
 BAND = 0.25
+# Added Nov 23 (Satya): reported next to the 9, not part of the r0-r3 rounds. The difficulty target needs a replay of
+# the suite (replay/sim/truth_study.py computes both; docs/m1_truth_ordering.md has the values).
+EXTRA_TARGETS = ("baseline contested strict", "maker concentration (top-5 share of fills)")
 
 # Every round lists all the knobs it sets (relative to the untuned M1 values in R0), so the record reproduces even
 # though the SimConfig defaults are now r3.

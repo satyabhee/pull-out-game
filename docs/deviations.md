@@ -229,3 +229,11 @@ a stacker (sits near the cap), a static deep book (10 orders on each of 20 level
 liquidity). 3 rounds (the maximum); r3 became the SimConfig default; 7 of 9 targets within +-25% of dev20, 2 not
 (touch order-count change p90 0.70x, median relative size change 1.74x): `docs/m1_calibration.md`.
 `full_visibility()` also switches off the broke quoters and the stacker (their rejections are hidden).
+
+**D36. Class sort vs proposer, and the simulator's truth ordering (Satya, Nov 23; docs/m1_truth_ordering.md).**
+Real dev20, block by block from the same book: class sort contradicts the printed trades in 6 of 222 scored blocks
+(8 txs), never the reverse; each is repaired by exactly one batch cut between the taker and the maker action class
+sort moves ahead of it (first batch 46%..85% of the block). No misclassified tx kind found. New simulator switch
+`truth_order` (default class_sort, unchanged); by the pre-registered rule the setting closest to real difficulty is
+proposer (baseline contested strict 0.286 vs real 0.587; class r 0.1: 0.199, r 0.5: 0.206). Not adopted as default
+(Satya's call). New reported targets: baseline contested strict, maker concentration (sim 1.5x real).

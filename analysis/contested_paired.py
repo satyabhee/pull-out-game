@@ -61,6 +61,16 @@ def paired(ref, var, keys, boot, seed=11):
             "var": mean([var[k] for k in keys]), "diff": est, "lo": lo, "hi": hi, "p": max(p, 1 / boot)}
 
 
+def contested_strict(variant_dir, chunks_dir) -> tuple[float, int]:
+    """(mean per-tx maker-strict over contested txs, n): the `ref` number main() prints for "per-tx maker-strict |
+    contested" when this variant is the reference."""
+    rows = load(Path(variant_dir))
+    scope = scope_of(rows, Path(chunks_dir), False)
+    vals = per_tx(rows, "matched_notional_full")
+    keys = [k for k, c in scope.items() if c and k in vals]
+    return (sum(vals[k] for k in keys) / len(keys) if keys else float("nan")), len(keys)
+
+
 def holm(ps):
     order = sorted(range(len(ps)), key=lambda i: ps[i])
     adj, running = [0.0] * len(ps), 0.0

@@ -98,3 +98,15 @@ def test_full_visibility_corrections_with_tx_evidence_are_exact(tmp_path):
                        trade_learn_at="block-end", learn_evidence="tx")
     scored = scored_rows(rows)
     assert scored and all(r["match_full"] for r in scored)
+
+
+def test_truth_study_rule_prefers_closest_difficulty_that_keeps_stats():
+    """docs/m1_truth_ordering.md: closest baseline contested strict wins, unless it breaks a statistic in band."""
+    from replay.sim import truth_study as ts
+    real = {k: 1.0 for k in ts.TARGETS} | {ts.HARD: 0.59}
+    ok = {k: 1.0 for k in ts.TARGETS}
+    cands = {ts.DEFAULT: ok | {ts.HARD: 0.20}, "a": ok | {ts.HARD: 0.50}, "b": ok | {ts.HARD: 0.58}}
+    cands["b"][ts.TARGETS[0]] = 2.0                       # closest, but breaks a statistic the default keeps
+    assert ts.choose(real, cands)[0] == "a"
+    cands["b"][ts.TARGETS[0]] = 1.0
+    assert ts.choose(real, cands)[0] == "b"

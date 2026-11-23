@@ -113,7 +113,10 @@ class Trade:
 class Chain:
     def __init__(self, accounts: dict[str, Account] | None = None, reduce_only_shrink: str = "leave",
                  first_oid: int = 1, first_tid: int = 1, min_notional: Decimal = MIN_NOTIONAL,
-                 open_order_cap: int | None = None):
+                 open_order_cap: int | None = None, order: str = "class_sort"):
+        if order not in ("class_sort", "proposer"):
+            raise ValueError(f"order={order!r}: class_sort | proposer")
+        self.order = order                      # truth ordering: class sort per batch (docs) | listing order
         self.accounts = accounts or {}
         self.reduce_only_shrink = reduce_only_shrink
         self.min_notional = Decimal(min_notional)
@@ -216,7 +219,8 @@ class Chain:
     def run_block(self, height: int, time_ms: int, batches: list[list[Tx]]) -> list[Trade]:
         trades: list[Trade] = []
         for b, batch in enumerate(batches):
-            for tx in sorted(batch, key=lambda tx: (tx.klass, tx.index)):
+            key = (lambda tx: (tx.klass, tx.index)) if self.order == "class_sort" else (lambda tx: tx.index)
+            for tx in sorted(batch, key=key):
                 self.truth.append({"kind": "exec", "height": height, "batch": b, "tx": tx.index, "hash": tx.hash})
                 trades += self._apply(tx, height, time_ms)
         return trades
