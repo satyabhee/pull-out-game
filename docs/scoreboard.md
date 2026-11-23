@@ -312,6 +312,29 @@ By the protocol branch Yuta builds A6-feed; whether A8b starts anyway is NS-2 (h
 Q17). Stage 1 script: `~/book-replay-data/handoff/a8b/stage1.sh` (not run). The dev_margin60 queue cases stay unopened
 (Stage 2 test set).
 
+**A8b Stage 1 result (Nov 23 ~19:40Z; NS-2 answered 17:24Z: start).** Inputs on B1: order_audit, A0 retriage, and
+`analysis.a8b_cases` (our queue at p just before each "queue order at the right price" miss), dev20 + dev-fast
+(`report/validate/a8b_cases_b1_{dev20,devfast}.json`; retriage dev20 hit the 2.5 GB guard after writing its output,
+which is byte-identical to B0's, as B0 = B1 on dev20). Yuta's feed-count bucket exists only for dev_margin60 (the
+Stage 2 set), so Stage 1 uses the retriage queue cases only. 37 cases: 6 where E and M are the same user / order (miss
+lies later in the tx), 7 without both E and M at p, **24 with M behind E**. In those 24: M has a LOWER priority bid than
+E in 21 (p-always predicts M first in 2), M was placed later than E in 20 (FIFO by placement predicts M first in 4), E is
+larger than M in 17, all are ALO; E's owners are a few heavy-quoting bots (0xd7d271, 0xfeee94, 0x6e8bc7, 0x50d59f,
+0x1bde1b, ...). "Lower p first" is not a plausible exchange rule; the likelier reading is that those E orders were not
+resting on the chain (phantoms), which Stage 2 can separate because the chain's fills contain only live orders.
+Disclosure: while locating the Stage 2 tool I printed the first 80 characters of the header and two rows of Yuta's
+queue-cases file (column names, chunk, hash prefix); nothing about makers, positions or outcomes.
+**Hypotheses for Stage 2 (written before it runs; at most 3):**
+- **H1 lower p first**: of two live orders at one price, the one with the lower priority bid fills first.
+- **H2 smaller first**: of two live orders at one price, the one with the smaller original size fills first.
+- **H3 FIFO among live orders (phantom reading)**: the earlier-placed order (block, tx, item) fills first. If H3 holds and
+  H1 / H2 do not, the Stage 1 misses are phantom orders ahead of M (A6 territory), not a queue rule.
+Stage 2 test (raw chain data, no engine): on dev_margin60, every pair of consecutive real fills at one price within one
+taker tx by two different makers whose latest placement at that price/side before the tx is in the window (and unique
+in its block); a hypothesis applies to a pair when its key differs between the two orders. Supported iff it predicts the
+chain's order in >= 80% of the pairs it applies to, with >= 30 pairs (as pre-registered). Supported H1 / H2 -> Stage 3
+switch + default rule; H3 alone -> report, no queue switch (hand the phantom evidence to A6 / Yuta).
+
 ### L5-lite · Multiplicity-lite `--multi-lite` (Satya, Nov 23 ~10:40Z: scoped L5; full M2 stays parked). Rule written ~10:55Z, before any build or run
 **What.** Alternatives per price level only (no forking anywhere else), at most 4 per level, at most one open fork per
 level (a second trigger at a level with an open fork is skipped and counted). The engine book always holds the
