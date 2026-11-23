@@ -205,3 +205,22 @@ work needs your call too).
 **Answers (Satya, Nov 23).** Q13: (b), hold `--placeholder-split` until A4(b) exists. Q14: yes, A6 moves to first, but
 rule-based first: data-streams (Yuta) builds a margin gate for post-only placements (`--alo-reject margin`, same rule
 as the IOC margin gate); the alo_reject classifier comes only after, if the rule leaves misses.
+
+# Session 4 questions (Nov 23)
+
+## Q15. A4(b) formally passes but moves nothing contested. Adopt, or hold?
+
+A4(b1) (`--placeholder-split` + trade-learn `name`) vs B1: maker-strict dev20 contested +0.5 [+0.0, +1.9] (one tx),
+uncontested +3.0 [+0.0, +6.3]; dev-fast contested +0.0 [0, 0], uncontested -1.1 [-7.2, +3.4]. (b2) (`--named-cancel`)
+removes 40 / 30 named pieces but changes no scored tx, so it equals (b1). By the rule written before the run, (b1)
+passes (contested lower bound 0 >= 0; dev-fast contested upper bound 0 >= 0), and the tie rule picks (b1).
+Against it: the contested target does not move on either set; named pieces get the right maker only 67% (dev20) /
+46% (dev-fast) of the time they fill; and per-tx recall drops by about what strict gains (a relabelling, see the
+scoreboard). **Options.** (a) Adopt (b1) as B2 (the rule as written). Needs a Rust port first: the Rust parity run fails on every chunk with
+`TypeError: RustEngine.refill() got an unexpected keyword argument 'counts'` (A4(a)'s split exists only in the Python
+engine's refill; replay_core's refill takes no counts). Naming itself is in the Replay layer.
+(b) Hold (b1) and (b2) as switches; A4 stops here, (c) size habits is not built; move on to A6 / A5
+(**recommended**: no contested effect, and a 46% naming hit rate on the newer set is close to a coin flip).
+(c) Change the adoption rule to require a contested gain (lower bound > 0, not >= 0) so no-op-on-contested switches
+cannot pass; that would also have held A4(a).
+

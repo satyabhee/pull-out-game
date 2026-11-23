@@ -22,10 +22,11 @@ Order "proposer" = the explorer listing, which is the execution order (L1, docs/
 | set | contested strict | uncontested strict | reference outputs |
 |---|---|---|---|
 | dev20 | 0.587 (n 113) | 0.713 (n 195) | `report/validate/margin_dev20` (= `m1_ref_blockend20`, byte-identical) |
-| dev-fast | 0.471 (n 50) | 0.728 (n 83) | `report/validate/margin_devfast` |
+| dev-fast | 0.460 (n 49) | 0.731 (n 84) | `report/validate/margin_devfast` |
 
 B0 (before Nov 23, same flags without `--taker-reject margin`): dev20 as above; dev-fast 0.442 / 0.694
-(`report/validate/devfast_b0`). Adoption: docs/scoreboard.md row "B0 + --taker-reject margin".
+(`report/validate/devfast_b0`). The contested set is fixed by the reference run's own engine makers, so B1 defines
+a slightly different dev-fast set (49 / 84) than B0 (50 / 83); on B0's set B1 scores 0.471 / 0.728. Adoption: docs/scoreboard.md row "B0 + --taker-reject margin".
 
 ## Differences from data-streams' FROZEN v2 (handoff/FROZEN_CONFIG.md)
 

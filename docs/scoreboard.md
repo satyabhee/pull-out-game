@@ -27,8 +27,10 @@ contested must not drop (paired 95% CI upper bound >= 0).** The baseline itself 
 | Nov 23 | A2 lead-in 300 / 600 | - | default rule | **not run: no blocks before the 150-block lead-in (QUESTIONS Q10)** | | | n | - |
 | Nov 23 | A8 queue order (26 misses split) | none run | sub-cause rule | no rule-fixable sub-cause supported by the chain's fills (below) | | | n/a | this session |
 | Nov 23 | A4(a) placeholder split | `--placeholder-split` | rule since Nov 23 | +0.0 [0.0, 0.0] (all txs byte-identical) | +0.0 [0.0, 0.0] | +0.0 [0.0, 0.0] / +0.0 [0.0, 0.0] | **n (formally passes; held, QUESTIONS Q13)** | this session |
-| Nov 23 | A4(b), A4(c) | - | - | not built this session (Q13) | | | n | - |
+| Nov 23 | A4(b), A4(c) | - | - | not built in session 3 (Q13); (b) built in session 4 (rows below); (c) not built | | | n | - |
 | Nov 23 | B0 + taker margin gate (data-streams) | `--taker-reject margin` | rule since Nov 23 | +0.0 [0.0, 0.0] (byte-identical: no margin snapshots) | +0.0 [0.0, 0.0] | **+2.9 [+0.0, +8.4] / +3.4 [-1.5, +8.3]** (0.442 -> 0.471 / 0.694 -> 0.728; all scored +3.2 [-0.4, +7.4]; engine-only txs 1633 -> 738) | **y -> B1** (Rust parity: byte-identical, dev20 + dev-fast) | this session |
+| Nov 23 | A4(b1) name pieces from trades (vs B1) | `--placeholder-split --trade-learn sweep,queue,name` | rule since Nov 23 | +0.5 [+0.0, +1.9] | +3.0 [+0.0, +6.3] | +0.0 [0.0, 0.0] / -1.1 [-7.2, +3.4] (B1 set: n 49 / 84) | **n: formally passes; held for Satya (QUESTIONS Q15)** | this session |
+| Nov 23 | A4(b2) + name from cancels (vs B1) | (b1) + `--named-cancel` | rule since Nov 23 | identical to (b1) on every tx | identical | identical | n (same as b1; Q15) | this session |
 
 ## Rules written before each item (Nov 23 session)
 
@@ -180,3 +182,22 @@ Works as built (one dev20 chunk: 78 -> 781 placeholder orders after 3 blocks) bu
 dev-fast (txs.csv byte-identical): nothing in B0 acts on individual placeholder orders (takers eat a level's
 front placeholders in order whatever the piece boundaries; scoring treats placeholder fills as anonymous; the touch
 ledger skips placeholders). It can only matter together with (b) naming or (d) count-based eviction of pieces.
+
+### A4(b) (vs B1; outputs `report/validate/a4b{1,2}_{dev20,devfast}`, pairs `a4b_cmp_*`, logs `handoff/a4b/`)
+Maker-strict (the scoreboard metric) in the row above. The pre-registered PRIMARY metric of contested_paired, per-tx
+recall, moves the other way: dev20 contested -0.5 [-1.9, 0.0], uncontested -3.4 [-6.9, 0.0]; dev-fast uncontested
+-3.5 [-9.9, 0.0]. Cause (checked on dev20 tx 0x291196be9e): recall credits a fill against an anonymous placeholder as
+a wildcard; once the piece is named, the fill carries a maker, and recall scores only makers placed in the window, so the
+same fill flips from recall-credit to strict-credit. Same fills, re-labelled.
+
+Counters (`python -m analysis.a4b_counters <set> --hl-data ... <B1 flags> --placeholder-split --trade-learn sweep,queue,name --named-cancel`):
+
+| set | pieces named | engine fills on named pieces | of which real maker at that price | named pieces removed by owner's cancel (b2) |
+|---|---|---|---|---|
+| dev20 | 91 (BTC 48, ETH 43) | 107 | 72 (67%) | 40 (no scored tx changed) |
+| dev-fast | 60 (BTC 38, ETH 22) | 110 | 51 (46%) | 30 (no scored tx changed) |
+
+Both parts formally pass the rule (dev20 contested lower bound 0.0; dev-fast contested unchanged). Held, not adopted:
+QUESTIONS Q15. Rust parity: not available (replay_core's refill has no per-level counts; every chunk fails with a
+TypeError), so adoption would need that port first.
+
