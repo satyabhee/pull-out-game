@@ -425,4 +425,6 @@ The model ranks well; the cutoff rule (precision on a 99%-negative population) w
 IOC that really fills costs a scored tx, so the cutoff has to be set on the cost of skipped real fills (NS-3 (b)).
 
 **NS-1 defaulted 13:14Z (3-hour rule, reversible):** A5 exact oid counting closed; today's resolver stays; next step = trace Yuta's 17 dev_margin60 lost-order cases by removal mechanism (analysis only).
+**NS-2 defaulted 13:23Z (Satya's set default):** A8b waits; Stage 1 script ready, Yuta's dev_margin60 queue cases unopened.
+**Benchmark check 13:24Z:** `scripts.benchmark_postchange` ranks reproduce Yuta's dev_alo10 (1-10) and confirm_alo2 (11-70) lists exactly; 71 qualifying chunks exist; nothing written.
 

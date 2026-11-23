@@ -249,4 +249,5 @@ Stage 1 now; (b) wait for Yuta's A6-feed result, then run A8b on the misses that
 Q16 is NS-1.
 
 **Q16 defaulted (NS-1, 13:14Z, 3-hour rule):** (a) close exact counting; trace the 17 lost-order cases next session.
+**Q17 defaulted (NS-2, 13:23Z):** A8b waits (Satya's set default); mahito's recommendation is now (a) start.
 
