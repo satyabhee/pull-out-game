@@ -586,3 +586,36 @@ backup confirm (frozen rule above: point > 0 and p < .025) fails. All five check
 Reported next to it (Addendum 1.1): changed chunks and changed contested txs per set.
 If all hold: NEEDS_SATYA entry (reversible, 3-hour default) "bug-fix adoption of I21 as B2", then Rust parity before
 docs/baseline.md changes. If any fails: I21 closed.
+
+**Backup confirm result (23:44Z Nov 23): FAIL.** confirm_fast5_60, B1 vs B1 + `--gate-spare-after`: contested **+1.7
+[+0.0, +5.7], p 0.735** (n 115, 40 chunks; 0.268 -> 0.285); uncontested +0.3, all scored +0.6. Changed: 1 contested
+chunk (2 txs up, 0 down). confirm_fast5_60 retired to dev.
+
+**I21 bug-fix-track evaluation (checks written at 23:39Z, above), 23:44Z:**
+| check | result | met |
+|---|---|---|
+| 1 chain behaviour cited | causality + I15 chain truth (6 gate evictions of orders the chain later filled) | yes |
+| 2 full-visibility sim 1.0 | (a) doc flags 394/394; (b) + B1 gate flags **391/394**; (c) + switch 391/394, identical to (b): `spared_after_touch` never fires in the sim (switch not exercised) | **no** |
+| 3 point > 0 on >= 3 of 5 sets, none < 0 | dev20 +2.7, dev-fast +4.1, dev_margin60 +2.7, alo2 +4.1, fast5 +1.7 | yes |
+| 4 uncontested not worse | pooled +0.5 [-0.0, +1.1] (n 1290); worst set dev-fast -0.01 | yes |
+| 5 flipped contested txs majority up | 19 up vs 2 down (12 changed chunks over 5 sets) | yes |
+**I21 is CLOSED** under the rule as written (check 2 fails). Pooled over the 5 sets: contested +2.9 [+1.1, +5.0]
+(n 561, 162 chunks). Re-opening it (e.g. a sim scenario that exercises the switch) would change a rule after its
+results were seen: asked as NS-6, not defaultable. Files: handoff/i21/confirm2_result.txt, bugfix_pooled.txt,
+bugfix_flips.txt, sim_check.log (`analysis.sim_switch_check`).
+
+**Sim finding (lane item 3), 23:44Z:** with nothing hidden, the bare `--alo-gate touch` loses 3 of 394 scored txs (seed 4) and
+rejects 92 ALOs the exact engine admits (`reject_engine_would_admit`); B1 loses one more (seed 2) that
+`--stp expire_maker` recovers (the chain's documented self-trade rule, docs/deviations.md D5; B1 uses cancel_taker).
+Both become IDEAS rows (I25, I26).
+
+### I26: self-trade cancels the resting order (`--stp expire_maker`), pre-registered 23:46Z Nov 23 (before any I26 run on real data)
+- **Mechanism / citation:** docs/deviations.md D5 (plan §1: the chain cancels the RESTING order and keeps matching;
+  Example 6 passes only with stp=maker). B1 uses cancel_taker. Full-visibility sim: B1 390 / 394, B1 + switch 391 / 394.
+- **Screen (BLITZ / tournament):** B1 vs B1 + `--stp expire_maker`, dev20 + dev-fast + dev_margin60 (B1 references
+  margin_dev20, margin_devfast, a3c_base_dev_margin60), `analysis.pooled_paired`. Promote iff pooled contested point
+  >= +1.0, lower >= -1.0, no acting set < 0 (a set where nothing changes is inert). One variant.
+- **Reported (Addendum 1.1):** changed chunks, changed contested txs (up / down) per set; uncontested; engine-only.
+- **After a promotion:** confirm per Addendum 1 (sign test on flipped contested txs, min evidence 10 flips or 8 changed
+  chunks, written before the first look), or the bug-fix track (its checks written before computing them). Check 2
+  (sim 1.0 under all combos) cannot pass until the touch gate's sim shortfall (I25) is fixed.
