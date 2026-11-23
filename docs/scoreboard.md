@@ -41,6 +41,7 @@ reported, and the dev-fast clause (upper bound >= 0) still applies.
 | Nov 23 | B0 + taker margin gate (data-streams) | `--taker-reject margin` | rule since Nov 23 | +0.0 [0.0, 0.0] (byte-identical: no margin snapshots) | +0.0 [0.0, 0.0] | **+2.9 [+0.0, +8.4] / +3.4 [-1.5, +8.3]** (0.442 -> 0.471 / 0.694 -> 0.728; all scored +3.2 [-0.4, +7.4]; engine-only txs 1633 -> 738) | **y -> B1** (Rust parity: byte-identical, dev20 + dev-fast) | this session |
 | Nov 23 | A4(b1) name pieces from trades (vs B1) | `--placeholder-split --trade-learn sweep,queue,name` | rule since Nov 23 | +0.5 [+0.0, +1.9] | +3.0 [+0.0, +6.3] | +0.0 [0.0, 0.0] / -1.1 [-7.2, +3.4] (B1 set: n 49 / 84) | **n: formally passes; held for Satya (QUESTIONS Q15)** | this session |
 | Nov 23 | A4(b2) + name from cancels (vs B1) | (b1) + `--named-cancel` | rule since Nov 23 | identical to (b1) on every tx | identical | identical | n (same as b1; Q15) | this session |
+| Nov 23 | A5 Part 1 oid counting test | - | A5 rule (ce533a8) | **no scope holds**: best = V0 same block, 89.1% of 312,162 pairs r = 0 (bar 99%) | | | n/a: Part 2 (resolver) not built, per the rule | this session |
 
 ## Rules written before each item (Nov 23 session)
 
@@ -257,4 +258,25 @@ Counters (`python -m analysis.a4b_counters <set> --hl-data ... <B1 flags> --plac
 Both parts formally pass the rule (dev20 contested lower bound 0.0; dev-fast contested unchanged). Held, not adopted:
 QUESTIONS Q15. Rust parity: not available (replay_core's refill has no per-level counts; every chunk fails with a
 TypeError), so adoption would need that port first.
+
+### A5 Part 1 (dev20 + dev-fast, 40 chunks; `python -m analysis.a5_oid_count ~/hl-data/mac3/dev20 ~/hl-data/mac3/devfast --hl-data ~/hl-data/mac3/hl_data --out report/validate/a5_count/count.json`, log `handoff/a5/count.log`)
+6,968,481 order items (28,108 in errored txs, 7,559 trigger items). 319,105 truth points located (anchors.json 6,140,
+oid facts 193,627, recorder user_orders on every coin 294,730; 6 dropped as not monotone).
+
+| variant | same block (312,162 pairs) | 1 boundary (5,475) | 2-5 boundaries (1,428) |
+|---|---|---|---|
+| V0 rule B | **89.1%** r = 0 (r > 0: 28,153; r < 0: 5,912) | 25.1% | 22.6% |
+| V1 + errored items | 88.6% (r < 0 rises to 8,046: errored items take no id) | 24.5% | 21.8% |
+| V2 - trigger items | 88.9% | 21.6% | 19.1% |
+
+V0 same-block residuals: -1: 4,428 · +1: 13,984 · +2: 3,620 · >= +10: 4,878. Pairs with r = 0 span on average 9 order
+txs; pairs with r > 0 span 105: ids the blocks do not show appear INSIDE blocks at a steady rate (roughly one per
+few hundred order items), plus more at block boundaries (25% r = 0 across one boundary). **Verdict (rule): counting
+holds in no scope; no resolver built.** Today's interpolation + oid-bracket resolver stays.
+
+Exploratory only (looked at after the verdict; not pre-registered, decides nothing): on one dev-fast chunk all 118
+pairs inside ONE tx had r = 0 (items of a tx take consecutive ids; data/oids.py joint_tx already uses this); a
+least-squares fit of r on item classes (3 dev-fast chunks, gaps <= 40 items) gives about +0.15 extra ids per
+non-filling BTC/ETH IOC item and -0.06 to -0.16 per modify item (a modify of a missing target takes no id). See
+QUESTIONS Q16.
 

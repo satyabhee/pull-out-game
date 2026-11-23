@@ -230,3 +230,15 @@ also need naming precision >= 70% on dev20 and dev-fast. Ownership: mahito owns 
 Yuta sizes unresolved-cancel misses on dev_margin60 and sends cases; A6 (post-only margin gate) is Yuta's, not mahito's.
 Data-gated rule tightened (overnight instructions): where the switch cannot act, byte-identical OR every differing tx
 traced to a case where its data exists, plus contested not worse; and a passing pre-registered confirm where it can.
+
+## Q16. A5: exact oid counting fails (89% same-block). Follow up, or close A5?
+
+The pre-registered test found no scope where every order item takes the next oid (best: 89.1% of same-block pairs;
+bar 99%), so no resolver was built. Ids the blocks don't show appear inside blocks, about one per few hundred items.
+Exploratory hints (after the verdict): ids are consecutive within one tx; non-filling IOCs seem to take extra ids
+(+0.15 each) and modifies of missing targets none. **Options.** (a) Close A5; keep today's resolver (**recommended**:
+A0 put "lost order / wrong cancel target" at 1.1% of missed contested notional, and a probabilistic count is what the
+interpolation resolver already does). (b) Pre-register a corrected count (IOC / modify weights fitted on dev20,
+tested on dev-fast) as a better interpolation prior, then rerun the resolver's held-out check. (c) Wait for Yuta's
+unmatched-cancel cases from dev_margin60 and decide from them whether cancel matching is worth more work.
+
