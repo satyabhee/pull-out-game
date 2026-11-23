@@ -280,9 +280,25 @@ least-squares fit of r on item classes (3 dev-fast chunks, gaps <= 40 items) giv
 non-filling BTC/ETH IOC item and -0.06 to -0.16 per modify item (a modify of a missing target takes no id). See
 QUESTIONS Q16.
 
-### Queue item 4 · reserved post-change benchmark (rule fixed Nov 23 ~10:20Z, before the chunks exist)
+### Queue item 4 · reserved post-change benchmark (rule fixed Nov 23 ~10:13Z, before the chunks exist)
 `python -m scripts.benchmark_postchange`: qualifying chunks (Yuta's Amendment 1/2 filter) ranked by start height;
 1-10 dev_alo10, 11-70 Yuta's confirm_alo2, **71-190 = the benchmark**, written once to
 `~/book-replay-data/handoff/benchmark_postchange.txt` when all 190 exist (never rewritten, never replayed; Satya
-decides when). At 10:20Z: 21 qualifying chunks (about one per 5 min, so ~14 h to go). Nothing written yet.
+decides when). At 10:13Z: 21 qualifying chunks (about one per 5 min, so ~14 h to go). Nothing written yet.
+
+### A8b · Queue order among REAL orders: pre-registration (Nov 23 ~10:20Z; activates only if Yuta's phantom-vs-queue
+### result says queue priority is the main cause, protocol queue item 3; nothing run yet)
+Two stages, so no hypothesis is tested on the data that suggested it.
+- **Stage 1 (form, dev20 + dev-fast under B1).** Cases: contested misses whose A0 cause is "queue order at the right
+  price" (A0 retriage rerun on B1) PLUS any A8 "price" / "older order" case that Yuta's feed-count bucket puts in
+  "ours == n" (our order count at that level equals the feed's n just before the tx). For each case record, for E (our
+  first filled order) and M (the chain's): placement block / listing position / time, priority p, tif, whether placed
+  by modify / batchModify, size, same user as the taker, reduce-only, and how many of our orders at that level the
+  chain's fills skipped. Hypotheses = candidate queue rules that reproduce M-before-E in at least 2/3 of the cases they
+  apply to; at most 3, written into this section before Stage 2.
+- **Stage 2 (test, chain fills, no engine).** Each hypothesis is checked on the chain's own consecutive fills at one
+  price (as analysis/same_block_queue.py) on Yuta's dev_margin60 cases and chunks, which mahito has not looked at:
+  supported iff it predicts the chain's order in >= 80% of the pairs it applies to, with >= 30 pairs.
+- **Stage 3.** Each supported rule goes behind a switch; default adoption rule (dev20 contested point > 0, lower
+  >= 0, dev-fast upper >= 0; uncontested upper >= -1.0). If no hypothesis survives Stage 1 or 2: report, build nothing.
 
