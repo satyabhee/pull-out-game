@@ -120,7 +120,8 @@ def config_fingerprint(args: tuple, kw: dict, backend: str) -> str:
     eng = kw["engine"]
     cfg = {"policy": f"{policy.__module__}.{policy.__qualname__}", "backend": backend,
            "engine": {"type": type(eng).__name__, "stp": eng.stp, "p_priority": eng.p_priority,
-                      "evict_arrival": eng.evict_arrival, "check_every_action": eng.check_every_action},
+                      "evict_arrival": eng.evict_arrival, "check_every_action": eng.check_every_action,
+                      **({"docs_t_ms": eng.docs_t_ms} if getattr(eng, "docs_t_ms", 400) != 400 else {})},
            "options": {k: _plain(v) for k, v in sorted(kw.items()) if k != "engine"}}
     return _sha(json.dumps(cfg, sort_keys=True).encode())
 

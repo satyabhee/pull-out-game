@@ -268,7 +268,7 @@ class Replay:
     def __init__(self, window_dir, hl_data, policy: Policy, *, anchors=None, use_resolver: bool = True,
                  nearest_ratio: int = 0, check_permutation: bool = True, hasher: Hasher | None = None,
                  observer: Observer | None = None, engine: Engine | None = None,
-                 alo_gate: str | None = None, gate_max_age_ms: int | None = None,
+                 alo_gate: str | None = None, gate_max_age_ms: int | None = None, gate_spare_after: bool = False,
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
                  keep_known: bool = False, skip_lead_in: bool = False, lead_in_keep: int | None = None,
@@ -545,6 +545,10 @@ class Replay:
         if alo_gate not in (None, "touch"):
             raise ValueError(f"unknown alo_gate {alo_gate!r}")
         self.alo_gate, self.gate_max_age_ms, self.reconcile_known = alo_gate, gate_max_age_ms, reconcile_known
+        # I21 (tournament, Nov 23): the gate's touch evidence cannot disprove an order placed after it; if an admitted
+        # ALO would cross such an order, evict nothing and let the engine decide (it rejects the ALO as would-cross)
+        self.gate_spare_after = gate_spare_after
+        self._height_ms: dict[int, int] | None = None
         self.reseed, self.keep_known = reseed, keep_known
         if outside_position not in ("end", "start"):
             raise ValueError(f"unknown outside_position {outside_position!r}")
@@ -1117,6 +1121,7 @@ class Replay:
         if age is None or (self.gate_max_age_ms is not None and age > self.gate_max_age_ms):
             self.gate_stats["abstain"] += 1
             return None
+        self._touch_ms = block.time_ms - age
         crosses = (ask is not None and p.px >= ask) if p.side is Side.BUY else (bid is not None and p.px <= bid)
         return not crosses
 
@@ -1153,6 +1158,15 @@ class Replay:
                 if not Engine._crosses(p.side, p.px, lv.px):
                     break
                 victims += [(nd.order.oid, nd.remaining) for nd in lv]
+            if self.gate_spare_after:
+                if self._height_ms is None:
+                    self._height_ms = {b.height: b.time_ms for b in self.blocks}
+                newer = [nd.order.oid for lv in book.levels(p.side.opposite) if Engine._crosses(p.side, p.px, lv.px)
+                         for nd in lv if self._height_ms.get(nd.order.block, -1) > self._touch_ms]
+                if newer:
+                    self.gate_stats["spared_after_touch"] += 1
+                    self.gate_stats["spared_orders"] += len(newer)
+                    return eng.apply(action)
             for oid, q in victims:
                 eng.evict(oid)
                 self.gate_stats["evicted_orders"] += 1

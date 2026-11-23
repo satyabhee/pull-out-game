@@ -163,6 +163,8 @@ def main(argv=None) -> int:
                     (r.get("removed") is None or r["removed"]["block"] is None or r["removed"]["block"] <= blk)]
             # the owner's own cancel by cloid is exact (the chain removed that order too): it cannot explain the
             # loss; the case is labelled by the other removals of M's orders at p
+            for o in mine:
+                o.setdefault("removed", None)
             suspects = [o for o in mine if not (o["removed"] and o["removed"]["own"]
                                                and o["removed"]["by"].startswith("cancel by cloid"))]
             label = (" + ".join(sorted({o["removed"]["by"] if o["removed"] else "still resting" for o in suspects}))

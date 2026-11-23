@@ -46,6 +46,7 @@ reported, and the dev-fast clause (upper bound >= 0) still applies.
 | Nov 23 | Fallback 3a naming strictness (vs B1) | `--placeholder-split --trade-learn sweep,queue,name --name-strict N1/N2/N3` | 3a rule (d6ca88c) | N1 +0.5 [+0.0, +1.9] (54%); N2 +0.5 [+0.0, +1.9] (53%); N3 +0.0 (names nothing) | N1/N2 +3.0 [+0.0, +6.3]; N3 +0.0 | not run (no level reaches 70% on dev20) | **n: rule picks N3, which has no named fills and no contested gain** | this session |
 | Nov 23 | Fallback 3b A3 ioc_reject classifier (vs B1) | `--taker-reject margin,ioc_model --ioc-model report/validate/a3/model.json` | 3b rule (a751296) | **-54.1 [-66.6, -41.9]** | -67.1 [-77.5, -57.2] | -25.6 [-45.5, -4.7] / -50.0 [-63.4, -37.4]; engine-only 738 -> 73, real-only -> 396 | **n** (dev_margin60 not run) | this session |
 | Nov 23 | A3 / I12 cost-based cutoff R = 130 (vs B1) | `--taker-reject margin,ioc_model --ioc-model report/validate/a3c/model_R130.json` | I12 rule (56f74cc) | **-16.0 [-22.2, -8.0]** | -21.3 [-30.7, -12.9] | -0.7 [-2.1, +0.0] / -22.6 [-31.4, -12.6]; dev_margin60 contested -15.5 [-23.8, -7.9] (n 159); pooled -13.4 [-18.2, -8.5] | **n** | this session |
+| Nov 23 | A8b queue order among real orders (Stage 1 + 2) | none | A8b rule (536b57a) + H1-H3 (ad3bf32) | no hypothesis supported on dm60 chain fills (H1 16%, H2 58%, H3 78.8%; bar 80%) | | | n (nothing built) | this session |
 
 ## Rules written before each item (Nov 23 session)
 
@@ -335,6 +336,14 @@ in its block); a hypothesis applies to a pair when its key differs between the t
 chain's order in >= 80% of the pairs it applies to, with >= 30 pairs (as pre-registered). Supported H1 / H2 -> Stage 3
 switch + default rule; H3 alone -> report, no queue switch (hand the phantom evidence to A6 / Yuta).
 
+**A8b Stage 2 result (19:37Z; `python -m analysis.a8b_stage2 ~/hl-data/mac3/dev_margin60 --hl-data ~/hl-data/mac3/hl_data`,
+`report/validate/a8b_stage2_dm60.json`; rules committed 19:34Z as ad3bf32):** 915 usable pairs of consecutive chain fills
+(1,160 skipped: placement unknown or ambiguous). H1 lower p first: right in 71 of 443 (16.0%); H2 smaller first: 521 of
+900 (57.9%); H3 FIFO: 721 of 915 (78.8%). **None reaches 80%: A8b builds nothing (Stage 3 not entered).** Exploratory, not
+a result: on live orders the HIGHER-p order fills first in 84% of the H1 pairs, the reverse of the Stage 1 misses, which
+fits the phantom reading (the high-p bot orders we keep ahead of M were not resting on the chain); handed to Yuta (phantom
+ideas). Slip: this raw-data scan peaked at 1.2 GB without RUN_LOCK, overlapping mahito's own I15 hold.
+
 ### L5-lite · Multiplicity-lite `--multi-lite` (Satya, Nov 23 ~10:40Z: scoped L5; full M2 stays parked). Rule written ~10:55Z, before any build or run
 **What.** Alternatives per price level only (no forking anywhere else), at most 4 per level, at most one open fork per
 level (a second trigger at a level with an open fork is skipped and counted). The engine book always holds the
@@ -497,6 +506,17 @@ Variants (max 3, fixed now), each replacing B1's `--p-priority docs`: **V1 docs:
 set's contested point < 0; if two or more pass, the best pooled point goes first. Promoted variants go to a fresh
 confirm (list + Holm fixed before that run); only a passing confirm leads to a B1 check and adoption. Python engine for
 the screen (the Rust port of `docs:<ms>` is built only if a variant is promoted).
+
+### I21 · ALO gate spares orders placed after its touch evidence (tournament; rule written before any screen)
+Origin: I15 trace (dev_margin60): in all 6 gate-eviction lost-order cases, the touch (bbo) the gate used is 66-133 ms
+older than the evicted order's placement. Switch `--gate-spare-after` (engine_py/replay.py, default off): when an
+admitted ALO would cross at least one resting order whose placement block time is after the touch evidence time, the
+gate evicts nothing and the engine applies the ALO (it is rejected as would-cross). One variant only.
+Smoke (dev_margin60 chunk 1230886851, the case where it was found): the evicted order now rests at the case blocks.
+**Screen** vs B1 on dev20 + dev-fast + dev_margin60, pooled (`analysis.pooled_paired`). **Promote** iff the tournament
+bar (pooled contested point >= +1.0 pt, lower >= -1.0, no set < 0). dev_margin60 is where the idea came from, so a
+promotion is only a ticket to the fresh confirm (list + Holm fixed before it); adoption only after a passing confirm,
+then the default rule on B1. Gate counters `spared_after_touch` / `spared_orders` reported.
 
 **NS-1 defaulted 13:14Z (3-hour rule, reversible):** A5 exact oid counting closed; today's resolver stays; next step = trace Yuta's 17 dev_margin60 lost-order cases by removal mechanism (analysis only).
 **NS-2 defaulted 13:23Z (Satya's set default):** A8b waits; Stage 1 script ready, Yuta's dev_margin60 queue cases unopened.
