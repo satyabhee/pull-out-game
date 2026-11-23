@@ -173,6 +173,30 @@ def load_alo_status(hl_data, heights: range | None = None, t0_ms: int | None = N
     return out
 
 
+def suspect_status_truth(window_dir) -> dict[tuple[int, str, int], dict]:
+    """Truth from the chunk's suspect_status.json (collect/capture.py SUSPECT_LOOKUPS: orderStatus by cloid of
+    suspect makers' post-only placements, with placed_height / tx / item), in load_alo_status's form, plus
+    "source": "suspect_status". MEASUREMENT ONLY (confusion table), never the engine. Missing file: {}."""
+    path = Path(window_dir) / "suspect_status.json"
+    if not path.exists():
+        return {}
+    out = {}
+    for r in json.load(open(path)):
+        bp = Path(window_dir) / f"{r['placed_height']}.json.gz"
+        if not bp.exists():
+            continue
+        with gzip.open(bp, "rt") as f:
+            b = json.load(f)
+        txs = b.get("blockDetails", b)["txs"]
+        if r["tx"] >= len(txs):
+            continue
+        ans = r.get("answer", {})
+        out[(r["placed_height"], txs[r["tx"]]["hash"], r["item"])] = {
+            "truth": alo_truth_class(ans), "source": "suspect_status",
+            "status": ans.get("order", {}).get("status", ans.get("status")) if isinstance(ans, dict) else None}
+    return out
+
+
 def stream_order_truth(rp, hl_data) -> dict[tuple[int, str, int], dict]:
     """Truth for placements of users the recorder tracked (orderUpdates: user_orders.jsonl), in load_alo_status's
     form. Each Place / Modify of the window joins its order's statuses by (user, asset, cloid), else by (user,
@@ -496,6 +520,8 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
     if oid_facts:
         for k, v in stream_order_truth(rp, hl_data).items():
             alo_truth.setdefault(k, v)                  # a probe answer (orderStatus) wins over the stream
+    for k, v in suspect_status_truth(rp.window_dir).items():
+        alo_truth.setdefault(k, v)                      # capture SUSPECT_LOOKUPS answers (orderStatus by cloid)
     obs = (observer_cls or ValidateObserver)(real_by_hash, alo_truth)
     obs.wildcard_pre_reseed_known = wildcard_pre_reseed_known
     rp.observer = obs
