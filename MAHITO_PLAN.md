@@ -52,9 +52,10 @@ Real engine on `mahito`, Rust backend, block-end correction, `--p-priority docs`
 6. **Budget:** each A item should take at most one session to get a first measured result. If it doesn't, write what's blocking it in `docs/QUESTIONS.md` and move on.
 
 ### Accuracy track (A), in priority order
+**Order since Nov 23 (Satya, from A0 ranked by miss count): A8 > A4 > A5 > A3 > A6 > A7; A2 deferred.**
 - **A0 · Re-triage (do first).** Classify every contested miss on the current baseline by cause: placeholder maker, margin-rejected IOC or ALO we filled, lost order / wrong cancel target, queue order at the right price, phantom order (we hold, chain doesn't), ordering inside a block, other. Report counts, share of missed notional, and 3 examples per cause. This replaces the old 135-miss breakdown and **sets the order of A2–A7**: work on the biggest causes first.
 - **A1 · dev-fast set.** Build a new development set (~20 chunks) from windows recorded after Nov 21 22:56 UTC, so it has the 5-level `l2Book fast` feed and no ingest gaps. Add a loader for that feed. Score the baseline on it. From then on, report dev-fast next to dev20 for every A item. (dev20 still decides adoption, until the user says otherwise.)
-- **A2 · Lead-in length.** Try 300 and 600 blocks (150 beat 75 by +2.6). This is only a config change. Watch the runtime cost.
+- **A2 · Lead-in length.** Try 300 and 600 blocks (150 beat 75 by +2.6). This is only a config change. Watch the runtime cost. **Deferred (Nov 23):** chunks hold only their captured 150-block lead-in; longer ones need a capture change (QUESTIONS Q10), not made for now.
 - **A3 · IOC margin classifier (P2).** The first piece of M3 · Polymorphic, trained on **real** labels. Train `ioc_reject` on the de-duplicated order histories (time-based split, calibrated, leakage test, as in M3). In replay: if the predicted rejection probability is ≥ a cutoff chosen on training days, skip the IOC. This replaces the `learn` rule's first-IOC leak. Report engine-only trades too (213 before).
 - **A4 · Placeholder owners (lightweight P1).**
   - (a) Split each snapshot level into its `n` orders using the feed's count changes, as P1's logic does, but keep only the single most likely queue (no particle filter).
@@ -64,13 +65,14 @@ Real engine on `mahito`, Rust backend, block-end correction, `--p-priority docs`
 - **A5 · Exact oid counting (P3).** If L1 confirms that the listing is execution order, oids may be countable exactly between anchors (P3's follow-up question). Test whether every order item takes the next oid (rejected orders, triggers, both coins) and use counting in place of interpolation where it holds.
 - **A6 · Margin-rejected post-only orders (P4).** Train the `alo_reject` classifier, the same way as A3. On dev-fast, use deeper levels to remove post-only orders that never rested.
 - **A7 · Silent reduce-only cancels (P6).** Small. Only if A0 shows it's worth any points.
+- **A8 · Queue order among known orders.** (Added Nov 23; A0's largest cause by count: 26 of 59 contested misses.) The real maker rests at the right price in our book but our queue fills others first. Split the misses into sub-causes (modify semantics, where post-snapshot named orders sit vs placeholders, the 400 ms / priority window, placement order within a block, partial fills), check each against the chain's real fills, and put a fix for each supported one behind a switch.
 
 ### Lab track (L), each item tied to what it unblocks
 - **L1 · Is the listing execution order?** (Unblocks A5 and the simulator's truth ordering; it's also IE 498's key premise.) Count runs of the class sequence per block vs a shuffled null, with the decision rule written down first. Check whether the 6 conflicting blocks' run boundaries fall inside their one-cut ranges. Then set the simulator truth to per-batch class sort with a measured batch rate, or to proposer, by the rule.
 - **L2 · Simulator difficulty.** (Unblocks M2 tuning.) Add maker concentration and baseline contested strict as calibration targets, and calibrate toward dev20 and dev-fast. Stop after 3 rounds and report.
 - **L3 · Arrival-order source.** (Unblocks the IE 498 counterfactual.) List any captured data with per-tx arrival times or mempool data. Don't build anything.
 - **L4 · Minimal M4 ordering probe.** (Unblocks IE 498 and confirms L1 directly.) The testnet experiment: a cancel and an IOC in the same block, in both listing orders. Only with the user's testnet keys and OK.
-- **L5 · M2 · Multiplicity, gated.** Build M2 only if A0 shows that misses needing several hypotheses at once (ambiguous queue splits, ambiguous cancel targets) are **≥ 30% of missed contested notional** after A2–A4 have landed. Otherwise M2 waits until after the semester.
+- **L5 · M2 · Multiplicity, gated.** Build M2 only if A0 shows that misses needing several hypotheses at once (ambiguous queue splits, ambiguous cancel targets) are **≥ 30% of missed contested notional** (Nov 23: count only misses caused by real ambiguity, not queue-order misses among known orders) after A2–A4 have landed. Otherwise M2 waits until after the semester.
 
 ### What happened to the original milestones
 - M2 → **L5**, gated on A0.

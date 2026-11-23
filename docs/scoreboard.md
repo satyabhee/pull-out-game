@@ -13,6 +13,10 @@ that block; `analysis/contested.py`). CIs: paired, chunk-cluster bootstrap 4000 
 lower bound is >= 0 AND the uncontested diff's 95% CI upper bound is >= -1.0 point (i.e. a drop of more than 1 point
 is not established). dev-fast is reported next to dev20 but does not decide (until Satya says otherwise).
 
+**Adoption rule since Nov 23 (Satya; written before any A8 / A4 run): pass the dev20 rule above AND dev-fast
+contested must not drop (paired 95% CI upper bound >= 0).** The baseline itself is defined in `docs/baseline.md`
+(checked before every A run; both sessions read it).
+
 ## Attempts
 
 | date | item | switch | rule | dev20 contested (n 113) | dev20 uncontested (n 195) | dev-fast contested / uncontested | adopted | commit |
