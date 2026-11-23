@@ -42,6 +42,7 @@ reported, and the dev-fast clause (upper bound >= 0) still applies.
 | Nov 23 | A4(b1) name pieces from trades (vs B1) | `--placeholder-split --trade-learn sweep,queue,name` | rule since Nov 23 | +0.5 [+0.0, +1.9] | +3.0 [+0.0, +6.3] | +0.0 [0.0, 0.0] / -1.1 [-7.2, +3.4] (B1 set: n 49 / 84) | **n: formally passes; held for Satya (QUESTIONS Q15)** | this session |
 | Nov 23 | A4(b2) + name from cancels (vs B1) | (b1) + `--named-cancel` | rule since Nov 23 | identical to (b1) on every tx | identical | identical | n (same as b1; Q15) | this session |
 | Nov 23 | A5 Part 1 oid counting test | - | A5 rule (ce533a8) | **no scope holds**: best = V0 same block, 89.1% of 312,162 pairs r = 0 (bar 99%) | | | n/a: Part 2 (resolver) not built, per the rule | this session |
+| Nov 23 | L5-lite Multiplicity-lite (vs B1) | `--multi-lite` | ML rule (c9c595c) + 70% naming bar | +0.5 [+0.0, +1.9] | +3.0 [+0.0, +6.3] | +0.0 [0, 0] / -1.1 [-7.2, +3.4]; naming precision 54% (dev20) / 35% (dev-fast) | **n: naming precision < 70% on both** | this session |
 
 ## Rules written before each item (Nov 23 session)
 
@@ -382,4 +383,20 @@ rejections). Every dev / hold-out set starts at or after Nov 19 15:22 UTC (dev20
 - **Adopt iff** the default rule (dev20 contested point > 0 AND lower >= 0; dev-fast contested upper >= 0; dev20
   uncontested upper >= -1.0) AND not worse on dev_margin60 (contested paired CI upper >= 0). Engine-only txs reported
   (dev-fast B1: 738).
+
+### Multiplicity-lite results (vs B1; `python -m analysis.named_screen <set> --hl-data ... <B1 flags> --multi-lite --out report/validate/ml_on_<set>`, logs `handoff/ml/`)
+Tests before the screen: unit 8/8; full-visibility sim property test exact with the switch on (reseed on, no fork
+fires: nothing is hidden); Rust = Python with the switch on, 3 calibrated-sim chunks; switch off = B1 byte-identical
+on dev-fast (5 CSVs, today's code). Calibrated sim, 40 chunks (`analysis.ml_sim_truth`, `report/validate/ml_sim/truth40.json`):
+phantom collapses pick the truth 149 / 156 (by owner's cancel 131 / 132, by the next trade 6 / 10, gone 12 / 14;
+only 7 of 333 forks had a truly rejected candidate; 177 still open at chunk end); owner collapses 184 / 184, but that
+check cannot tell candidates apart (every candidate also had a seeded order there), so it means little.
+
+| set | contested | uncontested | phantom forks (rewrites) | owner forks | fills on named pieces (right maker) |
+|---|---|---|---|---|---|
+| dev20 | +0.5 [+0.0, +1.9] | +3.0 [+0.0, +6.3] | 397 (56) | 9 | 136 (74 = 54%) |
+| dev-fast | +0.0 [0, 0] | -1.1 [-7.2, +3.4] | 259 (12) | 11 | 148 (52 = 35%) |
+
+The scored change equals A4(b1)'s to the third decimal: the phantom forks close mostly on owners' cancels (E2) and
+rewrite few levels, so the effect is the naming, and the naming is wrong about half the time. Not adopted.
 
