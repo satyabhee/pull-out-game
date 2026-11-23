@@ -53,6 +53,7 @@ Real engine on `mahito`, Rust backend, block-end correction, `--p-priority docs`
 
 ### Accuracy track (A), in priority order
 **Order since Nov 23 (Satya, from A0 ranked by miss count): A8 > A4 > A5 > A3 > A6 > A7; A2 deferred.**
+**Update Nov 23 (Q14): A6 first, rule-based (data-streams' `--alo-reject margin`); classifier only if misses remain.**
 - **A0 · Re-triage (do first).** Classify every contested miss on the current baseline by cause: placeholder maker, margin-rejected IOC or ALO we filled, lost order / wrong cancel target, queue order at the right price, phantom order (we hold, chain doesn't), ordering inside a block, other. Report counts, share of missed notional, and 3 examples per cause. This replaces the old 135-miss breakdown and **sets the order of A2–A7**: work on the biggest causes first.
 - **A1 · dev-fast set.** Build a new development set (~20 chunks) from windows recorded after Nov 21 22:56 UTC, so it has the 5-level `l2Book fast` feed and no ingest gaps. Add a loader for that feed. Score the baseline on it. From then on, report dev-fast next to dev20 for every A item. (dev20 still decides adoption, until the user says otherwise.)
 - **A2 · Lead-in length.** Try 300 and 600 blocks (150 beat 75 by +2.6). This is only a config change. Watch the runtime cost. **Deferred (Nov 23):** chunks hold only their captured 150-block lead-in; longer ones need a capture change (QUESTIONS Q10), not made for now.

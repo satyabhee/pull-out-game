@@ -68,6 +68,15 @@ Rule: the default rule, for each length vs B0 (lead-in 150) on dev20. If both pa
 unless the two are within 0.5 points: then the shorter one (cheaper). Runtime cost reported (median of runs,
 ingest running). Status before running: see QUESTIONS.md Q10 (dev20 has no blocks before its 150-block lead-in).
 
+### B0 + `--taker-reject margin` (Satya, Nov 23; written before the run)
+Switch from data-streams (passed twice on its margin-era confirm sets vs FROZEN v2: +4.7 and +3.8 contested). Rule:
+the rule since Nov 23 (dev20 rule AND dev-fast contested paired CI upper bound >= 0), B0 vs B0 + the switch.
+Expected: dev20 a no-op (0 of 20 chunks have clearinghouseState.json; sanity check); dev-fast is the real test (20 of
+20 have it). If it passes: into docs/baseline.md (B1), Rust parity checked (the rule is in the Python Replay layer,
+which drives both engines), row here.
+
+### A4(b) · naming placeholder pieces: rule written before building (see A4(b) section when added)
+
 ## Results
 
 ### A0 (dev20, baseline B0; `python -m analysis.retriage ~/hl-data/mac3/dev20 --hl-data ~/hl-data/mac3/hl_data --audit report/validate/order_audit_dev20 --out report/validate/a0_retriage_dev20`)

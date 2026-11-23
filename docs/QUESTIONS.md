@@ -201,3 +201,7 @@ currently ranked after A4, A5 and A3. **Options.** (a) Keep the order A4 > A5 > 
 (**recommended**: by count it would now cover ~21 of A0's 59 contested misses, more than any other item). A6 needs
 the alo_reject classifier (training on the order histories: Yuta owns the hist/margin data tests, so the split of
 work needs your call too).
+
+**Answers (Satya, Nov 23).** Q13: (b), hold `--placeholder-split` until A4(b) exists. Q14: yes, A6 moves to first, but
+rule-based first: data-streams (Yuta) builds a margin gate for post-only placements (`--alo-reject margin`, same rule
+as the IOC margin gate); the alo_reject classifier comes only after, if the rule leaves misses.
