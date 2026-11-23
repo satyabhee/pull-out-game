@@ -1,5 +1,6 @@
 """taker_reject rules (Replay._taker_skip / _taker_learn) on a bare Replay, no window needed."""
 from collections import Counter
+from decimal import Decimal as D
 
 from engine_py.replay import Replay
 from engine_py.types import ASSETS, Place, Side, Tif
@@ -40,7 +41,7 @@ def test_learn_blocks_until_real_fill():
 
 def test_margin_gate():
     coin = ASSETS[0].name                       # BTC, max leverage 40
-    r = bare({"margin"}, margin={"broke": (-5.0, {coin: 0.5}), "rich": (1000.0, {}), "thin": (10.0, {})})
+    r = bare({"margin"}, margin={"broke": (D(-5), {coin: D("0.5")}), "rich": (D(1000), {}), "thin": (D(10), {})})
     assert r._taker_skip(ioc("broke", "60000", "0.01")) == "skip_margin"          # grows a long
     assert r._taker_skip(ioc("broke", "60000", "0.3", side=Side.SELL)) is None    # reduces it
     assert r._taker_skip(ioc("broke", "60000", "0.7", side=Side.SELL)) == "skip_margin"   # flips: 0.2 new short
@@ -60,8 +61,8 @@ def test_load_margin(tmp_path):
               open(tmp_path / "clearinghouseState.json", "w"))
     json.dump([{"user": "0xab", "answer": {"tokenToAvailableAfterMaintenance": [[0, "18.5"]]}}],
               open(tmp_path / "spotClearinghouseState.json", "w"))
-    assert load_margin(tmp_path) == {"0xab": (-7.0, {"BTC": -0.02})}
-    assert load_margin(tmp_path, spot=True) == {"0xab": (11.5, {"BTC": -0.02})}
+    assert load_margin(tmp_path) == {"0xab": (D(-7), {"BTC": D("-0.02")})}
+    assert load_margin(tmp_path, spot=True) == {"0xab": (D("11.5"), {"BTC": D("-0.02")})}
     assert load_margin(tmp_path / "missing") == {}
 
 
@@ -88,3 +89,15 @@ def test_hist_rejects_match_by_cloid_or_shape_within_2s(tmp_path):
     assert not hist_rejected(rej, ioc("0xu", "60000", "0.01"), 5_000_000)          # iocCancelRejected: engine decides
     assert not hist_rejected(rej, ioc("0xu", "60000", "0.02"), 1_000_000)          # other size
     assert load_hist_rejects(tmp_path / "none") == {}
+
+
+def test_alo_margin_uses_same_rule_and_own_stats():
+    coin = ASSETS[0].name
+    r = bare(set(), margin={"broke": (D(-5), {coin: D("0.5")}), "thin": (D(10), {})})
+    alo = lambda u, px, sz, side=Side.BUY: Place(**{**ioc(u, px, sz, side=side).__dict__, "tif": Tif.ALO})
+    assert r._margin_short(alo("broke", "60000", "0.01"), "alo_margin")
+    assert not r._margin_short(alo("broke", "60000", "0.3", side=Side.SELL), "alo_margin")
+    assert r._margin_short(alo("thin", "60000", "0.01"), "alo_margin")
+    assert not r._margin_short(alo("nobody", "60000", "1"), "alo_margin")
+    assert r.taker_stats["alo_margin_unknown"] == 1 and r.taker_stats["alo_margin_checked"] == 3
+    assert r._taker_skip(ioc("broke", "60000", "0.01")) is None      # alo_reject alone leaves IOCs alone

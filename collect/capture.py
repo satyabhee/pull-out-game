@@ -41,6 +41,12 @@ Settings (environment variables):
                        top IOC senders: exact final statuses (perpMarginRejected ...) for replay --taker-reject hist
   MARGIN_USERS=0       chunks: when the chunk is planned, clearinghouseState + spotClearinghouseState (weight 2
                        each) of this many users: the previous chunk's IOC users, then recent takers
+  ALO_MARGIN_USERS=0   chunks: clearinghouseState only (weight 2) of this many more users, after the IOC users: half
+                       the previous chunk's top post-only (ALO) makers at the touch (within TOUCH_BP of the last
+                       trade), half the SUSPECTS_FILE users (makers the replay filled with no real trade,
+                       analysis/suspect_makers.py); a short half is filled from the other (replay --alo-reject margin)
+  TOUCH_BP=1           post-only placement counts as "at the touch" within this many bp of the coin's last trade
+  SUSPECTS_FILE=suspects.json
   HIST_END_USERS=6     chunks: historicalOrders (~120 weight each, reserved up front so they queue under the
                        budget instead of bursting) asked all at once as soon as the chunk's last block exists (its
                        history then always covers the chunk), for the ranker's users (TRACKERS_FILE: contested
@@ -77,6 +83,10 @@ HIST_END_USERS = int(os.environ.get("HIST_END_USERS", 6))
 TRACKERS_FILE = os.environ.get("TRACKERS_FILE", "trackers.json")
 HIST_END_RANDOM = os.environ.get("HIST_END_RANDOM") == "1"
 HIST_IOC_USERS = int(os.environ.get("HIST_IOC_USERS", 0))   # chunks: historicalOrders at chunk end for the top IOC senders
+CAPTURE_VERSION = "2026-11-23-alo-margin"      # written into every chunk's window.json (capture_version)
+ALO_MARGIN_USERS = int(os.environ.get("ALO_MARGIN_USERS", 0))
+TOUCH_BP = float(os.environ.get("TOUCH_BP", 1))
+SUSPECTS_FILE = os.environ.get("SUSPECTS_FILE", "suspects.json")
 MARGIN_USERS = int(os.environ.get("MARGIN_USERS", 0))   # chunks: clearinghouseState + spot of this many IOC users at plan time
 TARGET_LOOKUPS = int(os.environ.get("TARGET_LOOKUPS", 0))    # orderStatus of int-oid cancel targets in the SCORED blocks   # experiment: per-chunk coin flip (seeded by the snapshot)
 INFO_FILES = {"userFillsByTime": "fills.json", "frontendOpenOrders": "open_orders.json",
@@ -412,6 +422,73 @@ def ioc_users(block):
     return c
 
 
+def alo_placements(block):
+    """[(user, asset, is_buy, px, block time ms)] of the BTC/ETH post-only (ALO) order items in one block's txs
+    (rejected ones too: the chain's rejects are what the margin snapshot is for)."""
+    out, t = [], block.get("blockTime", 0)
+    for tx in block.get("txs", []):
+        a = tx.get("action") or {}
+        kind = a.get("type")
+        items = (a.get("orders", []) if kind == "order" else [a.get("order", {})] if kind == "modify"
+                 else [m.get("order", {}) for m in a.get("modifies", [])] if kind == "batchModify" else [])
+        for o in items:
+            if isinstance(o, dict) and o.get("a") in (0, 1) and ((o.get("t") or {}).get("limit") or {}).get("tif") == "Alo":
+                try:
+                    out.append((tx.get("user", "").lower(), o["a"], bool(o.get("b")), float(o["p"]), t))
+                except (KeyError, TypeError, ValueError):
+                    pass
+    return out
+
+
+def alo_touch_users(placements, trades, bp=None, n=100):
+    """user -> number of post-only placements within `bp` bp of the coin's last recorder trade before them (most
+    first, top n). Placements before the first trade of their coin are not counted."""
+    import bisect
+    bp = TOUCH_BP if bp is None else bp
+    coin = {0: "BTC", 1: "ETH"}
+    series = {}
+    for t in sorted(trades, key=lambda t: t["time"]):
+        ts, px = series.setdefault(t["coin"], ([], []))
+        ts.append(t["time"]); px.append(float(t["px"]))
+    c = collections.Counter()
+    for u, a, _, px, t in placements:
+        ts, pxs = series.get(coin[a], ([], []))
+        i = bisect.bisect_right(ts, t) - 1
+        if i >= 0 and abs(px - pxs[i]) <= pxs[i] * bp / 1e4:
+            c[u] += 1
+    return dict(sorted(c.items(), key=lambda x: (-x[1], x[0]))[:n])
+
+
+def load_suspects(path=None):
+    """Ranked suspect makers (SUSPECTS_FILE: {"time", "users": [...]}, analysis/suspect_makers.py); [] if missing."""
+    try:
+        return [u.lower() for u in json.load(open(path or os.path.join(HOME, SUSPECTS_FILE))).get("users", [])]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def alo_margin_users(prev_touch, suspects, n, exclude=()):
+    """{"touch": [...], "suspect": [...]}: up to n users for the post-only margin snapshot, about half from the
+    previous chunk's top touch makers and half from the suspects, none in `exclude` (the IOC margin users, who
+    keep priority) and no repeats; a half with too few users is filled from the other list."""
+    skip = {u.lower() for u in exclude}
+    touch = [u for u, _ in sorted((prev_touch or {}).items(), key=lambda x: (-x[1], x[0])) if u not in skip]
+    sus = [u for u in suspects if u not in skip]
+    out = {"touch": [], "suspect": []}
+    taken = set()
+
+    def take(name, src, k):
+        for u in src:
+            if len(out[name]) >= k:
+                return
+            if u not in taken:
+                out[name].append(u); taken.add(u)
+    take("touch", touch, (n + 1) // 2)
+    take("suspect", sus, n - len(out["touch"]))
+    take("touch", touch, n - len(out["suspect"]))
+    return out
+
+
 def margin_users(prev_iocs, trades, n):
     """Users for the plan-time margin snapshot: the previous chunk's IOC users (most IOCs first), then the takers
     of the recorder's recent trades (most notional first)."""
@@ -424,14 +501,15 @@ def margin_users(prev_iocs, trades, n):
     return out[:n]
 
 
-def ask_margin(writer, snap_ms, users):
+def ask_margin(writer, snap_ms, users, alo_users=()):
     """clearinghouseState and spotClearinghouseState of `users`, asked at once when the chunk is planned (the
-    scored blocks are a few seconds after the snapshot). Stored with the chunk (clearinghouseState.json ...)."""
-    if not users:
+    scored blocks are a few seconds after the snapshot), plus clearinghouseState only of `alo_users` (spot added
+    nothing for the IOC gate; keeps the burst minute under the budget). Stored with the chunk."""
+    if not users and not alo_users:
         return None
     extra = {"snapshot_time": snap_ms}
-    writer.ask_info_now("clearinghouseState", users, extra)
-    return writer.ask_info_now("spotClearinghouseState", users, extra)
+    writer.ask_info_now("clearinghouseState", list(users) + list(alo_users), extra)
+    return writer.ask_info_now("spotClearinghouseState", users, extra) if users else time.time()
 
 
 def int_cancel_users(block):
@@ -498,6 +576,7 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
     meta.setdefault("failed_heights", [])
     fetched_now, t0, status = 0, time.time(), None
     cancels = collections.Counter()
+    alos = []
     iocs = collections.Counter()
     for i, h in enumerate(range(start, end + 1)):
         p = os.path.join(d, f"{h}.json.gz")
@@ -546,6 +625,8 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
             picker.feed(h, b)
             cancels.update(int_cancel_users(b))
             iocs.update(ioc_users(b))
+            if ALO_MARGIN_USERS:
+                alos += alo_placements(b)
             if h >= start + warmup:
                 for u, oid in int_oid_targets(b):
                     scored_targets.setdefault((u, oid), h)
@@ -561,6 +642,12 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
             save_json(wpath, meta); save_json(apath, old + writer.snapshot())
     meta["int_cancel_users"] = dict(sorted(cancels.items(), key=lambda x: (-x[1], x[0]))[:30])
     meta["ioc_users"] = dict(sorted(iocs.items(), key=lambda x: (-x[1], x[0]))[:100])
+    if ALO_MARGIN_USERS and alos:
+        try:
+            meta["alo_touch_users"] = alo_touch_users(alos, recorder_trades(min(a[4] for a in alos) - 60_000,
+                                                                            max(a[4] for a in alos)))
+        except Exception as e:                       # never lose a chunk over the next chunk's user choice
+            meta["alo_touch_error"] = repr(e)
     if extras and status is None:
         ask_extras(writer, extras, meta, cancels)
     if TARGET_LOOKUPS and status is None and scored_targets:
@@ -815,6 +902,7 @@ def run_chunks(fetcher, state, writer, cancellers=None):
     cancellers = cancellers or CancellerTally()
     answered = None                                  # prefetched open orders: latest answer time (ms)
     prev_iocs = {}                                   # previous chunk's IOC users (margin snapshot)
+    prev_touch = {}                                  # previous chunk's post-only makers at the touch
     while True:
         pct = disk_pct()
         if pct > 85:
@@ -844,7 +932,7 @@ def run_chunks(fetcher, state, writer, cancellers=None):
             time.sleep(0.5); continue
         last_snap, last_start = snap, time.time()
         start, end, warmup = with_lead_in(span, LEAD_IN_BLOCKS)
-        meta = {"kind": "chunk", "snapshot_time": snap, "lead_in_blocks": warmup}
+        meta = {"kind": "chunk", "snapshot_time": snap, "lead_in_blocks": warmup, "capture_version": CAPTURE_VERSION}
         if OPEN_LEAD_MS and CHUNK_OPEN_USERS:
             if answered:
                 meta["open_orders_lead_ms"] = snap - answered
@@ -853,8 +941,12 @@ def run_chunks(fetcher, state, writer, cancellers=None):
             ask_open_orders(writer, snap)
         if MARGIN_USERS:
             mu = margin_users(prev_iocs, recorder_trades(snap - 60_000, snap), MARGIN_USERS)
-            if ask_margin(writer, snap, mu):
+            am = alo_margin_users(prev_touch, load_suspects(), ALO_MARGIN_USERS, exclude=mu) \
+                if ALO_MARGIN_USERS else {"touch": [], "suspect": []}
+            if ask_margin(writer, snap, mu, am["touch"] + am["suspect"]):
                 meta["margin_users"] = len(mu)
+                if ALO_MARGIN_USERS:
+                    meta["alo_margin_users"] = am
                 meta["margin_answered_at"] = int(time.time() * 1000)
         hist_on = HIST_END_USERS and (not HIST_END_RANDOM or random.Random(snap).random() < 0.5)
         if HIST_END_RANDOM:
@@ -872,6 +964,7 @@ def run_chunks(fetcher, state, writer, cancellers=None):
                          extras=chunk_extras())
         cancellers.add(meta.get("int_cancel_users"))
         prev_iocs = meta.get("ioc_users") or {}
+        prev_touch = meta.get("alo_touch_users") or {}
         save_json(STATE, state)
         if status == "archived_cap":
             if ONCE:

@@ -480,3 +480,55 @@ def test_margin_users_prev_iocs_first_then_recent_takers():
               {"users": ["0xM2", "0xT2"], "side": "A", "px": "100", "sz": "5"},
               {"users": ["0xi1", "0xM3"], "side": "B", "px": "100", "sz": "9"}]
     assert cap.margin_users({"0xi1": 3, "0xi2": 7}, trades, 4) == ["0xi2", "0xi1", "0xt2", "0xt1"]
+
+
+def test_alo_placements_btc_eth_alo_only():
+    blk = {"blockTime": 5, "txs": [
+        {"user": "0xA", "action": {"type": "order", "orders": [
+            {"a": 0, "b": True, "p": "100", "s": "1", "t": {"limit": {"tif": "Alo"}}},
+            {"a": 0, "b": True, "p": "100", "s": "1", "t": {"limit": {"tif": "Ioc"}}},
+            {"a": 7, "b": True, "p": "100", "s": "1", "t": {"limit": {"tif": "Alo"}}}]}},
+        {"user": "0xB", "action": {"type": "modify", "oid": 1, "order":
+            {"a": 1, "b": False, "p": "20.5", "s": "1", "t": {"limit": {"tif": "Alo"}}}}}]}
+    assert cap.alo_placements(blk) == [("0xa", 0, True, 100.0, 5), ("0xb", 1, False, 20.5, 5)]
+
+
+def test_alo_touch_users_within_bp_of_last_trade():
+    trades = [{"coin": "BTC", "time": 10, "px": "10000"}, {"coin": "BTC", "time": 20, "px": "10100"},
+              {"coin": "ETH", "time": 10, "px": "2000"}]
+    pl = [("0xa", 0, True, 10000.5, 15),      # 0.5 bp from 10000: touch
+          ("0xa", 0, True, 10000.5, 25),      # last trade now 10100: far
+          ("0xb", 0, False, 10100.0, 20),     # exactly the last trade
+          ("0xc", 1, True, 2000.0, 5),        # before ETH's first trade: not counted
+          ("0xd", 1, True, 1999.0, 11)]       # 5 bp away
+    assert cap.alo_touch_users(pl, trades, bp=1) == {"0xa": 1, "0xb": 1}
+
+
+def test_alo_margin_users_half_and_half_ioc_users_first():
+    touch = {"0xt1": 9, "0xt2": 5, "0xt3": 1, "0xi1": 20}
+    sus = ["0xs1", "0xt1", "0xs2"]
+    got = cap.alo_margin_users(touch, sus, 4, exclude=["0xI1"])
+    assert got == {"touch": ["0xt1", "0xt2"], "suspect": ["0xs1", "0xs2"]}
+    assert cap.alo_margin_users(touch, [], 4, exclude=["0xi1"]) == {"touch": ["0xt1", "0xt2", "0xt3"], "suspect": []}
+    assert cap.alo_margin_users({}, sus, 2) == {"touch": [], "suspect": ["0xs1", "0xt1"]}
+
+
+def test_ask_margin_spot_only_for_ioc_users():
+    asked = []
+
+    class W:
+        def ask_info_now(self, kind, users, extra=None):
+            asked.append((kind, list(users)))
+            return 1.0
+    assert cap.ask_margin(W(), 0, ["0xi"], ["0xa"]) == 1.0
+    assert asked == [("clearinghouseState", ["0xi", "0xa"]), ("spotClearinghouseState", ["0xi"])]
+    asked.clear()
+    assert cap.ask_margin(W(), 0, [], ["0xa"]) and asked == [("clearinghouseState", ["0xa"])]
+    assert cap.ask_margin(W(), 0, [], []) is None
+
+
+def test_load_suspects(tmp_path):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"time": 1, "users": ["0xAB", "0xcd"]}))
+    assert cap.load_suspects(str(p)) == ["0xab", "0xcd"]
+    assert cap.load_suspects(str(tmp_path / "none.json")) == []

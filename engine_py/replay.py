@@ -148,6 +148,63 @@ class Observer:
         """reseed=True only: called before the asset's book is reconciled and rebuilt from `snapshot`."""
 
 
+def forced_subset(sizes: list[int], k: int, target: int, budget: int = 300_000):
+    """The indices that are in EVERY set of exactly k items whose sizes sum to target, as a sorted tuple (possibly
+    empty: no index is forced); "none" when no such set exists; "budget" when the (count, sum) states exceed
+    `budget`. Prefix x suffix reachability: index i is forced iff no solution avoids it."""
+    m = len(sizes)
+    if not 0 <= k <= m or target < 0:
+        return "none"
+    pre = [{(0, 0)}]
+    states = 1
+    for x in sizes:
+        cur = set(pre[-1])
+        for c, sm in pre[-1]:
+            if c < k and sm + x <= target:
+                cur.add((c + 1, sm + x))
+        states += len(cur)
+        if states > budget:
+            return "budget"
+        pre.append(cur)
+    if (k, target) not in pre[-1]:
+        return "none"
+    suf = [set() for _ in range(m + 1)]
+    suf[m] = {(0, 0)}
+    for i in range(m - 1, -1, -1):
+        cur = set(suf[i + 1])
+        for c, sm in suf[i + 1]:
+            if c < k and sm + sizes[i] <= target:
+                cur.add((c + 1, sm + sizes[i]))
+        states += len(cur)
+        if states > 2 * budget:
+            return "budget"
+        suf[i] = cur
+    forced = []
+    for i in range(m):                              # is there a solution without item i?
+        after = suf[i + 1]
+        if not any((k - c, target - sm) in after for c, sm in pre[i]):
+            forced.append(i)
+    return tuple(forced)
+
+
+def load_fast_books(hl_data, asset: int, t0_ms: int, t1_ms: int) -> list:
+    """deep_ledger fast5: [(time, {Side: {px ticks: (size lots, n)}})] of the recorder's l2Book fast updates
+    (book_<coin>_fast.jsonl, 5 levels per side) with t0 <= time <= t1, deduplicated by time, time order."""
+    a = ASSETS[asset]
+    seen: dict[int, list] = {}
+    for path in _hour_files(Path(hl_data), f"book_{a.name}_fast", t0_ms, t1_ms):
+        for rec in _records(path, t0_ms, t1_ms):
+            d = rec["msg"]["data"]
+            if t0_ms <= d["time"] <= t1_ms:
+                seen[d["time"]] = d["levels"]
+    out = []
+    for t in sorted(seen):
+        bids, asks = seen[t]
+        out.append((t, {Side.BUY: {a.px_to_ticks(x["px"]): (a.sz_to_lots(x["sz"]), int(x["n"])) for x in bids},
+                        Side.SELL: {a.px_to_ticks(x["px"]): (a.sz_to_lots(x["sz"]), int(x["n"])) for x in asks}}))
+    return out
+
+
 def unique_subset(sizes: list[int], k: int, target: int, budget: int = 300_000):
     """The one set of exactly k indices whose sizes sum to target (sizes > 0), as a sorted tuple; else "none",
     "ambiguous", or "budget" (more than `budget` partial states). Exact DP over (count, sum) with ways capped at 2,
@@ -239,7 +296,7 @@ MAX_LEVERAGE = {"BTC": 40, "ETH": 25}          # Hyperliquid max leverage (Nov 2
 
 def load_margin(window_dir, spot: bool = False) -> dict:
     """taker_reject margin: user -> (free margin USD, {coin: signed position size}) from the chunk's plan-time
-    clearinghouseState.json (collect/capture.py MARGIN_USERS). free = accountValue - totalMarginUsed (perp only);
+    clearinghouseState.json (collect/capture.py MARGIN_USERS), as Decimals (no floats). free = accountValue - totalMarginUsed (perp only);
     spot=True adds the spot USDC available after maintenance (unified accounts). Missing file: {}."""
     path = Path(window_dir) / "clearinghouseState.json"
     if not path.exists():
@@ -250,15 +307,15 @@ def load_margin(window_dir, spot: bool = False) -> dict:
         if not isinstance(ans, dict) or "marginSummary" not in ans:
             continue
         ms = ans["marginSummary"]
-        free = float(ms["accountValue"]) - float(ms["totalMarginUsed"])
-        pos = {p["position"]["coin"]: float(p["position"]["szi"]) for p in ans.get("assetPositions", [])}
+        free = Decimal(ms["accountValue"]) - Decimal(ms["totalMarginUsed"])
+        pos = {p["position"]["coin"]: Decimal(p["position"]["szi"]) for p in ans.get("assetPositions", [])}
         out[r["user"].lower()] = (free, pos)
     if spot:
         sp = Path(window_dir) / "spotClearinghouseState.json"
         for r in (json.load(open(sp)) if sp.exists() else []):
             ans, u = r.get("answer"), r["user"].lower()
             if u in out and isinstance(ans, dict):
-                avail = dict((int(k), float(v)) for k, v in ans.get("tokenToAvailableAfterMaintenance") or [])
+                avail = dict((int(k), Decimal(v)) for k, v in ans.get("tokenToAvailableAfterMaintenance") or [])
                 if 0 in avail:
                     out[u] = (out[u][0] + avail[0], out[u][1])
     return out
@@ -282,7 +339,8 @@ class Replay:
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
                  deep_book: bool = False, deep_lookback_ms: int = 600_000, learn_keep_known: bool = False,
                  facts_exclude: tuple = (), use_bbo: bool = True, anchor_drop_kinds: tuple = (),
-                 oid_bracket: bool = False, taker_reject: str | None = None,
+                 oid_bracket: bool = False, taker_reject: str | None = None, alo_reject: str | None = None,
+                 deep_ledger: str | None = None,
                  taker_seed=None):
         """oid_bracket: reference points from the tracked users' orders on every coin + the monotone c(k) bracket
         rule in the resolver (data/oids.py).
@@ -452,8 +510,29 @@ class Replay:
         self.taker_stats: Counter = Counter()
         self._taker_blocked: set[str] = set(taker_seed or ())    # learn: users whose last engine-filled IOC had no real fill (seeded from earlier chunks)
         self._blk_ioc: dict[str, tuple[str, bool]] = {}   # this block: hash -> (user, engine filled or skipped)
+        if deep_ledger not in (None, "fast5", "fast5touch"):
+            raise ValueError(f"unknown deep_ledger {deep_ledger!r}")
+        self.deep_ledger = deep_ledger
+        self.fast5_stats: Counter = Counter()
+        self.fast5_log: list | None = None             # diagnostics: set to [] to log every level decision
+        self._fast: dict = {}                          # asset -> load_fast_books(...)
+        self._fast_last: dict = {}                     # asset -> index of the last processed aligned update
+        self._fast_gap: dict = {}                      # (asset, side, px) -> index of the update that showed a gap
+        self._truth: dict = {}                         # (user, real oid) -> (status_ts, status): counters only
+        if deep_ledger:
+            for asset in ASSETS:
+                self._fast[asset] = load_fast_books(self.hl_data, asset, self.t0 - 60_000, self.t1)
+            from data import oid_facts
+            for o in oid_facts.load(self.window_dir, self.hl_data).orders:
+                key = (o["user"], int(o["oid"]))
+                if o.get("status") and o.get("status_ts") is not None and \
+                        (key not in self._truth or o["status_ts"] >= self._truth[key][0]):
+                    self._truth[key] = (o["status_ts"], o["status"])
+        self.alo_reject = frozenset(x for x in (alo_reject or "").split(",") if x)
+        if self.alo_reject - {"margin"}:
+            raise ValueError(f"unknown alo_reject rules {sorted(self.alo_reject - {'margin'})}")
         self._margin = load_margin(self.window_dir, spot="margin_spot" in self.taker_reject) \
-            if self.taker_reject & {"margin", "margin_spot"} else {}
+            if self.taker_reject & {"margin", "margin_spot"} or self.alo_reject else {}
         self._hist_rej = load_hist_rejects(self.window_dir) if "hist" in self.taker_reject else {}
         self._real_trades: dict[str, list] = {}
         if self._rules or "learn" in self.taker_reject:
@@ -890,19 +969,27 @@ class Replay:
                 return "skip_min10"
         if "learn" in self.taker_reject and p.user in self._taker_blocked:
             return "skip_learn"
-        if self._margin and not p.reduce_only:
-            st = self._margin.get(p.user.lower())
-            if st is None:
-                self.taker_stats["margin_unknown"] += 1
-            else:
-                a = ASSETS[p.asset]
-                free, pos = st
-                szi = pos.get(a.name, 0.0)
-                signed = float(a.lots_to_sz(p.sz)) * (1 if p.side is Side.BUY else -1)
-                grow = abs(signed) if szi == 0 or (szi > 0) == (signed > 0) else max(0.0, abs(signed) - abs(szi))
-                if grow > 0 and free < grow * float(a.ticks_to_px(p.px)) / MAX_LEVERAGE[a.name]:
-                    return "skip_margin"
+        if self.taker_reject & {"margin", "margin_spot"} and self._margin_short(p, "margin"):
+            return "skip_margin"
         return None
+
+    def _margin_short(self, p: Place, tag: str) -> bool:
+        """True when placement p grows the user's position and their plan-time free margin (load_margin) is under
+        the grown notional / max leverage. Reduce-only orders and users without a snapshot pass (counted in
+        taker_stats as <tag>_unknown; checked ones as <tag>_checked)."""
+        if not self._margin or p.reduce_only:
+            return False
+        st = self._margin.get(p.user.lower())
+        if st is None:
+            self.taker_stats[f"{tag}_unknown"] += 1
+            return False
+        self.taker_stats[f"{tag}_checked"] += 1
+        a = ASSETS[p.asset]
+        free, pos = st
+        szi = pos.get(a.name, Decimal(0))
+        signed = Decimal(a.lots_to_sz(p.sz)) * (1 if p.side is Side.BUY else -1)
+        grow = abs(signed) if szi == 0 or (szi > 0) == (signed > 0) else max(Decimal(0), abs(signed) - abs(szi))
+        return grow > 0 and free * MAX_LEVERAGE[a.name] < grow * Decimal(a.ticks_to_px(p.px))
 
     def _taker_learn(self) -> None:
         """taker_reject learn, once per block from that block's real trades (policy-independent): a real fill
@@ -1089,6 +1176,103 @@ class Replay:
                             self.touch_reconciled[(name, "n_capped")] += 1
                             extra -= 1
 
+    def _deep_ledger_block(self, bi: int, b: Block) -> None:
+        """deep_ledger fast5, at the start of block b: for each asset take the latest l2Book fast update whose time lies
+        in [previous block's time, b's time) (aligned: our book then holds exactly the blocks before it; none -> skip).
+        On each side, every level of ours strictly behind the feed's best price and not beyond its 5th level is
+        compared with the feed (a price inside that range missing from the feed has n = 0, size 0). Where ours holds
+        k = ours - n > 0 more orders and excess = our size - real size > 0, in this update AND in the previous aligned
+        update (the gap persists 2 updates), remove only the orders that are in every set of k of ours summing to the
+        excess (forced_subset). Levels with a placeholder, more than ledger_k excess orders or LEDGER_MAX_ORDERS
+        orders abstain. Removal precision (counters only): a removed order whose real oid is known exactly and has a
+        status fact counts as phantom if that status (not open) came at or before b's time, else live."""
+        prev_t = self.blocks[bi - 1].time_ms if bi > 0 else self.t0 - 1
+        st = self.fast5_stats
+        for asset in sorted(ASSETS):
+            feed = self._fast.get(asset) or []
+            i = bisect.bisect_left(feed, (b.time_ms,)) - 1
+            if i < 0 or feed[i][0] < prev_t:
+                st["fast5_no_aligned_update"] += 1
+                continue
+            if self._fast_last.get(asset) == i:
+                continue                             # this update was already used at an earlier block
+            prev_i, self._fast_last[asset] = self._fast_last.get(asset), i
+            st["fast5_updates"] += 1
+            name = ASSETS[asset].name
+            for side in (Side.BUY, Side.SELL):
+                lv = feed[i][1][side]
+                if len(lv) < 2:
+                    continue
+                pxs = sorted(lv, reverse=side is Side.BUY)            # best first
+                best, last = pxs[0], pxs[-1]
+                book = self.engine.books[asset]
+                for level in list(book.levels(side)):
+                    px = level.px
+                    if px == best and self.deep_ledger != "fast5touch":
+                        continue                     # fast5: the touch level stays with the bbo ledger
+                    if (side is Side.BUY and px < last) or (side is Side.SELL and px > last):
+                        break
+                    if (side is Side.BUY and px > best) or (side is Side.SELL and px < best):
+                        continue                     # better than the feed's best: the touch reconcile's job
+                    sz, n = lv.get(px, (0, 0))
+                    nodes = list(level)
+                    key = (asset, side, px)
+                    k, excess = len(nodes) - n, level.total - sz
+                    if k <= 0 or excess <= 0:
+                        self._fast_gap.pop(key, None)
+                        self._f5log(b, asset, side, px, "no_gap", k, excess)
+                        continue
+                    seen_before = self._fast_gap.get(key) == prev_i and prev_i is not None
+                    self._fast_gap[key] = i
+                    if not seen_before:
+                        st[f"{name}:fast5_gap_first_seen"] += 1
+                        self._f5log(b, asset, side, px, "gap_first_seen", k, excess)
+                        continue
+                    if any(nd.order.user == PLACEHOLDER for nd in nodes):
+                        st[f"{name}:fast5_skip_placeholder"] += 1
+                        self._f5log(b, asset, side, px, "skip_placeholder", k, excess)
+                        continue
+                    if k > self.ledger_k or len(nodes) > self.LEDGER_MAX_ORDERS:
+                        st[f"{name}:fast5_too_many"] += 1
+                        continue
+                    got = forced_subset([nd.remaining for nd in nodes], k, excess, self.LEDGER_BUDGET)
+                    if not isinstance(got, tuple):
+                        st[f"{name}:fast5_{got}"] += 1
+                        self._f5log(b, asset, side, px, got, k, excess)
+                        continue
+                    if not got:
+                        st[f"{name}:fast5_none_forced"] += 1
+                        self._f5log(b, asset, side, px, "none_forced", k, excess)
+                        continue
+                    self._f5log(b, asset, side, px, f"removed {len(got)} of {len(nodes)}", k, excess,
+                                [nodes[j].order.oid for j in got])
+                    st[f"{name}:fast5_levels_acted"] += 1
+                    for j in got:
+                        nd = nodes[j]
+                        st[f"{name}:fast5_removed"] += 1
+                        st[f"truth:{self._removal_truth(nd.order.oid, nd.order.user, b.time_ms)}"] += 1
+                        self.engine.evict(nd.order.oid)
+                    self._fast_gap.pop(key, None)
+
+    def _f5log(self, b, asset, side, px, outcome, k, excess, oids=()):
+        if self.fast5_log is not None:
+            self.fast5_log.append((b.height, asset, side, px, outcome, k, excess, tuple(oids)))
+
+    def _removal_truth(self, oid: int, user: str, t_ms: int) -> str:
+        """deep_ledger counters: phantom / live / unknown for an order we are about to remove."""
+        act = self.placed_by.get(oid)
+        if act is None or self.resolver is None or not self.resolver.est.exact:
+            return "unknown"
+        pos = (act.block, act.tx_index, act.item_index)       # as data/oids.OidResolver.note keys it
+        inv = getattr(self, "_exact_inv", None)
+        if inv is None or len(inv) != len(self.resolver.est.exact):
+            inv = self._exact_inv = {v: k for k, v in self.resolver.est.exact.items()}
+        hl = inv.get(pos)
+        st = self._truth.get((user.lower(), hl)) if hl is not None else None
+        if st is None:
+            return "unknown"
+        return "live" if st[1] == "open" or st[0] > t_ms else "phantom"
+
     LEDGER_BUDGET = 300_000   # combinations tried per touch level before abstaining
     LEDGER_MAX_ORDERS = 60
 
@@ -1138,6 +1322,10 @@ class Replay:
                 self.taker_stats[skip] += 1
                 self._blk_ioc[action.hash] = (action.user, True)
                 return [], []
+        if self.alo_reject and isinstance(action, Place) and action.tif is Tif.ALO \
+                and self._margin_short(action, "alo_margin"):
+            self.taker_stats["skip_alo_margin"] += 1     # alo_reject margin: the chain rejects it; it never rests
+            return [], []
         before = self.engine.next_oid
         self._block = block
         self.engine.block_time_ms = block.time_ms
@@ -1181,6 +1369,8 @@ class Replay:
                 self.touch.advance(b.time_ms)
             if self.touch_reconcile:
                 self._reconcile_touch()
+            if self.deep_ledger:
+                self._deep_ledger_block(bi, b)
             if self.placeholder_ttl_ms is not None:
                 self._expire_placeholders(b.time_ms)
             ordered, outside = self._ordered(b)
