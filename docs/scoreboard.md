@@ -17,6 +17,13 @@ is not established). dev-fast is reported next to dev20 but does not decide (unt
 contested must not drop (paired 95% CI upper bound >= 0).** The baseline itself is defined in `docs/baseline.md`
 (checked before every A run; both sessions read it).
 
+**Adoption rule since Nov 23, session 5 (Satya, Q15; written before the next run, replaces the two above): adopt iff
+dev20 contested point estimate > 0 AND its 95% CI lower bound >= 0 AND dev-fast contested 95% CI upper bound >= 0
+(the dev20 uncontested clause stays: upper bound >= -1.0). For owner-naming switches, ALSO naming precision >= 70% on
+both dev20 and dev-fast (engine fills on named pieces whose named owner is the real maker at that price / all engine
+fills on named pieces).** Reason (Satya): a wrong owner name biases per-maker results in the IE 498 study, and
+maker-strict does not penalise it.
+
 ## Attempts
 
 | date | item | switch | rule | dev20 contested (n 113) | dev20 uncontested (n 195) | dev-fast contested / uncontested | adopted | commit |
@@ -77,6 +84,36 @@ the rule since Nov 23 (dev20 rule AND dev-fast contested paired CI upper bound >
 Expected: dev20 a no-op (0 of 20 chunks have clearinghouseState.json; sanity check); dev-fast is the real test (20 of
 20 have it). If it passes: into docs/baseline.md (B1), Rust parity checked (the rule is in the Python Replay layer,
 which drives both engines), row here.
+
+### A5 · Exact oid counting (Satya, Nov 23, session 5; written before any A5 run)
+Owner: mahito (Yuta sizes unresolved-cancel misses on dev_margin60 and sends cases). Baseline: B1.
+
+**Part 1 · counting test (analysis; adopts nothing).** Sets dev20 + dev-fast (40 chunks), raw explorer blocks, every
+order item of every tx on every asset (errored txs included, flagged). Truth points = placements whose real oid is
+known: capture's orderStatus answers (anchors.json), the oid facts (data/oid_facts.load), recorder user_orders on every
+coin (stream_orders_all), each located at EXACTLY one order item by (user, cloid, time) or (user, px, size, time);
+points located ambiguously are dropped, then the longest chain increasing in both position and oid is kept
+(OidEstimator.consistent). For consecutive truth points a < b (listing order across the chunk), residual
+r = (oid_b - oid_a) - (items in (a, b] that the variant says take an id). Variants, fixed now:
+- V0 = rule B (G0): every item of a NON-errored order / modify / batchModify tx, any asset, trigger items included;
+- V1 = V0 + the items of errored txs;
+- V2 = V0 without trigger items.
+Reported per variant: pairs with r = 0 / r < 0 / r > 0, split into same-block pairs and pairs crossing d = 1, 2-5,
+> 5 block boundaries; for r != 0 pairs what lies between (tx types incl. twapOrder, block boundaries, zero-hash trades
+on BTC/ETH).
+**Verdict.** Counting "holds" in a scope (same block; or crossing d boundaries) for a variant iff >= 99% of that
+scope's pairs have r = 0 AND the scope has >= 200 pairs over the 40 chunks. Best variant = the most same-block
+pairs with r = 0 (tie: V0). If counting holds in no scope: report, build nothing, stop.
+
+**Part 2 · resolver behind `--oid-count` (only if Part 1 finds a scope).** Inside a scope where counting holds,
+the oid of every placement is exact from a truth point in that scope (best variant's count); an int-oid cancel /
+modify target that falls in such a scope maps to that one placement, used iff it rests, belongs to the canceller and
+is on that asset; everything else keeps today's resolver (interpolation + oid bracket). Held-out check before any
+scoring run: truth points in 3 folds (by chunk order), each fold's points removed from the counting anchors; every
+exact mapping of a held-out point compared with its real placement. **Wrong exact mappings must be <= 1%** (a wrong
+cancel target removes a real maker's order: same bias as a wrong owner name), else the switch is not scored.
+Then the scoreboard run vs B1 under the session-5 rule above (no naming clause; the held-out precision >= 99% plays
+that role).
 
 ### A4(b) · Name placeholder pieces from later trades and cancels (Satya, Nov 23; written before building)
 Builds on A4(a) (`--placeholder-split`: each snapshot level is split into its uncovered order count, so one

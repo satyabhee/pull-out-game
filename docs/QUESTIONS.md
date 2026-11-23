@@ -224,3 +224,8 @@ engine's refill; replay_core's refill takes no counts). Naming itself is in the 
 (c) Change the adoption rule to require a contested gain (lower bound > 0, not >= 0) so no-op-on-contested switches
 cannot pass; that would also have held A4(a).
 
+**Answer (Satya, Nov 23).** (b): hold (b1) / (b2). Rule change (scoreboard, before the next run): adopt only if dev20
+contested point estimate > 0 AND lower bound >= 0 AND dev-fast contested upper bound >= 0; owner-naming switches
+also need naming precision >= 70% on dev20 and dev-fast. Ownership: mahito owns A5 (exact oid counting + resolver);
+Yuta sizes unresolved-cancel misses on dev_margin60 and sends cases; A6 (post-only margin gate) is Yuta's, not mahito's.
+
