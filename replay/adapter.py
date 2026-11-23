@@ -26,7 +26,9 @@ from engine_py.types import Fill, Side
 # Engine options shared by every switch setting (frozen config + docs priority).
 ENGINE_OPTIONS = ("--alo-gate touch --reseed --nearest-ratio 3 --keep-known --outside-other-txs --deep-book "
                   "--p-priority docs --evict-arrival --oid-bracket --touch-reconcile --touch-evict ledger "
-                  "--ledger-k 99 --learn-evidence tx").split()       # learn-evidence tx: adopted Nov 23 (Q7, D33)
+                  "--ledger-k 99 --learn-evidence tx --taker-reject margin").split()
+# learn-evidence tx: adopted Nov 23 (Q7, D33). taker-reject margin: adopted Nov 23 as B1 (docs/baseline.md; acts only
+# on chunks with clearinghouseState.json, i.e. captured since Nov 22 04:20 UTC).
 
 # Switches (Satya, Nov 22): each maps to an option the Python engine already has.
 #   stp:        taker = cancel the taker's remainder (engine default) | maker = cancel the resting order (plan §1)

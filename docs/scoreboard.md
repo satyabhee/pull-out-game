@@ -5,7 +5,7 @@ file shows the order). Metric: per-tx maker-strict (matched notional with the ri
 over txs, split by contested (one of the tx's makers, real or engine, sent a cancel / modify / ALO on that asset in
 that block; `analysis/contested.py`). CIs: paired, chunk-cluster bootstrap 4000 (`analysis/contested_paired.py`).
 
-**Current baseline (B0)**: real engine on `mahito`, Rust backend, block-end correction, `--p-priority docs`,
+**Current baseline: B1 = B0 + `--taker-reject margin` (Nov 23; docs/baseline.md).** B0 was: real engine on `mahito`, Rust backend, block-end correction, `--p-priority docs`,
 `--learn-evidence tx`, order=proposer, stp=taker, lead-in 150 (as captured). Reference outputs
 `report/validate/m1_ref_blockend20` (Python engine; Rust identical).
 
@@ -28,6 +28,7 @@ contested must not drop (paired 95% CI upper bound >= 0).** The baseline itself 
 | Nov 23 | A8 queue order (26 misses split) | none run | sub-cause rule | no rule-fixable sub-cause supported by the chain's fills (below) | | | n/a | this session |
 | Nov 23 | A4(a) placeholder split | `--placeholder-split` | rule since Nov 23 | +0.0 [0.0, 0.0] (all txs byte-identical) | +0.0 [0.0, 0.0] | +0.0 [0.0, 0.0] / +0.0 [0.0, 0.0] | **n (formally passes; held, QUESTIONS Q13)** | this session |
 | Nov 23 | A4(b), A4(c) | - | - | not built this session (Q13) | | | n | - |
+| Nov 23 | B0 + taker margin gate (data-streams) | `--taker-reject margin` | rule since Nov 23 | +0.0 [0.0, 0.0] (byte-identical: no margin snapshots) | +0.0 [0.0, 0.0] | **+2.9 [+0.0, +8.4] / +3.4 [-1.5, +8.3]** (0.442 -> 0.471 / 0.694 -> 0.728; all scored +3.2 [-0.4, +7.4]; engine-only txs 1633 -> 738) | **y -> B1** (Rust parity: byte-identical, dev20 + dev-fast) | this session |
 
 ## Rules written before each item (Nov 23 session)
 
