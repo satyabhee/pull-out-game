@@ -180,3 +180,24 @@ A peer session (data-streams) says your rule is no Claude attribution in commits
 `Co-Authored-By: Claude` trailer, and commits on mahito so far carry it (incl. d7339e6, plan v2). I have not
 rewritten any history. Options: (a) keep the trailer; (b) drop it from now on (I need it in CLAUDE.md or memory to
 override the session instruction). Your call.
+
+# Session 3 questions (Nov 23)
+
+## Q13. A4(a) "passes" the adoption rule with zero effect. Adopt, or hold until (b)?
+
+`--placeholder-split` leaves every dev20 and dev-fast score byte-identical (+0.0 [0.0, 0.0] everywhere), so it
+formally meets the rule (contested CI lower bound 0 >= 0, dev-fast upper bound 0 >= 0). Adopting it means porting it
+to the Rust engine's refill for parity, for no measured gain. **Options.** (a) Adopt now (rule as written). (b) Hold it
+as a switch and adopt only together with A4(b) (naming owners of the pieces), which is what can change scores
+(**recommended**: a no-op should not move the baseline). A4(b)/(c) were not built tonight: A8's finding (21 of 26
+queue misses are post-only orders the chain never held) took the session, and (b) needs a piece-level naming rule
+written first. **Done instead:** nothing adopted; the switch is in the code, default off.
+
+## Q14. A8 points at A6. Move A6 up?
+
+A8's 26 queue misses are mostly phantoms: E's post-only order sits in our book, the chain never filled it and never
+saw a cancel, and the only two checkable ones were perpMarginRejected. That is A6 (margin-rejected post-only orders),
+currently ranked after A4, A5 and A3. **Options.** (a) Keep the order A4 > A5 > A3 > A6. (b) Put A6 right after A4
+(**recommended**: by count it would now cover ~21 of A0's 59 contested misses, more than any other item). A6 needs
+the alo_reject classifier (training on the order histories: Yuta owns the hist/margin data tests, so the split of
+work needs your call too).

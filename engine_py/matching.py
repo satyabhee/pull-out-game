@@ -34,6 +34,14 @@ from engine_py.types import (
 
 PLACEHOLDER = "placeholder"   # owner of seeded pre-window liquidity
 
+
+def split_equal(total: int, k: int) -> list[int]:
+    """total lots in k positive integer parts, as equal as possible, larger parts first (deterministic)."""
+    if not 1 <= k <= total:
+        raise ValueError(f"cannot split {total} lots into {k} orders")
+    q, r = divmod(total, k)
+    return [q + 1] * r + [q] * (k - r)
+
 Resolver = Callable[[str, int, int], "int | None"]
 
 
@@ -200,23 +208,29 @@ class Engine:
         self.stats["evicted_by_gate"] += 1
         return order
 
-    def refill(self, asset: int, bids, asks) -> dict[str, int]:
+    def refill(self, asset: int, bids, asks, counts=None) -> dict[str, int]:
         """Lead-in re-seed (keep known orders): wherever a snapshot level holds more than we do, add the
         difference as one placeholder at the FRONT of that level. That liquidity rested before anything
         we saw placed, so it queues ahead. Never trims; run reconcile(known=...) first so nothing better
         than the snapshot's best remains (otherwise the crossed-book check fails loudly)."""
         book = self.books[asset]
         out = {"refilled": 0, "refilled_orders": 0}
-        for side, levels in ((Side.BUY, bids), (Side.SELL, asks)):
+        for side, levels, ns in ((Side.BUY, bids, counts[0] if counts else ()),
+                                 (Side.SELL, asks, counts[1] if counts else ())):
             ours = book.side(side)
-            for px, sz in levels:
+            for i, (px, sz) in enumerate(levels):
                 level = ours.get(px)
                 gap = sz - (level.total if level is not None else 0)
                 if gap > 0:
-                    order = self._new_order(PLACEHOLDER, asset, side, px, gap, Tif.GTC, None)
-                    book.add(order, gap, front=True)
+                    # counts given (A4a, --placeholder-split): the gap is the snapshot's orders we do not hold, so it
+                    # becomes (snapshot n - orders we hold there) placeholders of equal size, not one
+                    held = len(level) if level is not None else 0
+                    k = max(1, min(gap, ns[i] - held)) if i < len(ns) else 1
+                    for q in reversed(split_equal(gap, k)):          # added at the front: last piece first
+                        order = self._new_order(PLACEHOLDER, asset, side, px, q, Tif.GTC, None)
+                        book.add(order, q, front=True)
+                        out["refilled_orders"] += 1
                     out["refilled"] += gap
-                    out["refilled_orders"] += 1
         self._assert_not_crossed(asset)
         for k, v in out.items():
             self.stats[f"refill_{k}"] += v

@@ -32,7 +32,7 @@ from pathlib import Path
 
 from data.oids import OidEstimator, OidResolver
 from data.parse import COIN_TO_ASSET, Stats, _hour_files, _records, iter_books, iter_trades, load_window, nearest_book
-from engine_py.matching import PLACEHOLDER, Engine
+from engine_py.matching import split_equal, PLACEHOLDER, Engine
 from engine_py.types import (ASSETS, Action, Block, Cancel, CancelByCloid, Fill, Modify, OutsideFill, Place,
                              Reject, RejectReason, Side, Tif, ZERO_HASH)
 
@@ -276,7 +276,7 @@ class Replay:
                  snapshot_shift: int = 0, outside_position: str = "end", outside_other_txs: bool = False,
                  other_position: str = "end",
                  placeholder_ttl_ms: int | None = None, placeholder_queue: str = "ahead",
-                 placeholder_cap: str | None = None, reseed_keep_known: bool = False,
+                 placeholder_cap: str | None = None, reseed_keep_known: bool = False, placeholder_split: bool = False,
                  trade_learn: str | None = None, trade_learn_at: str = "tx", oid_guard: str | None = None,
                  refill_position: str = "front",
                  oid_facts: bool = False, name_prewindow: bool = False, named_anon: str = "front",
@@ -430,6 +430,7 @@ class Replay:
             raise ValueError("reseed_keep_known needs reseed=True")
         self.placeholder_ttl_ms, self.placeholder_queue = placeholder_ttl_ms, placeholder_queue
         self.placeholder_cap, self.reseed_keep_known = placeholder_cap, reseed_keep_known   # alias, see keep_known
+        self.placeholder_split = placeholder_split  # A4a: a snapshot level's uncovered size = its uncovered orders
         self.ph_stats: Counter = Counter()          # placeholder flag effects (lots / counts)
         self.trade_learn = trade_learn
         self._rules = self.parse_trade_learn(trade_learn)
@@ -561,7 +562,8 @@ class Replay:
     def _seed(self) -> None:
         for coin in COINS:
             snap = nearest_book(self.hl_data, coin, self.t0)
-            self._seed_levels(snap.asset, snap.bids, snap.asks, snap.time_ms)
+            self._seed_levels(snap.asset, snap.bids, snap.asks, snap.time_ms,
+                              counts=(snap.bid_n, snap.ask_n) if self.placeholder_split else None)
             self.seed_offsets[coin] = snap.time_ms - self.t0
             if self.deep_book:
                 self._build_deep(snap)
@@ -766,13 +768,17 @@ class Replay:
             heapq.heappush(self._ph_heap, (time_ms, oid))
         return oid
 
-    def _seed_levels(self, asset: int, bids, asks, time_ms: int, sizes=None) -> None:
-        """One placeholder per snapshot level (tail of the level). sizes: {(side, px): lots} overrides."""
-        for side, levels in ((Side.BUY, bids), (Side.SELL, asks)):
+    def _seed_levels(self, asset: int, bids, asks, time_ms: int, sizes=None, counts=None) -> None:
+        """One placeholder per snapshot level (tail of the level). sizes: {(side, px): lots} overrides.
+        counts (A4a, --placeholder-split): (bid_n, ask_n); each level becomes n equal placeholders instead of one."""
+        for side, levels, ns in ((Side.BUY, bids, counts[0] if counts else ()),
+                                 (Side.SELL, asks, counts[1] if counts else ())):
             for rank, (px, sz) in enumerate(levels):
                 q = sz if sizes is None else sizes.get((side, px), sz)
                 if q > 0:
-                    self._seed_one(asset, side, px, q, time_ms, rank)
+                    k = max(1, min(q, ns[rank])) if rank < len(ns) else 1
+                    for piece in split_equal(q, k):
+                        self._seed_one(asset, side, px, piece, time_ms, rank)
 
     def _expire_placeholders(self, now_ms: int) -> None:
         eng = self.engine
@@ -1259,7 +1265,8 @@ class Replay:
             if self.reseed and self.keep_known:
                 res = eng.reconcile(s.asset, s.bids, s.asks, known="oldest")
                 first = eng.next_oid
-                res.update(eng.refill(s.asset, s.bids, s.asks), refill=1)
+                res.update(eng.refill(s.asset, s.bids, s.asks, counts=(s.bid_n, s.ask_n))
+                           if self.placeholder_split else eng.refill(s.asset, s.bids, s.asks), refill=1)
                 self._note_refill(s, first)
                 if self.refill_position == "back":
                     self._refill_to_back(s.asset, first)

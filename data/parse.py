@@ -473,12 +473,16 @@ class BookSnapshot:
     time_ms: int
     bids: tuple[tuple[int, int], ...]   # (px ticks, sz lots), best first
     asks: tuple[tuple[int, int], ...]
+    bid_n: tuple[int, ...] = ()         # order count per level (l2Book "n"), same order as bids; () if unknown
+    ask_n: tuple[int, ...] = ()
 
 
 def _snapshot(asset: int, d: dict) -> BookSnapshot:
     spec = ASSETS[asset]
     conv = lambda lv: tuple((spec.px_to_ticks(x["px"]), spec.sz_to_lots(x["sz"])) for x in lv)
-    return BookSnapshot(asset=asset, time_ms=d["time"], bids=conv(d["levels"][0]), asks=conv(d["levels"][1]))
+    cnt = lambda lv: tuple(int(x["n"]) for x in lv) if all("n" in x for x in lv) else ()
+    return BookSnapshot(asset=asset, time_ms=d["time"], bids=conv(d["levels"][0]), asks=conv(d["levels"][1]),
+                        bid_n=cnt(d["levels"][0]), ask_n=cnt(d["levels"][1]))
 
 
 def iter_books(hl_data, coin: str, t0_ms: int, t1_ms: int, suffix: str = "") -> Iterator[BookSnapshot]:

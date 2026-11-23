@@ -25,6 +25,9 @@ contested must not drop (paired 95% CI upper bound >= 0).** The baseline itself 
 | Nov 23 | A0 re-triage | - | analysis only | 59 contested misses classified (below) | | | n/a | this session |
 | Nov 23 | A1 dev-fast | - | analysis only | | | B0 scored (row above); 20 chunks, `docs/devfast_chunks.txt` | n/a | this session |
 | Nov 23 | A2 lead-in 300 / 600 | - | default rule | **not run: no blocks before the 150-block lead-in (QUESTIONS Q10)** | | | n | - |
+| Nov 23 | A8 queue order (26 misses split) | none run | sub-cause rule | no rule-fixable sub-cause supported by the chain's fills (below) | | | n/a | this session |
+| Nov 23 | A4(a) placeholder split | `--placeholder-split` | rule since Nov 23 | +0.0 [0.0, 0.0] (all txs byte-identical) | +0.0 [0.0, 0.0] | +0.0 [0.0, 0.0] / +0.0 [0.0, 0.0] | **n (formally passes; held, QUESTIONS Q13)** | this session |
+| Nov 23 | A4(b), A4(c) | - | - | not built this session (Q13) | | | n | - |
 
 ## Rules written before each item (Nov 23 session)
 
@@ -129,3 +132,26 @@ Switch `--placeholder-split` (default off). (a) split each placeholder level int
 later trades and cancels (a real maker filled at that level in a later tx takes the placeholder order of the matching
 size); (c) ties broken by the account's habitual order size (median size of its window orders at that asset).
 Adoption: the rule above (dev20 rule AND dev-fast contested CI upper bound >= 0).
+
+### A8 (dev20; `python -m analysis.a8_queue ...`, `handoff/a8/`)
+
+| sub-cause (first match) | misses | share of the 26's missed notional (441k USD) | checked against the chain | rule fix? |
+|---|---|---|---|---|
+| price: we filled E at a level the chain skipped | 7 | 67.7% | E's order older, placed once (cloid), never cancelled, never filled on chain; the chain swept past its level | no: E's order was not on chain (phantom, cause unseen) |
+| placement order within a block | 6 | 23.1% | chain-wide test, 169 same-block pairs: listing order agrees 89%, higher priority bid p filled first 61:3 (our docs priority already does this); in all 6 misses E was listed first AND had the higher p, yet was not filled | no: E not on chain. 0x6e8bc7cd's order: perpMarginRejected (order histories) |
+| older order the chain did not fill | 7 | 1.3% | same as "price": E placed once, never cancelled/filled; in the clearest case our level equals the chain's (4 orders, 83,604 lots) but the chain filled the newer M first | no: phantom / unknown |
+| partial fill / size | 4 | 0.7% | 4/4: the chain filled E at that price earlier, fills our engine gave to other makers | no own fix: downstream of earlier misses |
+| other | 2 | 7.3% | E placed in the tx's own block; 0x6e8bc7cd's order perpMarginRejected | no |
+| named order placement, modify semantics, priority window | 0 | 0% | - | - |
+
+Hypotheses rejected on the chain's data: cloid reuse (each E cloid placed exactly once), modify (none), named
+orders (none), the 400 ms priority window (none). **Reading: 21 of the 26 "queue" misses are not queue rules at all:
+our book holds an order of E that the chain does not (2 / 2 checkable in the order histories: perpMarginRejected).**
+That is A6's target (margin-rejected post-only orders), not A8's. No A8 switch was run because no sub-cause gave a
+rule supported by the fills.
+
+### A4(a) (`--placeholder-split`)
+Works as built (one dev20 chunk: 78 -> 781 placeholder orders after 3 blocks) but changes NO scored fill on dev20 or
+dev-fast (txs.csv byte-identical): nothing in B0 acts on individual placeholder orders (takers eat a level's
+front placeholders in order whatever the piece boundaries; scoring treats placeholder fills as anonymous; the touch
+ledger skips placeholders). It can only matter together with (b) naming or (d) count-based eviction of pieces.
