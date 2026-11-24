@@ -278,6 +278,7 @@ class Replay:
                  touch_trades_first: bool = False,
                  oracle_file: str | None = None, oracle: tuple = (), oracle_prequeue: str | None = None,
                  learn_tid: bool = False, phantom_ledger: str | None = None, phantom_mode: str | None = None,
+                 px_sigfig: str | None = None,
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
                  keep_known: bool = False, skip_lead_in: bool = False, lead_in_keep: int | None = None,
@@ -565,6 +566,13 @@ class Replay:
         self._tid_maker: dict = {}                  # (taker hash, tid) -> (height, tx, item) of the maker placement
         self._pos_eoid: dict = {}                   # (height, tx, item) -> our engine oid created by that placement
         self.tid_events: list = []                  # I27c info check: (height, coin, user, "real" | "phantom")
+        # I33 (default off): HL rejects a non-integer price with > 5 significant figures ("item": that placement;
+        # "action": also the user's adjacent order txs in the block = the explorer's split of one action)
+        if px_sigfig not in (None, "item", "action"):
+            raise ValueError(f"px_sigfig {px_sigfig!r}: item | action")
+        self.px_sigfig = px_sigfig
+        self.sigfig_stats: Counter = Counter()
+        self._sigfig_blk: tuple[int, set] | None = None
         # I27c (default off): users with tid-proven phantoms (ledger of EARLIER chunks + this chunk's earlier blocks)
         self.phantom_mode = phantom_mode
         self._ph: Counter = Counter()
@@ -1390,6 +1398,40 @@ class Replay:
         st[(name, "ledger_evicted")] += k
         return [(px, sz)]
 
+    @staticmethod
+    def _over_sigfig(p: Place) -> bool:
+        """HL price rule: a non-integer price may carry at most 5 significant figures."""
+        d = Decimal(ASSETS[p.asset].ticks_to_px(p.px))
+        if d == d.to_integral_value():
+            return False
+        return len(d.normalize().as_tuple().digits) > 5
+
+    def _sigfig_reject(self, block: Block, action: Action) -> bool:
+        p = action.new if isinstance(action, Modify) else action
+        if not isinstance(p, Place):
+            return False
+        if self.px_sigfig == "item":
+            return self._over_sigfig(p)
+        if self._sigfig_blk is None or self._sigfig_blk[0] != block.height:
+            places = sorted(((a.tx_index, a.user) for a in block.actions
+                             if isinstance(a.new if isinstance(a, Modify) else a, Place)), key=lambda x: x[0])
+            bad = {a.tx_index for a in block.actions
+                   if isinstance(a.new if isinstance(a, Modify) else a, Place)
+                   and self._over_sigfig(a.new if isinstance(a, Modify) else a)}
+            owner = {a.tx_index: a.user for a in block.actions}
+            rej = set(bad)
+            idx = sorted(owner)
+            pos = {ti: k for k, ti in enumerate(idx)}
+            for ti in bad:                               # extend over adjacent txs of the same user that place orders
+                u = owner[ti]
+                for step in (-1, 1):
+                    k = pos[ti] + step
+                    while 0 <= k < len(idx) and owner[idx[k]] == u and any(x[0] == idx[k] for x in places):
+                        rej.add(idx[k])
+                        k += step
+            self._sigfig_blk = (block.height, rej)
+        return action.tx_index in self._sigfig_blk[1]
+
     def phantom_flagged(self, user: str) -> bool:
         """I27c flag: >= 1 tid-proven phantom and more phantom than real proofs, from earlier blocks only."""
         u = (user or "").lower()
@@ -1430,6 +1472,22 @@ class Replay:
 
     def _apply(self, block: Block, action: Action) -> tuple[list[Fill], list[Reject]]:
         self.observer.before_action(self, block, action)
+        if self.px_sigfig is not None and self._sigfig_reject(block, action):
+            p = action.new if isinstance(action, Modify) else action
+            self.sigfig_stats[f"rejected_{p.tif.name}"] += 1
+            if isinstance(action, Modify):              # the cancel half still happens
+                meta = dict(user=action.user, block=action.block, tx_index=action.tx_index,
+                            item_index=action.item_index, hash=action.hash, priority=action.priority,
+                            asset=action.asset)
+                cancel = (CancelByCloid(**meta, cloid=action.target) if isinstance(action.target, str)
+                          else Cancel(**meta, oid=action.target))
+                self._block = block
+                self.engine.block_time_ms = block.time_ms
+                out = self.engine.apply(cancel)
+            else:
+                out = ([], [])
+            self.observer.after_action(self, block, action, out[0], out[1], None)
+            return out
         if self.phantom_mode == "reject":
             p = action.new if isinstance(action, Modify) else action
             if isinstance(p, Place) and p.tif is Tif.ALO and self.phantom_flagged(action.user):

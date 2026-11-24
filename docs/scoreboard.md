@@ -828,3 +828,5 @@ B3 = B2 + `--gate-spare-after`; docs/baseline.md updated; ACCURACY.md row added.
   and no set below -0.5; (5) contested flips up > down. Reported: changed chunks, changed contested txs, rejected counts.
 - **V2:** screen bar (pooled contested >= +1.0, lower >= -1.0, no acting set < 0) on dev20 + dev-fast + dm60 vs B3; a
   pass goes to a fresh-set confirm (Addendum 1 sign test). V1 and V2 Holm-paired at the confirm.
+- I33 note (written before any I33 run): decoded actions carry no explorer tx time, so V2 groups by same user +
+  adjacent listing positions in the block only (no time equality); the explorer's split txs of one action are adjacent.

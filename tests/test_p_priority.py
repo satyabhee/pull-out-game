@@ -165,3 +165,14 @@ def test_phantom_sink_off_is_unchanged():
         eng.block_time_ms = 0
         eng.apply(a)
     assert queue(eng, 100) == ["0xbad", "0xa"]          # docs p jump within the window
+
+
+def test_px_sigfig_rule():
+    # I33: HL rejects a non-integer price with more than 5 significant figures; integers always allowed
+    from engine_py.replay import Replay
+    mk = lambda px, asset=0: Place(user="0xa", asset=asset, block=1, tx_index=0, item_index=0, hash="0x" + "1" * 64,
+                                   priority=None, side=Side.BUY, px=px, sz=1, tif=Tif.ALO, cloid=None, reduce_only=False)
+    assert Replay._over_sigfig(mk(609672))          # BTC 60967.2: 6 significant figures
+    assert not Replay._over_sigfig(mk(609080))      # BTC 60908: integer
+    assert not Replay._over_sigfig(mk(171280, 1))   # ETH 1712.80 = 1712.8: 5 significant figures
+    assert Replay._over_sigfig(mk(171285, 1))       # ETH 1712.85: 6
