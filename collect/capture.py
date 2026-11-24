@@ -102,7 +102,7 @@ HIST_END_USERS = int(os.environ.get("HIST_END_USERS", 6))
 TRACKERS_FILE = os.environ.get("TRACKERS_FILE", "trackers.json")
 HIST_END_RANDOM = os.environ.get("HIST_END_RANDOM") == "1"
 HIST_IOC_USERS = int(os.environ.get("HIST_IOC_USERS", 0))   # chunks: historicalOrders at chunk end for the top IOC senders
-CAPTURE_VERSION = "2026-11-24-truth-live"      # written into every chunk's window.json (capture_version)
+CAPTURE_VERSION = "2026-11-24-truth-live2"     # written into every chunk's window.json (capture_version)
 CAPTURE_SUPERSET_OF = "2026-11-23-open-margin" # same files as that version plus new ones the replay does not read
 ALO_MARGIN_USERS = int(os.environ.get("ALO_MARGIN_USERS", 0))
 TOUCH_BP = float(os.environ.get("TOUCH_BP", 1))
@@ -115,7 +115,10 @@ TRUTH_WEIGHT_PER_MIN = int(os.environ.get("TRUTH_WEIGHT_PER_MIN", 300))
 TRUTH_STALE_S = float(os.environ.get("TRUTH_STALE_S", 360))
 MARGIN_USERS = int(os.environ.get("MARGIN_USERS", 0))   # chunks: clearinghouseState + spot of this many IOC users at plan time
 TARGET_LOOKUPS = int(os.environ.get("TARGET_LOOKUPS", 0))    # orderStatus of int-oid cancel targets in the SCORED blocks   # experiment: per-chunk coin flip (seeded by the snapshot)
-INFO_FILES = {"userFillsByTime": "fills.json", "frontendOpenOrders": "open_orders.json",
+# OPEN_ORDERS_FILE: open_orders.json is a replay input (data/oid_facts reads it); truth-only captures write it under a
+# name the replay never reads, so the chunk stays a strict superset of the open-margin inputs (Nov 24, mahito #45)
+OPEN_ORDERS_FILE = os.environ.get("OPEN_ORDERS_FILE", "open_orders.json")
+INFO_FILES = {"userFillsByTime": "fills.json", "frontendOpenOrders": OPEN_ORDERS_FILE,
               "historicalOrders": "hist_orders.json"}
 FRESH_MIN = float(os.environ.get("FRESH_MIN", 20))
 # Never request a block older than this. Nov 18 log: the cap hit while fetching ~84-min-old blocks after

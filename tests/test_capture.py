@@ -720,3 +720,7 @@ def test_truth_asker_skips_a_user_after_five_unknowns_and_reprobes(tmp_path, mon
     t.close(); t.join(5)
     assert asked == ["0x0", "0x1", "0x2", "0x3", "0x4", "0x29"]   # 5 asked, then 1 probe after 25 skips
     assert json.loads((tmp_path / "t.json").read_text())["counts"]["skipped_unanswerable_user"] == 34
+
+
+def test_open_orders_file_name_is_configurable():
+    assert cap.INFO_FILES["frontendOpenOrders"] == cap.OPEN_ORDERS_FILE
