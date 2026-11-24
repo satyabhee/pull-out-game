@@ -25,7 +25,7 @@ from engine_py.types import ASSETS
 from engine_py.matching import PLACEHOLDER
 from engine_py.types import Modify, Place, Side, Tif
 
-BBO = re.compile(r"bbo was ([0-9.]+)@([0-9.]+)")
+BBO = re.compile(r"bbo was ([0-9]+(?:\.[0-9]+)?)@([0-9]+(?:\.[0-9]+)?)")
 
 
 def _named_best(book, side: Side):
