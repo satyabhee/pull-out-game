@@ -830,3 +830,15 @@ B3 = B2 + `--gate-spare-after`; docs/baseline.md updated; ACCURACY.md row added.
   pass goes to a fresh-set confirm (Addendum 1 sign test). V1 and V2 Holm-paired at the confirm.
 - I33 note (written before any I33 run): decoded actions carry no explorer tx time, so V2 groups by same user +
   adjacent listing positions in the block only (no time equality); the explorer's split txs of one action are adjacent.
+
+### I34: gate defers after an in-block sweep, pre-registered 11:24Z Nov 24 (no I34 code or run exists yet)
+- **Info check (touch audit, RIKA.md, seen):** 33 SQD chunks, 7,033 ALOs the chain ACCEPTED: we rejected 170 (2.4%),
+  all as would-cross; 130 of them by the ALO gate while our in-block engine book did NOT cross; in 120 of those 130 an
+  EARLIER tx of the same block traded on the crossing side at / through the gate's touch price (recorded trades, taker
+  tx listed before the ALO). The gate reads the previous block's post-block bbo, so it cannot see the in-block sweep.
+- **Rule (`--gate-insweep`, default off):** when a recorded trade of an earlier tx in the same block (execution order)
+  hit the ALO's crossing side at or through the gate's touch price, the gate abstains for that ALO and the engine's own
+  crossing check decides. Causal: only trades of txs executed before the ALO are used (rule 1).
+- **Normal screen (one variant):** B3 vs B3 + `--gate-insweep` on dev20 + dev-fast + dm60, analysis.pooled_paired;
+  promote iff pooled contested >= +1.0, lower >= -1.0, no acting set < 0; then a fresh-set confirm (Addendum 1 sign test).
+  Reported: changed chunks / contested flips, uncontested, gate abstains added. Full-visibility sim must stay 394 / 394.
