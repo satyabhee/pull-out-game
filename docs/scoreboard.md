@@ -761,3 +761,6 @@ after NS-6): ALL 5 MET.** B2 (`bf1_*`) vs B2 + `--gate-spare-after` (`i21b2_*`),
 | 5 flips majority positive | contested 13 up / 2 down (10 changed chunks); uncontested 8 up / 1 down | yes |
 Pooled contested **+1.9 [+0.8, +3.3]** (n 552, 159 chunks; 0.514 -> 0.533). Next as registered: Rust parity (queued),
 then NEEDS_SATYA "bug-fix adoption of I21 as B3" (reversible, 3-hour default).
+**I21-on-B2 Rust parity (07:25Z):** replay.parity, options_for(stp=maker) + `--touch-trades-first --gate-spare-after`
+vs i21b2_dev20 / i21b2_devfast: PARITY OK, every CSV identical. NS-11 (a) unblocked (default 10:22Z).
+**I27 tid solve, dev_margin60 (07:16Z, inside a hold):** 917 of 1,332 trades solved (69%); dev20 44%, dev-fast 78%.
