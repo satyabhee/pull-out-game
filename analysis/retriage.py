@@ -9,7 +9,7 @@ classified at the first point where its real and engine fills diverge, in the ru
 ordering > placeholder > margin-rejected IOC/ALO > phantom > lost order > queue > other.
 
 usage: python -m analysis.retriage <chunk-parent dir> --hl-data DIR --audit report/validate/order_audit_dev20
-       --out DIR
+       --out DIR [--stp maker --extra "--touch-trades-first"]   (B2; default = B1)
 """
 from __future__ import annotations
 
@@ -110,9 +110,11 @@ def main(argv=None) -> int:
     ap.add_argument("--hl-data", required=True)
     ap.add_argument("--audit", required=True, help="order_audit output (blocks.csv: c_only = class sort fixes)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--stp", default="taker", choices=("taker", "maker"), help="maker for B2 (docs/baseline.md)")
+    ap.add_argument("--extra", default="", help='extra replay options, e.g. "--touch-trades-first" for B2')
     a = ap.parse_args(argv)
     hl = Path(a.hl_data)
-    policy, opts = split_policy(options_for())
+    policy, opts = split_policy(options_for(stp=a.stp) + a.extra.split())
     kw = run_kwargs_from_options(hl, opts)
     fix_blocks = {(r["chunk"], int(r["block"])) for r in csv.DictReader(open(Path(a.audit) / "blocks.csv"))
                   if int(r["c_only"]) > 0}
