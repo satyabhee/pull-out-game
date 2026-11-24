@@ -44,6 +44,8 @@ def main(argv=None) -> int:
     ap.add_argument("--windows", default=str(HOME / "hl-data/mac3/windows"))
     ap.add_argument("--n", type=int, default=60)
     ap.add_argument("--max-sets", type=int, default=5)
+    ap.add_argument("--after", type=int, default=0, help="only chunks starting after this height (mahito #59: C3 starts "
+                                                          "after dev_cap20's last chunk, 1233109679)")
     a = ap.parse_args(argv)
     handoff = HOME / "book-replay-data/handoff"
     bench = handoff / "benchmark_postchange.txt"
@@ -54,7 +56,7 @@ def main(argv=None) -> int:
     outdir = handoff / "confirm_sets"
     outdir.mkdir(exist_ok=True)
     used = used_chunks(HOME / "hl-data/mac3", handoff)
-    q = [c for c in qualifying(Path(a.windows)) if int(c.name.split("-")[0]) > last
+    q = [c for c in qualifying(Path(a.windows)) if int(c.name.split("-")[0]) > max(last, a.after)
          and c.name not in used and c.name not in REPLAYED]
     k = len(list(outdir.glob("C*.txt")))
     print(f"qualifying after the benchmark (last start {last}), not in any set: {len(q)}; sets already frozen: {k}",
