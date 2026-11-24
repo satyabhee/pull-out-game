@@ -75,6 +75,7 @@ def run_one(a) -> int:
                     "named_bid": _named_best(book, Side.BUY), "named_ask": _named_best(book, Side.SELL),
                     "opp_level_kind": _level_kind(book, opp, book.best_ask() if opp is Side.SELL else book.best_bid()),
                     "gate_bid": tb[0], "gate_ask": tb[1], "gate_age_ms": tb[2],
+                    "user_resting": len(rp.engine.by_user.get(action.user, {})),   # I32 info check (our count)
                 }
             else:
                 self._cur = None
@@ -132,6 +133,9 @@ def summarize(files):
         return "gate == chain" if g == c else ("gate worse than chain (admits)" if ((g > c) if buy else (g < c)) else "gate better than chain")
     out["WE ADMITTED a chain reject: gate touch vs chain bbo"] = dict(Counter(gate_vs_chain(r) for r in adm))
     out["by tracked (admitted chain rejects)"] = dict(Counter(r["tracked"] for r in adm))
+    cap = [r.get("user_resting") for r in rows if "Too many open orders" in (r["chain_text"] or "")]
+    out["I32: our resting count at chain open-order-cap rejects (min / median / max, n)"] = (
+        [min(cap), sorted(cap)[len(cap) // 2], max(cap), len(cap)] if cap and None not in cap else None)
     out["chunks"] = len({r["chunk"] for r in rows})
     return out
 
