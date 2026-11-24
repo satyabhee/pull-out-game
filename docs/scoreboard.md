@@ -639,3 +639,11 @@ lines unchanged). Corrected I21 screen: pooled contested **+2.7 [+0.8, +4.9]** (
 still above the bar; no past promotion decision changes (I01 V1-V3, I23 and A3 failed on per-set or point criteria that
 the duplicates do not flip; to re-check I23: Yuta). Also: **dev20 is a subset of final240** (20 of 240; dev20 ⊂ held67
 ⊂ held ⊂ final240), and confirm_margin60 / confirm2_margin60 each share 3 chunks with dev-fast: NS-8.
+
+**Full-visibility sim sweep (00:01Z Nov 24, `analysis.sim_switch_check`, 10 seeds, 394 scored txs; base = listing,
+stp expire_maker, docs priority, `--alo-gate touch --touch-trades-first`):** each of 18 switches added singly stays at
+394 / 394 (trade corrections block-end / tx, reseed, keep-known, nearest-ratio, outside-other-txs, deep-book,
+evict-arrival, oid-bracket, touch-reconcile, ledger, taker-reject margin, gate-spare-after, multi-lite, named-cancel,
+touch-refill, touch-n-cap). Only `--p-priority always` falls short (218 / 395), as expected: it ignores the documented
+400 ms window (control, not in B1). So under full visibility the only B1 deviations are I25 and I26.
+(handoff/i21/sim_sweep.json)
