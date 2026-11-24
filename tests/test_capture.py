@@ -627,3 +627,76 @@ def test_chunk_capture_asks_suspect_lookups_in_scored_blocks_only_and_keeps_anch
     assert [r["user"] for r in st] == ["0xu1", "0xu3", "0xu1", "0xu3"]
     assert all(r["placed_height"] >= 1150 for r in st)
     assert not {(r["user"], r["oid"]) for r in st} & {(a["user"], a["oid"]) for a in json.loads(base_anchors)}
+
+
+class IocFetcher(StubFetcher):
+    """Every block: one BTC IOC with a cloid, one ETH IOC without a cloid, one ALO, one errored IOC."""
+
+    def get(self, h):
+        txs = [px_tx("0xi%d" % (h % 3), h, [item(f"0x{h:04x}i", tif="Ioc")]),
+               px_tx("0xn", h, [item(None, a=1, tif="Ioc")]),
+               px_tx("0xa", h, [item(f"0x{h:04x}a")]),
+               px_tx("0xe", h, [item(f"0x{h:04x}e", tif="Ioc")], error="rejected")]
+        b = {"height": h, "blockTime": 5000 + h, "numTxs": len(txs), "txs": txs}
+        return b, json.dumps({"blockDetails": b}).encode()
+
+
+def test_ioc_items_takes_btc_eth_iocs_with_cloid_from_ok_txs():
+    b, _ = IocFetcher().get(1200)
+    assert cap.ioc_items(b, 1200) == [(1200, 0, 0, "0xi0", "0x04b0i", 6200)]
+
+
+class FreeBudget:
+    def __init__(self):
+        self.taken = 0
+
+    def take(self, w):
+        self.taken += w
+
+
+def test_truth_asker_caps_skips_stale_and_writes_its_file(tmp_path):
+    asked = []
+    now = [10.0]
+    bud, tb = FreeBudget(), FreeBudget()
+    t = cap.TruthAsker(str(tmp_path / "truth_status.json"), 3, bud,
+                       lookup=lambda u, c: asked.append((u, c)) or {"status": "order", "order": {"status": "iocCancelRejected"}},
+                       truth_bud=tb, clock=lambda: now[0], stale_s=5)
+    t.feed([(1, 0, 0, "0xa", "0xc1", 9_000), (2, 0, 0, "0xb", "0xc2", 1_000), (3, 0, 0, "0xc", "0xc3", 9_500),
+            (4, 0, 0, "0xd", "0xc4", 9_900)])                     # the 4th is over the cap
+    t.close(); t.join(5)
+    out = json.loads((tmp_path / "truth_status.json").read_text())
+    assert asked == [("0xa", "0xc1"), ("0xc", "0xc3")]          # 0xc2 was 9 s old at asking time: skipped
+    assert out["queued"] == 3 and out["counts"] == {"over_cap": 1, "skipped_stale": 1, "status:iocCancelRejected": 2}
+    assert [r["placed_height"] for r in out["rows"]] == [1, 3]
+    assert bud.taken == 4 and tb.taken == 4                      # weight 2 per call, booked in both budgets
+
+
+def test_chunk_capture_truth_ioc_asks_scored_iocs_and_keeps_anchors_unchanged(tmp_home, monkeypatch):
+    calls = []
+    w = cap.Writer(lookup=lambda u, k: {"status": "order"}, info_gap_s=0)
+    cap.capture(IocFetcher(), 1000, 1179, {"kind": "chunk"}, writer=w, state={}, warmup=150, max_anchors=20)
+    d = tmp_home / "windows" / "1000-1179"
+    base = (d / "anchors.json").read_text()
+    for f in d.iterdir():
+        f.unlink()
+    monkeypatch.setattr(cap, "TRUTH_IOC", 10)
+    monkeypatch.setattr(cap, "order_status", lambda u, c: calls.append((u, c)) or {"status": "unknownOid"})
+    monkeypatch.setattr(cap, "_TRUTH_BUDGET", cap.info.Budget(per_min=10_000))
+    made = []
+    orig = cap.TruthAsker
+
+    class Spy(orig):
+        def __init__(self, *a, **k):
+            k["stale_s"] = 1e12
+            super().__init__(*a, **k)
+            made.append(self)
+    monkeypatch.setattr(cap, "TruthAsker", Spy)
+    meta = {"kind": "chunk"}
+    assert cap.capture(IocFetcher(), 1000, 1179, meta, writer=w, state={}, warmup=150, max_anchors=20) == "complete"
+    made[0].join(10)
+    strip = lambda t: [{k: v for k, v in a.items() if k != "asked_at"} for a in json.loads(t)]
+    assert strip((d / "anchors.json").read_text()) == strip(base)
+    out = json.loads((d / "truth_status.json").read_text())
+    assert meta["truth_ioc_queued"] == 10 == out["queued"] and len(calls) == 10
+    assert all(r["placed_height"] >= 1150 for r in out["rows"])  # scored blocks only
+    assert out["counts"]["over_cap"] == 20 and out["counts"]["status:unknownOid"] == 10

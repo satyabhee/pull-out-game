@@ -55,6 +55,12 @@ Settings (environment variables):
                        users in the scored blocks, asked as soon as the blocks are fetched, one user at a time in
                        suspect order (round robin): chain truth for phantom/queue cases. suspect_status.json (not
                        anchors.json, so the replay never reads it); meta suspect_lookups / suspect_candidates
+  TRUTH_IOC=0          chunks: orderStatus (weight 2) by cloid of up to this many BTC/ETH IOC placements in the
+                       scored blocks, asked as each block is fetched (statuses of rejected IOCs are gone within
+                       minutes: 15/15 known at 2.5 min, 6/8 at 7 min, 0-1/8 after 4 h), on a low-priority thread
+                       capped at TRUTH_WEIGHT_PER_MIN=300 (inside INFO_WEIGHT_PER_MIN); items older than
+                       TRUTH_STALE_S=360 s are skipped. truth_status.json (oracle truth, BLITZ Addendum 3: the replay
+                       never reads it; written by the thread itself when the chunk's items are done)
   TOUCH_BP=1           post-only placement counts as "at the touch" within this many bp of the coin's last trade
   SUSPECTS_FILE=suspects.json
   HIST_END_USERS=6     chunks: historicalOrders (~120 weight each, reserved up front so they queue under the
@@ -93,14 +99,17 @@ HIST_END_USERS = int(os.environ.get("HIST_END_USERS", 6))
 TRACKERS_FILE = os.environ.get("TRACKERS_FILE", "trackers.json")
 HIST_END_RANDOM = os.environ.get("HIST_END_RANDOM") == "1"
 HIST_IOC_USERS = int(os.environ.get("HIST_IOC_USERS", 0))   # chunks: historicalOrders at chunk end for the top IOC senders
-CAPTURE_VERSION = "2026-11-23-open-margin"     # written into every chunk's window.json (capture_version)
-CAPTURE_SUPERSET_OF = "2026-11-23-alo-margin"  # same files as that version plus new ones the replay does not read
+CAPTURE_VERSION = "2026-11-24-truth-live"      # written into every chunk's window.json (capture_version)
+CAPTURE_SUPERSET_OF = "2026-11-23-open-margin" # same files as that version plus new ones the replay does not read
 ALO_MARGIN_USERS = int(os.environ.get("ALO_MARGIN_USERS", 0))
 TOUCH_BP = float(os.environ.get("TOUCH_BP", 1))
 SUSPECTS_FILE = os.environ.get("SUSPECTS_FILE", "suspects.json")
 OPEN_MARGIN_USERS = int(os.environ.get("OPEN_MARGIN_USERS", 0))
 OPEN_MARGIN_DELAY_S = float(os.environ.get("OPEN_MARGIN_DELAY_S", 62))
 SUSPECT_LOOKUPS = int(os.environ.get("SUSPECT_LOOKUPS", 0))
+TRUTH_IOC = int(os.environ.get("TRUTH_IOC", 0))                 # chunks: orderStatus of this many scored-block IOCs
+TRUTH_WEIGHT_PER_MIN = int(os.environ.get("TRUTH_WEIGHT_PER_MIN", 300))
+TRUTH_STALE_S = float(os.environ.get("TRUTH_STALE_S", 360))
 MARGIN_USERS = int(os.environ.get("MARGIN_USERS", 0))   # chunks: clearinghouseState + spot of this many IOC users at plan time
 TARGET_LOOKUPS = int(os.environ.get("TARGET_LOOKUPS", 0))    # orderStatus of int-oid cancel targets in the SCORED blocks   # experiment: per-chunk coin flip (seeded by the snapshot)
 INFO_FILES = {"userFillsByTime": "fills.json", "frontendOpenOrders": "open_orders.json",
@@ -161,6 +170,92 @@ def order_status(user, oid):
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())
+
+
+def ioc_items(block, height):
+    """[(height, tx index, item index, user, cloid, block time ms)] of the BTC/ETH IOC placements with a cloid."""
+    out = []
+    for t, tx in enumerate(block.get("txs", [])):
+        if tx.get("error") is not None:
+            continue
+        a = tx.get("action") or {}
+        if a.get("type") != "order":
+            continue
+        for i, o in enumerate(a.get("orders", [])):
+            if isinstance(o, dict) and o.get("a") in (0, 1) and o.get("c") and \
+                    ((o.get("t") or {}).get("limit") or {}).get("tif") == "Ioc":
+                out.append((height, t, i, tx.get("user", "").lower(), o["c"], block.get("blockTime")))
+    return out
+
+
+_TRUTH_BUDGET = None
+
+
+def truth_budget():
+    global _TRUTH_BUDGET
+    if _TRUTH_BUDGET is None:
+        _TRUTH_BUDGET = info.Budget(per_min=TRUTH_WEIGHT_PER_MIN)
+    return _TRUTH_BUDGET
+
+
+class TruthAsker:
+    """One chunk's live chain-truth lookups (orderStatus by cloid), on its own daemon thread so the fetch loop and
+    the writer queue never wait for it. Each call books weight twice: in the low-priority truth budget (its own
+    cap) and in the capture's global budget (so the IP total stays inside INFO_WEIGHT_PER_MIN). close() makes the
+    thread write `path` once its queue is done; join() waits (tests)."""
+
+    def __init__(self, path, cap, budget, lookup=None, truth_bud=None, clock=time.time, stale_s=None):
+        self.path, self.cap, self.budget = path, cap, budget
+        self.lookup = lookup or order_status
+        self.truth_bud = truth_bud or truth_budget()
+        self.clock = clock
+        self.stale_s = TRUTH_STALE_S if stale_s is None else stale_s
+        self.q = queue.Queue()
+        self.rows, self.queued = [], 0
+        self.counts = collections.Counter()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def feed(self, items):
+        for it in items:
+            if self.queued >= self.cap:
+                self.counts["over_cap"] += 1
+                continue
+            self.queued += 1
+            self.q.put(it)
+
+    def close(self):
+        self.q.put(None)
+
+    def join(self, timeout=None):
+        self.thread.join(timeout)
+
+    def _run(self):
+        while True:
+            it = self.q.get()
+            if it is None:
+                break
+            h, t, i, u, c, bt = it
+            if bt is not None and self.clock() * 1000 - bt > self.stale_s * 1000:
+                self.counts["skipped_stale"] += 1
+                continue
+            self.truth_bud.take(2)
+            self.budget.take(info.weight_of("orderStatus"))
+            asked = self.clock()
+            try:
+                r = self.lookup(u, c)
+            except Exception as e:
+                r = {"error": repr(e)}
+            st = r.get("order", {}).get("status") if isinstance(r, dict) and r.get("status") == "order" else \
+                (r.get("status") if isinstance(r, dict) else None) or "error"
+            self.counts[f"status:{st}"] += 1
+            self.rows.append({"placed_height": h, "tx": t, "item": i, "user": u, "cloid": c, "block_time": bt,
+                              "asked_at": asked, "answered_at": self.clock(), "answer": r})
+        try:
+            save_json(self.path, {"kind": "truth_status", "queued": self.queued, "counts": dict(self.counts),
+                                  "rows": self.rows})
+        except Exception:
+            pass
 
 
 class Writer:
@@ -713,6 +808,7 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
     suspect_set, scands = set(suspects), []
     alos = []
     iocs = collections.Counter()
+    truth = TruthAsker(os.path.join(d, "truth_status.json"), TRUTH_IOC, writer.budget) if TRUTH_IOC else None
     for i, h in enumerate(range(start, end + 1)):
         p = os.path.join(d, f"{h}.json.gz")
         b = None
@@ -763,6 +859,11 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
             if ALO_MARGIN_USERS:
                 alos += alo_placements(b)
             if h >= start + warmup:
+                if truth is not None:
+                    try:
+                        truth.feed(ioc_items(b, h))
+                    except Exception as e:           # never lose a chunk over oracle truth
+                        meta["truth_error"] = repr(e)
                 if suspect_set:
                     scands += suspect_candidates(b, h, suspect_set)
                 for u, oid in int_oid_targets(b):
@@ -777,6 +878,9 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
         if i % 300 == 0 and i:
             meta["blocks_on_disk"] = len(glob.glob(os.path.join(d, "*.json.gz")))
             save_json(wpath, meta); save_json(apath, old + writer.snapshot())
+    if truth is not None:
+        meta["truth_ioc_queued"] = truth.queued
+        truth.close()
     meta["int_cancel_users"] = dict(sorted(cancels.items(), key=lambda x: (-x[1], x[0]))[:30])
     meta["ioc_users"] = dict(sorted(iocs.items(), key=lambda x: (-x[1], x[0]))[:100])
     if ALO_MARGIN_USERS and alos:
