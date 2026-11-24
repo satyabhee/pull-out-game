@@ -21,7 +21,10 @@ from analysis.validate_chunks import find_chunks
 VERSION = "2026-11-23-alo-margin"
 # open-margin (Yuta, Nov 23 17:52Z) is a strict superset of alo-margin: the replay's inputs are produced exactly as
 # before and v3 output is byte-identical with or without the new files (mail to_mahito #16), so it qualifies too
-VERSIONS = (VERSION, "2026-11-23-open-margin")
+# truth-live (Nov 24 00:14Z) wrote open_orders.json (a replay input: oid facts); Yuta renamed it to open_orders_truth.json
+# in every truth-live chunk before any replay (mail to_mahito #37 / to_yuta #47), so those chunks carry the same replay
+# inputs as open-margin; truth-live2 writes the truth-only name from the start.
+VERSIONS = (VERSION, "2026-11-23-open-margin", "2026-11-24-truth-live", "2026-11-24-truth-live2")
 FIRST = 71                      # 1-based rank of the first benchmark chunk among qualifying chunks
 # chunks already replayed by anyone; skipped inside the benchmark range (ranks 1-70, Yuta's lists, never shift)
 REPLAYED = {
