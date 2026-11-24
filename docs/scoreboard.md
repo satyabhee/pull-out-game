@@ -899,3 +899,9 @@ seldom sit at scored contested fills).
 **I42 count audit (lead L12; 14:54Z; measurement, rule in IDEAS I42):** pooled over dev20 / dev-fast / dm60 (77 chunks):
 our pre-block named orders at the touch exceed the previous block's bbo n ("phantom-certain") in 28% of contested misses
 (n 168) vs 19% of hits (n 143): +0.09 [-0.016, +0.198]. CI includes 0 -> I40 (pseudo-orders from n) to the bottom.
+
+**I37 screen (15:20Z Nov 24; dev_cap20, 19 scored chunks; B3 vs B3 + `--cap-windows`): both FAIL.**
+V1 (`--cap-free any`): inert (0 txs change). V2 (`--cap-free removed`): contested +1.5 [-3.2, +5.1] (n 236; 10 up / 5 down,
+5 changed chunks), uncontested -0.4 [-2.7, +1.1] (1 up / 2 down): lower bound below -1.0 -> not promoted; near-miss
+(point >= +0.5): re-screen after the next adoption, and when more open_book_users dev chunks exist (a larger dev set would be
+a NEW pre-registered screen, not a second look at this one).
