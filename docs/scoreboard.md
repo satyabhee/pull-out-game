@@ -737,3 +737,15 @@ placements at p (pre-window) 120 / 10, no match 278 / 24, ambiguous 8 / 2. Slip:
 
 **B2 adopted (04:49Z Nov 24): bug-fix adoption of BF1** (NS-10 default (a), no answer by 04:48Z; Rust parity OK).
 B2 = B1 + `--touch-trades-first` + `--stp expire_maker`; docs/baseline.md updated; ACCURACY.md row added. Reversible.
+
+**I27a screen result (05:35Z Nov 24; B2 = bf1_* vs B2 + `--learn-tid`; dev20, dev-fast, dm60): FAILED (inert).**
+Pooled contested +0.0 [+0.0, +0.0] (n 314, 78 chunks), uncontested +0.0 (n 632); every set +0.0; 0 txs changed, 0
+changed chunks. The switch acts (one dev20 chunk probe: 4 tid_exact_cuts, 3 placeholder orders cut) but the tid-pinned
+cut lands where the old rule cuts (the maker's first order at p), so no fill changes. Reading: B2's queue correction
+already picks the order the chain filled whenever it fires; fill identity adds nothing THROUGH THIS CORRECTION. Not
+promoted. Fill identity may still help where no correction fires (e.g. as phantom evidence for orders never filled while
+later ones are): not pre-registered, not run.
+
+**ORACLE (Addendum 3) complete (05:00Z; handoff/ORACLE.md):** O1+O3+O4 0.0; O2 contested -0.15 [-0.93, +0.65], uncontested
++1.08; O-all contested +0.43 [+0.00, +1.03], uncontested +1.20 [+0.46, +2.01]; residual 343 / 344 B1 contested misses.
+Full-visibility sim: all 66 switch pairs on the B2 base 394 / 394 (handoff/i21/sim_pairs_b2.json).
