@@ -905,3 +905,14 @@ V1 (`--cap-free any`): inert (0 txs change). V2 (`--cap-free removed`): conteste
 5 changed chunks), uncontested -0.4 [-2.7, +1.1] (1 up / 2 down): lower bound below -1.0 -> not promoted; near-miss
 (point >= +0.5): re-screen after the next adoption, and when more open_book_users dev chunks exist (a larger dev set would be
 a NEW pre-registered screen, not a second look at this one).
+
+### I43: snapshot reconcile evicts known orders newest-first, pre-registered 15:27Z Nov 24 (no I43 code or run exists yet)
+- **Info (seen):** B3 tid_triage (227 tid-pinned fills of 90 B3 misses): the chain's exact filled order was REMOVED
+  from our book before the tx in 17 fills, 14 of them by the snapshot reconcile's known-order eviction (B3: reseed +
+  keep-known -> Engine.reconcile(known="oldest"), by arrival with --evict-arrival). The phantoms that sit ahead of real
+  makers are mostly FRESH (70% placed in the same block as the filled order; SQD: perpMargin / cap rejects), while
+  oldest-first evicts the aged orders, which survived on chain long enough to be real.
+- **Rule (`--reseed-evict newest`, default oldest = B3):** under reseed + keep-known, the reconcile removes the drift
+  from known orders newest-first (by arrival with --evict-arrival).
+- **Screen (one variant):** B3 vs B3 + `--reseed-evict newest` on dev20 + dev-fast + dm60, pooled_paired, promotion bar;
+  then a fresh-set confirm (C1, Addendum 1 sign test). Full-visibility sim must stay 394 / 394.
