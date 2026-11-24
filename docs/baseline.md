@@ -3,7 +3,29 @@
 Path for other worktrees: `~/book-replay/docs/baseline.md` (branch `mahito`). Any change to the baseline is made
 HERE, in the same commit that adopts it, with a row in `docs/scoreboard.md`.
 
-## Current baseline: B2 = B1 + `--touch-trades-first` + `--stp expire_maker` (since Nov 24 04:49Z; bug-fix adoption, NS-10 default)
+## Current baseline: B3 = B2 + `--gate-spare-after` (since Nov 24 10:22Z; bug-fix adoption, NS-11 default)
+
+I21 on B2 passed all 5 pre-registered bug-fix-track checks (docs/scoreboard.md "I21 on B2"): pooled 5-set contested
++1.9 [+0.8, +3.3], every set > 0, 13 up / 2 down; uncontested +0.6 [+0.1, +1.3]; Rust parity byte-identical
+(dev20, dev-fast). `--gate-spare-after`: an admitted ALO that crosses an order placed AFTER the gate's touch evidence
+evicts nothing (evidence older than an order cannot disprove it). Reversible: revert to B2 below.
+
+```
+--alo-gate touch --reseed --nearest-ratio 3 --keep-known --outside-other-txs --deep-book --p-priority docs \
+--evict-arrival --oid-bracket --touch-reconcile --touch-evict ledger --ledger-k 99 \
+--learn-evidence tx --taker-reject margin --trade-learn-at block-end --touch-trades-first --gate-spare-after \
+--policy listing --stp expire_maker
+```
+
+| set | contested strict | uncontested strict | reference outputs |
+|---|---|---|---|
+| dev20 | 0.605 | 0.723 | `report/validate/i21b2_dev20` |
+| dev-fast | 0.522 | 0.731 | `report/validate/i21b2_devfast` |
+| dev_margin60 | 0.542 | 0.705 | `report/validate/i21b2_dev_margin60` |
+| confirm_alo2_60 / confirm_fast5_60 (retired) | | | `report/validate/i21b2_confirm_alo2_60`, `i21b2_confirm_fast5_60` |
+Contested sets fixed by B1's reference runs, as for B2.
+
+## Previous baseline: B2 = B1 + `--touch-trades-first` + `--stp expire_maker` (Nov 24 04:49Z - 10:22Z; bug-fix adoption, NS-10 default)
 
 BF1 passed all 5 pre-registered bug-fix-track checks (docs/scoreboard.md "BF1"; Addendum 1.4): pooled 5-set contested
 +2.8 [+1.0, +5.0], 20 up / 4 down, uncontested +0.1, full-visibility sim 394 / 394 under all 18 single switches, Rust

@@ -806,3 +806,6 @@ queued ahead of it by our docs rule cannot have existed on chain (a real one wou
 pairs show): they are PHANTOMS (H-reject; H-jump refuted). They cannot have been rejected for crossing (X rested at the
 same price on the same side), so margin-type item rejections or invisible removals are the candidates (Yuta's status
 truth: perpMarginRejected seen among the few known).
+
+**B3 adopted (10:24Z Nov 24): bug-fix adoption of I21 on B2** (NS-11 default (a), no answer by 10:22Z; Rust parity OK).
+B3 = B2 + `--gate-spare-after`; docs/baseline.md updated; ACCURACY.md row added. Reversible.
