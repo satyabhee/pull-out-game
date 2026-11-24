@@ -80,14 +80,14 @@ def align(explorer_txs, sqd_actions):
     pool = defaultdict(list)
     for a in sqd_actions:
         for j, it in enumerate(item_list(a["action"])):
-            pool[(a["user"].lower(), json.dumps(it, sort_keys=True))].append((a, j))
+            pool[((a.get("user") or "").lower(), json.dumps(it, sort_keys=True))].append((a, j))
     out = {}
     for t, tx in enumerate(explorer_txs):
         its = item_list(tx.get("action") or {})
         if not its:
             out[t] = None
             continue
-        k = (tx["user"].lower(), json.dumps(its[0], sort_keys=True))
+        k = ((tx.get("user") or "").lower(), json.dumps(its[0], sort_keys=True))
         if not pool[k]:
             out[t] = None
             continue
