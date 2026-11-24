@@ -24,7 +24,8 @@ VERSION = "2026-11-23-alo-margin"
 # truth-live (Nov 24 00:14Z) wrote open_orders.json (a replay input: oid facts); Yuta renamed it to open_orders_truth.json
 # in every truth-live chunk before any replay (mail to_mahito #37 / to_yuta #47), so those chunks carry the same replay
 # inputs as open-margin; truth-live2 writes the truth-only name from the start.
-VERSIONS = (VERSION, "2026-11-23-open-margin", "2026-11-24-truth-live", "2026-11-24-truth-live2")
+VERSIONS = (VERSION, "2026-11-23-open-margin", "2026-11-24-truth-live", "2026-11-24-truth-live2",
+            "2026-11-24-truth-live3")   # truth-live3 adds open_book_users.json (not read by the replay unless I37 is on)
 FIRST = 71                      # 1-based rank of the first benchmark chunk among qualifying chunks
 # chunks already replayed by anyone; skipped inside the benchmark range (ranks 1-70, Yuta's lists, never shift)
 REPLAYED = {
