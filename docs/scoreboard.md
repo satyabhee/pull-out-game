@@ -842,3 +842,7 @@ B3 = B2 + `--gate-spare-after`; docs/baseline.md updated; ACCURACY.md row added.
 - **Normal screen (one variant):** B3 vs B3 + `--gate-insweep` on dev20 + dev-fast + dm60, analysis.pooled_paired;
   promote iff pooled contested >= +1.0, lower >= -1.0, no acting set < 0; then a fresh-set confirm (Addendum 1 sign test).
   Reported: changed chunks / contested flips, uncontested, gate abstains added. Full-visibility sim must stay 394 / 394.
+
+**O5 ALL-USER ORACLE (RIKA R2; 12:00Z Nov 24; look-ahead by design, diagnostic only; B3; dev-fast + dm60):** all-user SQD
+truth on 56 covered contested misses: +2.86 pt [+0.48, +5.66] (6 fixed, 7 up / 1 down); tracked-only truth +0.00 on
+identical runs; ceiling @100% coverage 5.7 pt [1.0, 11.2]. Branch ">= ~2 pt" (CI lower end 1.0). NS-13 (AWS plan).
