@@ -647,3 +647,8 @@ evict-arrival, oid-bracket, touch-reconcile, ledger, taker-reject margin, gate-s
 touch-refill, touch-n-cap). Only `--p-priority always` falls short (218 / 395), as expected: it ignores the documented
 400 ms window (control, not in B1). So under full visibility the only B1 deviations are I25 and I26.
 (handoff/i21/sim_sweep.json)
+
+**I26 screen result (00:19Z Nov 24): FAIL (inert).** B1 vs B1 + `--stp expire_maker`: pooled contested +0.0 [+0.0, +0.0]
+(n 314, 78 chunks), uncontested +0.0; **0 changed scored txs, 0 changed chunks on all three sets** (self-trades never
+reach a scored tx on dev). Not promoted. It matches the documented chain rule and costs nothing; it stays default-off
+and is re-checked only inside a later bug-fix bundle (if any), not on its own. handoff/i21/i26_screen.txt.
