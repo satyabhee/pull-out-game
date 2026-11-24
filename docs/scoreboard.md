@@ -677,3 +677,15 @@ data fact; I26 alone is inert on real data; the sim is exact only with both.
   docs/baseline.md, ACCURACY.md ("bug-fix adoption"), ANATOMY redo, final240 headline per the pre-approval (reporting
   only; NS-8 decides whether dev20 is excluded from it). **If any fails:** BF1 not adopted; I25 waits for the next
   baseline's re-screen.
+
+**BF1 bug-fix-track evaluation (01:48Z Nov 24; checks written 0833309 before any BF1 run): ALL 5 MET.**
+| check | result | met |
+|---|---|---|
+| 1 citation | bbo / trade times = block times (bbo post-block, trades intra-block); D5 stp | yes |
+| 2 sim | BF1 394 / 394; each of 18 single switches on BF1's base 394 / 394 (re-run on committed code dcad22e; handoff/i21/bf1_sim.log) | yes |
+| 3 contested point > 0 on >= 3 of 5, none < 0 | dev20 0.00 (one tx +1, one -1), dev-fast +2.0, dm60 +0.9, alo2 +6.4, fast5 +4.3 | yes |
+| 4 uncontested not worse | pooled +0.1 [-0.3, +0.6] (n 1267); every set >= 0 | yes |
+| 5 flips | 20 up / 4 down (shared chunks once) | yes |
+Pooled over the 5 sets (chunks once): contested **+2.8 [+1.0, +5.0]** (0.488 -> 0.516, n 554, 159 chunks). Changed
+chunks: dev20 2, dev-fast 1, dm60 5 (+3 uncontested), alo2 5, fast5 3 (+3 uncontested). Next: Rust parity (dev20 +
+dev-fast), then NS-9 default -> B2. handoff/i21/bf1_eval.txt.
