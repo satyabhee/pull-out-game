@@ -852,3 +852,5 @@ dev20 / dev-fast / dm60 contested +0.0 / +0.0 / +0.0, uncontested +0.0 each: 0 s
 unscored txs only; 383 violating placements per 6 dm60 chunks sit away from scored fills). Check 3 (point > 0 on >= 3 of 5
 sets) can no longer be met, so the 2 confirm-set runs were stopped. The rule stays documented chain behaviour (kept as a
 switch, default off). V2 (action rule) screen running as pre-registered.
+**I33 V2 (`--px-sigfig action`) screen (13:35Z Nov 24): FAIL (inert).** Pooled contested +0.0 [+0.0, +0.0]
+(n 311), uncontested +0.0; 0 txs changed on dev20 / dev-fast / dm60. I33 closed (both variants inert on scored txs).
