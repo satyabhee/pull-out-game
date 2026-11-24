@@ -869,3 +869,10 @@ switch, default off). V2 (action rule) screen running as pre-registered.
   window placements are not applied, except after that user's own cancels / fills in the window free a slot (one
   placement per freed slot). Screen: B3 vs B3 + V1 on dev_cap20 (pooled_paired; promotion bar), confirm on the next
   fresh set that carries open_book_users.json (Addendum 1 sign test).
+- I37 notes (written 14:29Z, before any I37 code run): "last 2 snapshots before the chunk" = the last two
+  open_book_users.json snapshots with answered_at < the chunk's first block time (a chunk's own file is often answered
+  after its start: 98 of the dev_cap20 snapshots were), from any earlier chunk (`--cap-windows` = windows root); pinned
+  also needs total_open >= 1,000. Freed slots = the pinned user's own Cancel / CancelByCloid actions in the window (fills
+  are not counted: the pinned books seen are static). Info seen before building (no replay): pinned users per dev_cap20
+  chunk 0-3 (0xf58b673c in 19 of 20 chunks, 0xeaf35054, 0x6bd572af); their window order actions 83,269 (0xf58b673c
+  71,825); whether B3 rests them is reported by the screen's counters.
