@@ -785,3 +785,13 @@ vs i21b2_dev20 / i21b2_devfast: PARITY OK, every CSV identical. NS-11 (a) unbloc
   confirm on fresh sets is the real test; its ledger = proofs from any chunk earlier in time than each confirm chunk.
 - **Full-visibility sim:** both variants must stay 394 / 394 (no phantoms exist there, so nothing should be flagged).
 - **If B3 (NS-11) is adopted before the screen runs, the screen uses B3 as its baseline** (stated now).
+
+**I27c screen result (08:58Z Nov 24; B2 vs B2 + `--learn-tid --phantom-ledger --phantom-mode`): BOTH FAIL.**
+| variant | pooled contested | pooled uncontested | per set contested (dev20 / dev-fast / dm60) | contested up / down | uncontested up / down |
+|---|---|---|---|---|---|
+| V1 sink | -2.9 [-7.1, +1.7] | **-6.9 [-9.9, -4.3]** | -0.4 / +1.8 / -4.0 | 24 / 36 (34 chunks) | 2 / 54 |
+| V2 reject | **-9.9 [-17.4, -2.8]** | **-7.0 [-11.6, -3.2]** | -4.3 / -17.1 / -10.5 | 33 / 71 (46 chunks) | 17 / 75 |
+Reading: the info check measured precision on PROOF events only, and proofs only arise where a queue cut fires at a
+contested level. The flagged users are big ALO makers whose OTHER orders are real (they are the real maker in many
+uncontested fills): flagging the USER instead of the ORDER removes / demotes real liquidity. A phantom is a property
+of an order (or of a user at a moment), not of a user. Not promoted; I27c closed (no other k / variant screened).
