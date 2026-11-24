@@ -809,3 +809,22 @@ truth: perpMarginRejected seen among the few known).
 
 **B3 adopted (10:24Z Nov 24): bug-fix adoption of I21 on B2** (NS-11 default (a), no answer by 10:22Z; Rust parity OK).
 B3 = B2 + `--gate-spare-after`; docs/baseline.md updated; ACCURACY.md row added. Reversible.
+
+### I33: price significant-figure rule, pre-registered 10:41Z Nov 24 (no I33 code or run exists yet)
+- **Chain behaviour:** HL docs (tick and lot size): a price may have at most 5 significant figures unless it is an
+  integer, and at most 6 - szDecimals decimals. SQD truth (RIKA R1, devfast block 1230572957, user 0xf36c562b, action
+  691): 7 BTC ALOs incl. "60967.2" -> ONE status for the whole action, "Price must be divisible by tick size", no item
+  placed (the valid "60908" item included). Our engine rests every such item (touch audit: 6 / 6 rested).
+- **Info check (seen):** 383 window placements with a non-integer price of > 5 significant figures in the first 6
+  dev_margin60 chunks (BTC 382, ETH 1) of 240,674 placements.
+- **V1 item rule (; bug-fix track, Addendum 1.4):** a window Place (or a Modify's new order) whose
+  price is non-integer with > 5 significant figures is not applied (a Modify's cancel half still is). All tifs.
+- **V2 action rule (; normal screen):** V1, plus every other order tx of the same user in the same
+  block at adjacent listing positions with the same time (the explorer's split of one action) is not applied either.
+- **Bug-fix-track checks for V1 (written now, before any run):** (1) chain behaviour cited (above); (2) full-visibility
+  sim 394 / 394 for B3 + V1 and each of the 12 single switch groups on that base (the sim's prices never violate, stated:
+  the rule cannot fire there, so check 2 shows only that it changes nothing else); (3) per-set contested point > 0 on
+  >= 3 of the 5 sets (dev20, dev-fast, dm60, alo2, fast5; B3 refs i21b2_*), none negative; (4) pooled uncontested >= 0
+  and no set below -0.5; (5) contested flips up > down. Reported: changed chunks, changed contested txs, rejected counts.
+- **V2:** screen bar (pooled contested >= +1.0, lower >= -1.0, no acting set < 0) on dev20 + dev-fast + dm60 vs B3; a
+  pass goes to a fresh-set confirm (Addendum 1 sign test). V1 and V2 Holm-paired at the confirm.
