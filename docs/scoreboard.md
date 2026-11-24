@@ -889,3 +889,13 @@ chunks) vs B3 (report/validate/headline_b3_f220_b1..b4, merged), per-tx paired, 
 contested maker-strict 56.2% -> **59.4%**, +3.2 [+1.5, +5.0] (n 1,932, 201 chunks); uncontested 67.4% -> 66.3%,
 -1.1 [-2.5, +0.0] (n 2,353); all scored 62.3% -> 63.2%, +0.8 [-0.3, +2.0] (n 4,285). (The older FROZEN text "56.3% on
 final240" is NOT comparable: different chunk set; Yuta could not reconcile it with its own file either.)
+
+**I34 screen (14:54Z Nov 24; B3 vs B3 + `--gate-insweep`): FAIL (near-miss).** Pooled contested +0.9 [+0.0, +2.3] (n 311,
+77 chunks; bar +1.0); dev20 +0.0, dev-fast +0.0, dm60 +1.9 [+0.0, +4.2]; contested 3 up / 1 down (2 changed chunks);
+uncontested -0.1 [-0.5, +0.0] (0 up / 1 down). Not promoted. Near-miss (pooled >= +0.5): re-screened after the next
+adoption (BLITZ stacking rule). Its acting is rare on scored txs (the 120 wrongly rejected real ALOs of the touch audit
+seldom sit at scored contested fills).
+
+**I42 count audit (lead L12; 14:54Z; measurement, rule in IDEAS I42):** pooled over dev20 / dev-fast / dm60 (77 chunks):
+our pre-block named orders at the touch exceed the previous block's bbo n ("phantom-certain") in 28% of contested misses
+(n 168) vs 19% of hits (n 143): +0.09 [-0.016, +0.198]. CI includes 0 -> I40 (pseudo-orders from n) to the bottom.
