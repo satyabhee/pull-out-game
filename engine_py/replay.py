@@ -279,6 +279,7 @@ class Replay:
                  oracle_file: str | None = None, oracle: tuple = (), oracle_prequeue: str | None = None,
                  learn_tid: bool = False, phantom_ledger: str | None = None, phantom_mode: str | None = None,
                  px_sigfig: str | None = None, gate_insweep: bool = False, cap_windows: str | None = None, cap_free: str = "any",
+                 reseed_evict: str = "oldest",
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
                  keep_known: bool = False, skip_lead_in: bool = False, lead_in_keep: int | None = None,
@@ -574,6 +575,9 @@ class Replay:
         # I34 (default off): the gate abstains for an ALO when an earlier tx of the same block traded on its crossing
         # side at / through the gate's touch (the touch is the previous block's post-block state)
         self.gate_insweep = gate_insweep
+        if reseed_evict not in ("oldest", "newest"):
+            raise ValueError(f"reseed_evict {reseed_evict!r}: oldest | newest")
+        self.reseed_evict = reseed_evict                # I43: known-order eviction order at a keep-known reseed
         # I37 (default off): users PINNED at their open-order cap (open_book_users.json: total_open identical +-1 in the
         # last two snapshots answered before this chunk's first block, >= 1,000) cannot add resting orders; one
         # placement allowed per own window cancel (freed slot)
@@ -1734,7 +1738,7 @@ class Replay:
             if self.reseed:
                 self.observer.before_reseed(self, b, s)
             if self.reseed and self.keep_known:
-                res = eng.reconcile(s.asset, s.bids, s.asks, known="oldest")
+                res = eng.reconcile(s.asset, s.bids, s.asks, known=self.reseed_evict)
                 first = eng.next_oid
                 res.update(eng.refill(s.asset, s.bids, s.asks, counts=(s.bid_n, s.ask_n))
                            if self.placeholder_split else eng.refill(s.asset, s.bids, s.asks), refill=1)

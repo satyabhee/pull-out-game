@@ -87,3 +87,22 @@ def test_gate_insweep_defers_to_engine_after_an_in_block_sweep(tmp_path):
     list(on)
     assert _alo_rested(on)                        # an earlier tx swept 60000: the engine's book decides (no cross)
     assert on.gate_stats["abstain_insweep"] == 1
+
+
+def test_reseed_evict_newest_removes_the_freshest_known_order(tmp_path):
+    from tests.window_fixture import B
+    w = Window(tmp_path)
+    w.book("BTC", T0 - 100, [], [])
+    w.block([place_tx(A, "0x01", H0, order(px="59990"))])                  # older known order
+    w.block([place_tx(B, "0x02", H0 + 1, order(px="59990"))])              # newer known order
+    w.book("BTC", w.time_of(H0 + 1) + 1, [("59990", "0.001")], [])         # snapshot: only one order's size there
+    w.block([])
+    w.block([])
+    window, hl = w.write()
+    users = lambda r: [nd.order.user for bk in r.engine.books.values() for lv in bk.bids.values() for nd in lv]
+    old = Replay(window, hl, listing, reseed=True, keep_known=True)
+    list(old)
+    new = Replay(window, hl, listing, reseed=True, keep_known=True, reseed_evict="newest")
+    list(new)
+    assert A not in users(old) and B in users(old)
+    assert B not in users(new) and A in users(new)

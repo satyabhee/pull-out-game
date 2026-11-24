@@ -475,7 +475,7 @@ def scoring_inputs(rp, hl_data, oid_facts) -> tuple[dict, dict]:
 
 
 def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
-        alo_gate=None, gate_max_age_ms=None, gate_spare_after=False, touch_trades_first=False, oracle_file=None, oracle=(), oracle_prequeue=None, learn_tid=False, phantom_ledger=None, phantom_mode=None, px_sigfig=None, gate_insweep=False, cap_windows=None, cap_free="any", evict_known=None, nearest_ratio=0, reseed=False,
+        alo_gate=None, gate_max_age_ms=None, gate_spare_after=False, touch_trades_first=False, oracle_file=None, oracle=(), oracle_prequeue=None, learn_tid=False, phantom_ledger=None, phantom_mode=None, px_sigfig=None, gate_insweep=False, cap_windows=None, cap_free="any", reseed_evict="oldest", evict_known=None, nearest_ratio=0, reseed=False,
         touch_reconcile=False, touch_n_cap=False, touch_refill=None, keep_known=False, skip_lead_in=False,
         lead_in_keep=None, touch_evict="oldest", ledger_k=3,
         snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
@@ -493,7 +493,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
     gc.set_threshold(50_000, 20, 1_000)
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
-                gate_max_age_ms=gate_max_age_ms, gate_spare_after=gate_spare_after, touch_trades_first=touch_trades_first, oracle_file=oracle_file, oracle=tuple(oracle), oracle_prequeue=oracle_prequeue, learn_tid=learn_tid, phantom_ledger=phantom_ledger, phantom_mode=phantom_mode, px_sigfig=px_sigfig, gate_insweep=gate_insweep, cap_windows=cap_windows, cap_free=cap_free, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
+                gate_max_age_ms=gate_max_age_ms, gate_spare_after=gate_spare_after, touch_trades_first=touch_trades_first, oracle_file=oracle_file, oracle=tuple(oracle), oracle_prequeue=oracle_prequeue, learn_tid=learn_tid, phantom_ledger=phantom_ledger, phantom_mode=phantom_mode, px_sigfig=px_sigfig, gate_insweep=gate_insweep, cap_windows=cap_windows, cap_free=cap_free, reseed_evict=reseed_evict, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
                 reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap, touch_refill=touch_refill,
                 lead_in_keep=lead_in_keep, touch_evict=touch_evict, ledger_k=ledger_k,
                 keep_known=keep_known, skip_lead_in=skip_lead_in,
@@ -834,6 +834,8 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="I27: the queue correction cuts at the maker order the trade id pins (data/tid_hash.py)")
     ap.add_argument("--cap-windows",
                     help="I37 (default off): windows root; users pinned at their open-order cap (open_book_users.json) cannot add orders")
+    ap.add_argument("--reseed-evict", choices=("oldest", "newest"), default="oldest",
+                    help="I43: order in which a keep-known reseed's reconcile evicts known orders (B3 = oldest)")
     ap.add_argument("--cap-free", choices=("any", "removed"), default="any",
                     help="I37: which own cancels free a slot for a pinned user (any = V1, removed = only ones that remove an order from our book = V2)")
     ap.add_argument("--gate-insweep", action="store_true",
@@ -957,7 +959,7 @@ def replay_kwargs(a) -> dict:
     """Keyword arguments for run() from add_replay_args options (all but hl_data, policy, anchors)."""
     return dict(use_resolver=not a.no_resolver, alo_gate=a.alo_gate, gate_max_age_ms=a.gate_max_age_ms,
                 gate_spare_after=a.gate_spare_after, touch_trades_first=a.touch_trades_first, oracle_file=a.oracle_file, oracle_prequeue=a.oracle_prequeue, learn_tid=a.learn_tid,
-                phantom_ledger=a.phantom_ledger, phantom_mode=a.phantom_mode, px_sigfig=a.px_sigfig, gate_insweep=a.gate_insweep, cap_windows=a.cap_windows, cap_free=a.cap_free,
+                phantom_ledger=a.phantom_ledger, phantom_mode=a.phantom_mode, px_sigfig=a.px_sigfig, gate_insweep=a.gate_insweep, cap_windows=a.cap_windows, cap_free=a.cap_free, reseed_evict=a.reseed_evict,
                 oracle=tuple(k for k in ("status", "cancel", "ioc") if getattr(a, f"oracle_{k}")),
                 evict_known=a.evict_known, nearest_ratio=a.nearest_ratio, reseed=a.reseed,
                 touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap, touch_refill=a.touch_refill,
