@@ -564,6 +564,7 @@ class Replay:
         self.learn_tid = learn_tid
         self._tid_maker: dict = {}                  # (taker hash, tid) -> (height, tx, item) of the maker placement
         self._pos_eoid: dict = {}                   # (height, tx, item) -> our engine oid created by that placement
+        self.tid_events: list = []                  # I27c info check: (height, coin, user, "real" | "phantom")
         if learn_tid:
             from data.tid_solve import solve_chunk
             est = self.resolver.est if self.resolver is not None else None
@@ -1009,6 +1010,18 @@ class Replay:
             if exact_idx:
                 cut = max(exact_idx)
                 self.learn_stats[f"tid_exact_cuts:{coin}"] += 1
+                # I27c info check (measurement): per-user proofs. An exact order = proven real; a named order ahead of
+                # the cut whose owner the chain did not fill at px in this tx = proven phantom.
+                h_now = self.blocks[self.block_index].height
+                px_makers = {t.maker for t in trs if t.px == px}
+                for j, nd in enumerate(nodes[:cut + 1]):
+                    u = nd.order.user
+                    if u == PLACEHOLDER:
+                        continue
+                    if nd.order.oid in exact:
+                        self.tid_events.append((h_now, coin, u, "real"))
+                    elif u not in px_makers:
+                        self.tid_events.append((h_now, coin, u, "phantom"))
                 for nd in nodes[:cut]:
                     if nd.order.oid in exact:
                         continue                   # another order the chain filled in this tx

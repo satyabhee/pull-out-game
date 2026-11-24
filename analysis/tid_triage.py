@@ -146,6 +146,7 @@ def main(argv=None) -> int:
     ap.add_argument("misses", nargs="+")
     ap.add_argument("--chunks", nargs="+", required=True, help="chunk-parent dirs (first holding the chunk wins)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--only", help="replay only this chunk (one process per chunk keeps memory flat)")
     vr.add_replay_args(ap)
     a = ap.parse_args(argv)
     if not a.learn_tid:
@@ -154,6 +155,8 @@ def main(argv=None) -> int:
     for f in a.misses:
         for r in csv.DictReader(open(f)):
             by_chunk[r["chunk"]].add(r["hash"])
+    if a.only:
+        by_chunk = {a.only: by_chunk.get(a.only, set())}
     kw = vr.replay_kwargs(a)
     rows: list = []
     for ch in sorted(by_chunk):
