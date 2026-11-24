@@ -276,7 +276,7 @@ class Replay:
                  observer: Observer | None = None, engine: Engine | None = None,
                  alo_gate: str | None = None, gate_max_age_ms: int | None = None, gate_spare_after: bool = False,
                  touch_trades_first: bool = False,
-                 oracle_file: str | None = None, oracle: tuple = (),
+                 oracle_file: str | None = None, oracle: tuple = (), oracle_prequeue: str | None = None,
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
                  keep_known: bool = False, skip_lead_in: bool = False, lead_in_keep: int | None = None,
@@ -561,9 +561,16 @@ class Replay:
         self.oracle = None
         if oracle:
             from engine_py.oracle import Oracle
-            if not oracle_file:
+            kinds = set(oracle) | ({"prequeue"} if oracle_prequeue else set())
+            if kinds - {"prequeue"} and not oracle_file:
                 raise ValueError("oracle switches need oracle_file")
-            self.oracle = Oracle(oracle_file, Path(window_dir).name, set(oracle))
+            self.oracle = Oracle(oracle_file, Path(window_dir).name, kinds, oracle_prequeue)
+            if self.oracle.prequeue:
+                self._oracle_prequeue()
+        elif oracle_prequeue:
+            from engine_py.oracle import Oracle
+            self.oracle = Oracle(None, Path(window_dir).name, {"prequeue"}, oracle_prequeue)
+            self._oracle_prequeue()
         self._height_ms: dict[int, int] | None = None
         self.reseed, self.keep_known = reseed, keep_known
         if outside_position not in ("end", "start"):
@@ -691,6 +698,47 @@ class Replay:
                 self.name_stats["named_lots"] += q
             if self.named_anon == "back":
                 anon()
+
+    def _oracle_prequeue(self) -> None:
+        """ORACLE O2 (look-ahead by design, diagnostic only): true pre-window queues at the seeded levels."""
+        orc, eng = self.oracle, self.engine
+        by_level: dict[tuple[int, Side, int], list] = {}
+        for r in orc.prequeue:
+            try:
+                asset = COIN_TO_ASSET[r["coin"]]
+                spec = ASSETS[asset]
+                side = Side.BUY if r["side"] == "B" else Side.SELL
+                px, q = spec.px_to_ticks(r["px"]), spec.sz_to_lots(r["sz"])
+            except (KeyError, ValueError):
+                orc.stats["prequeue_bad_row"] += 1
+                continue
+            if q > 0:
+                by_level.setdefault((asset, side, px), []).append((int(r["placed_time_ms"] or 0), int(r["oid"]), r, q))
+        for (asset, side, px), named in sorted(by_level.items(), key=lambda kv: (kv[0][0], kv[0][1].value, kv[0][2])):
+            level = eng.books[asset].side(side).get(px)
+            phs = [nd for nd in level if nd.order.user == PLACEHOLDER] if level is not None else []
+            if not phs:
+                orc.stats["prequeue_no_placeholder"] += len(named)
+                continue
+            ph = phs[0]
+            avail, meta = ph.remaining, self.ph_meta.get(ph.order.oid)
+            eng._remove(ph.order.oid)
+            take = []
+            for _, oid, r, q in sorted(named, key=lambda x: (x[0], x[1])):
+                q2 = min(q, avail)
+                if q2 <= 0:
+                    orc.stats["prequeue_no_room"] += 1
+                    continue
+                avail -= q2
+                take.append((oid, r, q2))
+            if avail > 0:
+                self._seed_one(asset, side, px, avail, *(meta[:2] if meta else (self.t0, 0)))
+            for oid, r, q in take:
+                self._rest_named({"user": r["user"], "oid": oid, "cloid": None}, asset, side, px, q)
+                eoid = self.named[oid]
+                orc.stats["prequeue_named"] += 1
+                if r.get("end_status") == "canceled" and r.get("end_time_ms"):
+                    orc.pending_cancel.append((int(r["end_time_ms"]), eoid))
 
     def _rest_named(self, o: dict, asset: int, side: Side, px: int, q: int) -> None:
         eng = self.engine

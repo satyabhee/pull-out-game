@@ -475,7 +475,7 @@ def scoring_inputs(rp, hl_data, oid_facts) -> tuple[dict, dict]:
 
 
 def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
-        alo_gate=None, gate_max_age_ms=None, gate_spare_after=False, touch_trades_first=False, oracle_file=None, oracle=(), evict_known=None, nearest_ratio=0, reseed=False,
+        alo_gate=None, gate_max_age_ms=None, gate_spare_after=False, touch_trades_first=False, oracle_file=None, oracle=(), oracle_prequeue=None, evict_known=None, nearest_ratio=0, reseed=False,
         touch_reconcile=False, touch_n_cap=False, touch_refill=None, keep_known=False, skip_lead_in=False,
         lead_in_keep=None, touch_evict="oldest", ledger_k=3,
         snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
@@ -493,7 +493,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
     gc.set_threshold(50_000, 20, 1_000)
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
-                gate_max_age_ms=gate_max_age_ms, gate_spare_after=gate_spare_after, touch_trades_first=touch_trades_first, oracle_file=oracle_file, oracle=tuple(oracle), reconcile_known=evict_known, nearest_ratio=nearest_ratio,
+                gate_max_age_ms=gate_max_age_ms, gate_spare_after=gate_spare_after, touch_trades_first=touch_trades_first, oracle_file=oracle_file, oracle=tuple(oracle), oracle_prequeue=oracle_prequeue, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
                 reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap, touch_refill=touch_refill,
                 lead_in_keep=lead_in_keep, touch_evict=touch_evict, ledger_k=ledger_k,
                 keep_known=keep_known, skip_lead_in=skip_lead_in,
@@ -828,6 +828,7 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     ap.add_argument("--oracle-status", action="store_true", help="ORACLE O1 (look-ahead by design): chain order status")
     ap.add_argument("--oracle-cancel", action="store_true", help="ORACLE O3 (look-ahead by design): true cancel target")
     ap.add_argument("--oracle-ioc", action="store_true", help="ORACLE O4 (look-ahead by design): IOC acceptance")
+    ap.add_argument("--oracle-prequeue", help="ORACLE O2 (look-ahead by design): true pre-window queues (prequeue.csv)")
     ap.add_argument("--evict-known", choices=["oldest", "newest"], help="G1 fix #2: rule 8 evicts known orders")
     ap.add_argument("--p-priority", type=_p_priority_arg, default=None, metavar="always|known|MS",
                     help="queue by grouping.p at one price: 'always', or only against orders <= MS ms older")
@@ -936,7 +937,7 @@ def _p_priority_arg(v: str):
 def replay_kwargs(a) -> dict:
     """Keyword arguments for run() from add_replay_args options (all but hl_data, policy, anchors)."""
     return dict(use_resolver=not a.no_resolver, alo_gate=a.alo_gate, gate_max_age_ms=a.gate_max_age_ms,
-                gate_spare_after=a.gate_spare_after, touch_trades_first=a.touch_trades_first, oracle_file=a.oracle_file,
+                gate_spare_after=a.gate_spare_after, touch_trades_first=a.touch_trades_first, oracle_file=a.oracle_file, oracle_prequeue=a.oracle_prequeue,
                 oracle=tuple(k for k in ("status", "cancel", "ioc") if getattr(a, f"oracle_{k}")),
                 evict_known=a.evict_known, nearest_ratio=a.nearest_ratio, reseed=a.reseed,
                 touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap, touch_refill=a.touch_refill,
