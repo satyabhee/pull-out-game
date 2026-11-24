@@ -795,3 +795,14 @@ Reading: the info check measured precision on PROOF events only, and proofs only
 contested level. The flagged users are big ALO makers whose OTHER orders are real (they are the real maker in many
 uncontested fills): flagging the USER instead of the ORDER removes / demotes real liquidity. A phantom is a property
 of an order (or of a user at a moment), not of a user. Not promoted; I27c closed (no other k / variant screened).
+
+**Chain queue order vs the docs p-priority rule (09:22Z Nov 24; analysis.queue_truth; 216 chunks of dev20, dev-fast,
+dm60, confirm_alo2_60, confirm_fast5_60; measurement):** when one taker tx fills two tid-pinned maker orders A then B
+at one price, the chain's queue had A ahead of B. Over **1,003 pairs**: FIFO-consistent 881 (309 same block), docs jump
+predicted and seen 120 (**23 same block**), jump seen but not predicted **0**, docs jump predicted but not seen **2**
+(cross block). **The docs rule (400 ms, higher p, ALO over ALO) matches the chain in 1,001 of 1,003 pairs, same block
+included.** Consequence for tid_triage: the 371 same-block, higher-p ALOs listed AFTER the chain's filled order X but
+queued ahead of it by our docs rule cannot have existed on chain (a real one would have jumped X, as the 23 same-block
+pairs show): they are PHANTOMS (H-reject; H-jump refuted). They cannot have been rejected for crossing (X rested at the
+same price on the same side), so margin-type item rejections or invisible removals are the candidates (Yuta's status
+truth: perpMarginRejected seen among the few known).
