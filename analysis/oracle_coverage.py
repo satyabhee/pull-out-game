@@ -59,6 +59,7 @@ def main(argv=None):
     tot = Counter()
     per_set = {}
     rows_out = []
+    seen_chunks = set()                      # a chunk in two sets is counted once (first set listed wins)
     for pair in a.pairs:
         name, base = pair.split("=")
         T = Path(a.truth_root) / name
@@ -82,8 +83,9 @@ def main(argv=None):
         raw = {(r["chunk"], r["hash"]): r for r in csv.DictReader(open(Path(base) / "txs.csv"))}
         c = Counter()
         cache = {}
+        dup = {ch for ch, _ in raw} & seen_chunks
         for (ch, h), r in raw.items():
-            if r["warmup"] != "0" or r["status"] not in ("match", "mismatch"):
+            if r["warmup"] != "0" or r["status"] not in ("match", "mismatch") or ch in dup:
                 continue
             contested_miss = sc.get((ch, h)) and (ch, h) in v and v[(ch, h)] < 0.999
             engine_only = float(r["real_notional"] or 0) == 0 and float(r["engine_notional"] or 0) > 0
@@ -116,7 +118,9 @@ def main(argv=None):
             rows_out.append({"set": name, "chunk": ch, "hash": h, "kind": kind, "category": r["category"],
                              "lost": round(1 - v.get((ch, h), 0), 4) if contested_miss else "",
                              **{k: int(x) for k, x in hit.items()}})
-        c["contested_n"] = sum(1 for x in sc.values() if x)
+        c["contested_n"] = sum(1 for (ch, _), x in sc.items() if x and ch not in dup)
+        c["dup_chunks"] = len(dup)
+        seen_chunks |= {ch for ch, _ in raw}
         per_set[name] = c
         tot.update(c)
     for name, c in list(per_set.items()) + [("POOLED", tot)]:
