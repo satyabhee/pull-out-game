@@ -278,7 +278,7 @@ class Replay:
                  touch_trades_first: bool = False,
                  oracle_file: str | None = None, oracle: tuple = (), oracle_prequeue: str | None = None,
                  learn_tid: bool = False, phantom_ledger: str | None = None, phantom_mode: str | None = None,
-                 px_sigfig: str | None = None,
+                 px_sigfig: str | None = None, gate_insweep: bool = False,
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
                  keep_known: bool = False, skip_lead_in: bool = False, lead_in_keep: int | None = None,
@@ -504,7 +504,7 @@ class Replay:
             thr = json.load(open(ioc_model)).get("thresholds") or {}
             self._ioc_thr = {k: (op, None if t is None else Decimal(t)) for k, (op, t) in thr.items()}
         self._real_trades: dict[str, list] = {}
-        if self._rules or "learn" in self.taker_reject:
+        if self._rules or "learn" in self.taker_reject or gate_insweep:
             for tr in iter_trades(self.hl_data, COINS, self.t0, self.t1):
                 if tr.hash != ZERO_HASH:
                     self._real_trades.setdefault(tr.hash, []).append(tr)
@@ -571,6 +571,13 @@ class Replay:
         if px_sigfig not in (None, "item", "action"):
             raise ValueError(f"px_sigfig {px_sigfig!r}: item | action")
         self.px_sigfig = px_sigfig
+        # I34 (default off): the gate abstains for an ALO when an earlier tx of the same block traded on its crossing
+        # side at / through the gate's touch (the touch is the previous block's post-block state)
+        self.gate_insweep = gate_insweep
+        self._sweep: dict[tuple[int, bool], int] = {}      # (asset, taker is buy) -> extreme px traded so far this block
+        self._sweep_blk = None
+        self._sweep_prev = None
+        self._sweep_seen: set = set()
         self.sigfig_stats: Counter = Counter()
         self._sigfig_blk: tuple[int, set] | None = None
         # I27c (default off): users with tid-proven phantoms (ledger of EARLIER chunks + this chunk's earlier blocks)
@@ -1265,6 +1272,12 @@ class Replay:
             return None
         self._touch_ms = block.time_ms - age
         crosses = (ask is not None and p.px >= ask) if p.side is Side.BUY else (bid is not None and p.px <= bid)
+        if crosses and self.gate_insweep:
+            buy = p.side is Side.BUY                    # a buy ALO crosses asks, which taker BUYs consume
+            sw = self._sweep.get((p.asset, buy))
+            if sw is not None and ((sw >= ask) if buy else (sw <= bid)):
+                self.gate_stats["abstain_insweep"] += 1
+                return None
         return not crosses
 
     def _apply_gated(self, action: Action) -> tuple[list[Fill], list[Reject]] | None:
@@ -1472,6 +1485,17 @@ class Replay:
 
     def _apply(self, block: Block, action: Action) -> tuple[list[Fill], list[Reject]]:
         self.observer.before_action(self, block, action)
+        if self.gate_insweep:
+            if self._sweep_blk != block.height:
+                self._sweep_blk, self._sweep_prev, self._sweep = block.height, None, {}
+                self._sweep_seen = set()
+            if self._sweep_prev is not None and self._sweep_prev != action.hash and self._sweep_prev not in self._sweep_seen:
+                self._sweep_seen.add(self._sweep_prev)
+                for tr in self._real_trades.get(self._sweep_prev, ()):
+                    k = (tr.asset, tr.taker_side is Side.BUY)
+                    cur = self._sweep.get(k)
+                    self._sweep[k] = tr.px if cur is None else (max(cur, tr.px) if k[1] else min(cur, tr.px))
+            self._sweep_prev = action.hash
         if self.px_sigfig is not None and self._sigfig_reject(block, action):
             p = action.new if isinstance(action, Modify) else action
             self.sigfig_stats[f"rejected_{p.tif.name}"] += 1
