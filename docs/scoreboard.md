@@ -714,3 +714,23 @@ candidates are narrowed (taker oid near its placement's estimated oid; maker oid
 post-tx evidence printed with the trade, like the evidence `--learn-evidence tx` already uses (rule 1 holds if it is
 used at block end, as corrections are). Next (measurement only, no replay change): how many real fills of the dev sets
 can be solved (taker oid and maker oid identified uniquely) with the oid estimator's brackets.
+**I27 solve coverage (02:34Z, `analysis.tid_solve`, measurement only):** real fills (taker tx in window, after warm-up)
+pinned to a unique (taker oid, maker placement): **dev20 333 / 757 (44%)**, **dev-fast 160 / 204 (78%)**, dev_margin60
+760 / 1,077 (71%; partial: stopped at ~40 of 60 chunks, see slip). Unsolved: maker order not among the maker's in-window
+placements at p (pre-window) 120 / 10, no match 278 / 24, ambiguous 8 / 2. Slip: the solver ran outside a lock hold
+(dev20 peak 1.8 GB) - logged in handoff/i27/NOTES.md; dev_margin60 to be re-run inside a hold.
+
+### I27a: tid-pinned queue correction (`--learn-tid`), pre-registered 02:37Z Nov 24 (before any I27a run on real data)
+- **Mechanism:** B1's `queue` correction (block end, tx evidence) removes what rests ahead of the filled maker's FIRST
+  order in our queue at p. The trade id (data/tid_hash.py) pins which order the chain actually filled; `--learn-tid` cuts
+  at that exact order (data/tid_solve.py, solved per chunk with the replay's own oid estimator), removing everything
+  ahead of it, the maker's own older orders included; unsolved trades fall back to the old rule. Evidence = the tx's
+  own printed trades at block end, as before (rule 1).
+- **Sim:** full visibility exact with it on (tests/test_sim_generate.py); hidden-state sim (6 seeds, real tids):
+  BF1 59 -> 62 of 231 strict, notional 0.335 -> 0.348 (one seed -1 tx).
+- **Screen:** current baseline (B2 = BF1 if NS-10 adopts it at / before 04:48Z, else B1) vs baseline + `--learn-tid`,
+  dev20 + dev-fast + dev_margin60, `analysis.pooled_paired` (chunks once); promote iff pooled contested point >= +1.0,
+  lower >= -1.0, no acting set < 0. One variant. Reported: changed chunks, contested up / down, uncontested,
+  tid_exact_cuts and tid_queue_* counters. Runs after the first ORACLE queue frees the lock (shares gaps with run2).
+- **After a promotion:** confirm under Addendum 1 (sign test on flipped contested txs; min 10 flips or 8 changed chunks;
+  pooling plan written before the first look) on fresh sets frozen by Yuta after the benchmark list.

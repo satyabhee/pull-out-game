@@ -139,3 +139,14 @@ def test_full_visibility_multi_lite_is_exact(tmp_path):
                        multi_lite=True, **kw)
     scored = scored_rows(rows)
     assert scored and all(r["match_full"] for r in scored)
+
+
+def test_full_visibility_learn_tid_is_exact(tmp_path):
+    """I27: with chain-accurate trade ids in the sim, the tid-pinned queue correction keeps strict recall at 1.0."""
+    cfg = SimConfig.full_visibility(seed=3, n_blocks=120, lead_in=40)
+    generate_chunk(cfg, tmp_path)
+    kw = dict(stp="expire_maker", p_priority="docs", oid_facts=True, trade_learn="sweep,queue",
+              trade_learn_at="block-end", learn_evidence="tx", learn_tid=True)
+    res, rows = vr.run(tmp_path / "windows" / chunk_name(cfg), tmp_path / "hl_data", "listing", quiet=True, **kw)
+    scored = scored_rows(rows)
+    assert scored and all(r["match_full"] for r in scored)

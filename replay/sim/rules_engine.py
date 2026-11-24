@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from engine_py.types import ASSETS
+from data.tid_hash import tid as chain_tid
 
 WINDOW_MS = 400
 MIN_NOTIONAL = Decimal(10)
@@ -305,7 +306,9 @@ class Chain:
                 continue
             q = min(o.sz, maker.sz)
             buyer, seller = (o.user, maker.user) if o.side == "B" else (maker.user, o.user)
-            trades.append(Trade(o.asset, o.side, best, q, time_ms, tx.hash, self.next_tid, buyer, seller,
+            # trade id as on chain (I27, data/tid_hash.py): top 50 bits of SipHash-1-3 over (buyer_oid, seller_oid)
+            boid, soid = (o.oid, maker.oid) if o.side == "B" else (maker.oid, o.oid)
+            trades.append(Trade(o.asset, o.side, best, q, time_ms, tx.hash, chain_tid(boid, soid), buyer, seller,
                                 maker.oid, o.oid))
             self.next_tid += 1
             self.truth.append({"kind": "fill", "maker_oid": maker.oid, "taker_oid": o.oid, "maker": maker.user,

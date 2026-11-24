@@ -277,6 +277,7 @@ class Replay:
                  alo_gate: str | None = None, gate_max_age_ms: int | None = None, gate_spare_after: bool = False,
                  touch_trades_first: bool = False,
                  oracle_file: str | None = None, oracle: tuple = (), oracle_prequeue: str | None = None,
+                 learn_tid: bool = False,
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
                  keep_known: bool = False, skip_lead_in: bool = False, lead_in_keep: int | None = None,
@@ -557,6 +558,17 @@ class Replay:
         # ALO would cross such an order, evict nothing and let the engine decide (it rejects the ALO as would-cross)
         self.gate_spare_after = gate_spare_after
         self.touch_trades_first = touch_trades_first
+        # I27 (BLITZ): trade ids pin the exact maker order of a real fill (data/tid_hash.py). learn_tid: the queue
+        # correction (trade_learn "queue", at the same block-end point) cuts at the exactly identified maker order
+        # instead of the maker's first order in our queue. Evidence = this tx's own printed trades (rule 1 as before).
+        self.learn_tid = learn_tid
+        self._tid_maker: dict = {}                  # (taker hash, tid) -> (height, tx, item) of the maker placement
+        self._pos_eoid: dict = {}                   # (height, tx, item) -> our engine oid created by that placement
+        if learn_tid:
+            from data.tid_solve import solve_chunk
+            est = self.resolver.est if self.resolver is not None else None
+            self.tid_stats = Counter()
+            self._tid_maker = solve_chunk(self.window_dir, Path(self.hl_data), 4000, self.tid_stats, est=est)
         # ORACLE (look-ahead by design, diagnostic only; engine_py/oracle.py, handoff/ORACLE.md)
         self.oracle = None
         if oracle:
@@ -984,6 +996,30 @@ class Replay:
                 if not makers:
                     continue                       # our own fills explain every real fill here
             nodes = list(level)
+            exact: set[int] = set()
+            if self.learn_tid:                     # I27: the chain's filled maker orders, when the tid pins them
+                for t in trs:
+                    if t.px == px and t.maker in makers:
+                        hit = self._tid_maker.get((t.hash, t.tid))
+                        eoid = self._pos_eoid.get(hit[0]) if hit else None
+                        if eoid is not None:
+                            exact.add(eoid)
+            idx = {nd.order.oid: i for i, nd in enumerate(nodes)}
+            exact_idx = [idx[o] for o in exact if o in idx]
+            if exact_idx:
+                cut = max(exact_idx)
+                self.learn_stats[f"tid_exact_cuts:{coin}"] += 1
+                for nd in nodes[:cut]:
+                    if nd.order.oid in exact:
+                        continue                   # another order the chain filled in this tx
+                    if self.learn_keep_known and nd.order.user != PLACEHOLDER:
+                        self.learn_stats[f"queue_kept_known:{coin}"] += 1
+                        continue
+                    kind = "placeholder" if nd.order.user == PLACEHOLDER else "known"
+                    self.learn_stats[f"tid_queue_{kind}_orders:{coin}"] += 1
+                    self.learn_stats[f"tid_queue_{kind}_lots:{coin}"] += nd.remaining
+                    eng._remove(nd.order.oid)
+                continue
             first_of: dict[str, int] = {}
             for i, nd in enumerate(nodes):
                 first_of.setdefault(nd.order.user, i)
@@ -1397,6 +1433,8 @@ class Replay:
                 q = self.placed[created]
                 self._sizes.setdefault((q.user, q.asset), set()).add(q.sz)
             self.placed_by[created] = action
+            if self.learn_tid:
+                self._pos_eoid[(action.block, action.tx_index, action.item_index)] = created
             if self.oracle is not None:
                 self.oracle.note_created(action, self.placed[created], created)
             if self.resolver is not None:
