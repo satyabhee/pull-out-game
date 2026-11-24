@@ -846,3 +846,9 @@ B3 = B2 + `--gate-spare-after`; docs/baseline.md updated; ACCURACY.md row added.
 **O5 ALL-USER ORACLE (RIKA R2; 12:00Z Nov 24; look-ahead by design, diagnostic only; B3; dev-fast + dm60):** all-user SQD
 truth on 56 covered contested misses: +2.86 pt [+0.48, +5.66] (6 fixed, 7 up / 1 down); tracked-only truth +0.00 on
 identical runs; ceiling @100% coverage 5.7 pt [1.0, 11.2]. Branch ">= ~2 pt" (CI lower end 1.0). NS-13 (AWS plan).
+
+**I33 V1 (`--px-sigfig item`) bug-fix-track result (12:28Z Nov 24): NOT adopted (check 3 fails).** B3 vs B3 + V1:
+dev20 / dev-fast / dm60 contested +0.0 / +0.0 / +0.0, uncontested +0.0 each: 0 scored txs change (the rule acts on
+unscored txs only; 383 violating placements per 6 dm60 chunks sit away from scored fills). Check 3 (point > 0 on >= 3 of 5
+sets) can no longer be met, so the 2 confirm-set runs were stopped. The rule stays documented chain behaviour (kept as a
+switch, default off). V2 (action rule) screen running as pre-registered.
