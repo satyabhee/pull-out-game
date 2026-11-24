@@ -817,9 +817,9 @@ B3 = B2 + `--gate-spare-after`; docs/baseline.md updated; ACCURACY.md row added.
   placed (the valid "60908" item included). Our engine rests every such item (touch audit: 6 / 6 rested).
 - **Info check (seen):** 383 window placements with a non-integer price of > 5 significant figures in the first 6
   dev_margin60 chunks (BTC 382, ETH 1) of 240,674 placements.
-- **V1 item rule (; bug-fix track, Addendum 1.4):** a window Place (or a Modify's new order) whose
+- **V1 item rule (`--px-sigfig item`; bug-fix track, Addendum 1.4):** a window Place (or a Modify's new order) whose
   price is non-integer with > 5 significant figures is not applied (a Modify's cancel half still is). All tifs.
-- **V2 action rule (; normal screen):** V1, plus every other order tx of the same user in the same
+- **V2 action rule (`--px-sigfig action`; normal screen):** V1, plus every other order tx of the same user in the same
   block at adjacent listing positions with the same time (the explorer's split of one action) is not applied either.
 - **Bug-fix-track checks for V1 (written now, before any run):** (1) chain behaviour cited (above); (2) full-visibility
   sim 394 / 394 for B3 + V1 and each of the 12 single switch groups on that base (the sim's prices never violate, stated:
