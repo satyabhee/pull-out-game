@@ -734,3 +734,6 @@ placements at p (pre-window) 120 / 10, no match 278 / 24, ambiguous 8 / 2. Slip:
   tid_exact_cuts and tid_queue_* counters. Runs after the first ORACLE queue frees the lock (shares gaps with run2).
 - **After a promotion:** confirm under Addendum 1 (sign test on flipped contested txs; min 10 flips or 8 changed chunks;
   pooling plan written before the first look) on fresh sets frozen by Yuta after the benchmark list.
+
+**B2 adopted (04:49Z Nov 24): bug-fix adoption of BF1** (NS-10 default (a), no answer by 04:48Z; Rust parity OK).
+B2 = B1 + `--touch-trades-first` + `--stp expire_maker`; docs/baseline.md updated; ACCURACY.md row added. Reversible.

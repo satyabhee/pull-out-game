@@ -3,7 +3,29 @@
 Path for other worktrees: `~/book-replay/docs/baseline.md` (branch `mahito`). Any change to the baseline is made
 HERE, in the same commit that adopts it, with a row in `docs/scoreboard.md`.
 
-## Current baseline: B1 = B0 + `--taker-reject margin` (since Nov 23; MAHITO_PLAN §00)
+## Current baseline: B2 = B1 + `--touch-trades-first` + `--stp expire_maker` (since Nov 24 04:49Z; bug-fix adoption, NS-10 default)
+
+BF1 passed all 5 pre-registered bug-fix-track checks (docs/scoreboard.md "BF1"; Addendum 1.4): pooled 5-set contested
++2.8 [+1.0, +5.0], 20 up / 4 down, uncontested +0.1, full-visibility sim 394 / 394 under all 18 single switches, Rust
+parity byte-identical (dev20, dev-fast). Reversible: revert to B1 below.
+
+```
+--alo-gate touch --reseed --nearest-ratio 3 --keep-known --outside-other-txs --deep-book --p-priority docs \
+--evict-arrival --oid-bracket --touch-reconcile --touch-evict ledger --ledger-k 99 \
+--learn-evidence tx --taker-reject margin --trade-learn-at block-end --touch-trades-first --policy listing --stp expire_maker
+```
+`--touch-trades-first`: bbo / trade rows share the block time and the bbo is the post-block state, so trades are applied
+first and never overwrite the bbo (I25). `--stp expire_maker`: a self-trade cancels the RESTING order (chain rule D5; I26).
+
+| set | contested strict | uncontested strict | reference outputs |
+|---|---|---|---|
+| dev20 | 0.587 | 0.713 | `report/validate/bf1_dev20` |
+| dev-fast | 0.481 | 0.731 | `report/validate/bf1_devfast` |
+| dev_margin60 | 0.515 | 0.701 | `report/validate/bf1_dev_margin60` |
+| confirm_alo2_60 / confirm_fast5_60 (retired) | | | `report/validate/bf1_confirm_alo2_60`, `bf1_confirm_fast5_60` |
+Contested sets fixed by B1's reference runs (pooled_paired vs margin_* / a3c_base / confirm*_base).
+
+## Previous baseline: B1 = B0 + `--taker-reject margin` (Nov 23 - Nov 24 04:49Z; MAHITO_PLAN §00)
 
 Engine: the replay engine on `mahito`, Rust backend (Python engine = reference, byte-identical on B1: `replay.parity --backend rust`, dev20 and dev-fast).
 
