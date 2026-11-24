@@ -876,3 +876,9 @@ switch, default off). V2 (action rule) screen running as pre-registered.
   are not counted: the pinned books seen are static). Info seen before building (no replay): pinned users per dev_cap20
   chunk 0-3 (0xf58b673c in 19 of 20 chunks, 0xeaf35054, 0x6bd572af); their window order actions 83,269 (0xf58b673c
   71,825); whether B3 rests them is reported by the screen's counters.
+- I37 V2 (added 14:34Z, BEFORE any I37 score; seen only the mechanics of one smoke chunk, 1233049496: V1 freed 2,563 slots from
+  the pinned user's own cancels and allowed 2,474 placements, rejected 1,409): most such cancels target the user's own
+  window orders, which the chain never rested, so on chain they free nothing. **V2 (`--cap-free removed`)**: a slot is
+  freed only by a cancel that removes an order from OUR book. V1 (`--cap-free any`, as registered) and V2 both screened;
+  Holm-paired at the confirm. Flag name: `--cap-windows DIR` (the windows root, needed for earlier snapshots) instead
+  of `--cap-pinned`.

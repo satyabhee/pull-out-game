@@ -278,7 +278,7 @@ class Replay:
                  touch_trades_first: bool = False,
                  oracle_file: str | None = None, oracle: tuple = (), oracle_prequeue: str | None = None,
                  learn_tid: bool = False, phantom_ledger: str | None = None, phantom_mode: str | None = None,
-                 px_sigfig: str | None = None, gate_insweep: bool = False,
+                 px_sigfig: str | None = None, gate_insweep: bool = False, cap_windows: str | None = None, cap_free: str = "any",
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
                  keep_known: bool = False, skip_lead_in: bool = False, lead_in_keep: int | None = None,
@@ -574,6 +574,36 @@ class Replay:
         # I34 (default off): the gate abstains for an ALO when an earlier tx of the same block traded on its crossing
         # side at / through the gate's touch (the touch is the previous block's post-block state)
         self.gate_insweep = gate_insweep
+        # I37 (default off): users PINNED at their open-order cap (open_book_users.json: total_open identical +-1 in the
+        # last two snapshots answered before this chunk's first block, >= 1,000) cannot add resting orders; one
+        # placement allowed per own window cancel (freed slot)
+        self.cap_pinned: set[str] = set()
+        self.cap_free: Counter = Counter()
+        self.cap_stats: Counter = Counter()
+        self.cap_on = cap_windows is not None
+        if cap_free not in ("any", "removed"):
+            raise ValueError(f"cap_free {cap_free!r}: any | removed")
+        self.cap_free_mode = cap_free
+        if cap_windows is not None:
+            import json as _json
+            t0 = self.blocks[0].time_ms
+            start = int(Path(self.window_dir).name.split("-")[0])
+            snaps = []
+            for d in Path(cap_windows).iterdir():
+                if not d.name[:1].isdigit() or int(d.name.split("-")[0]) > start:
+                    continue
+                f = d / "open_book_users.json"
+                if not f.exists():
+                    continue
+                rows = _json.loads(f.read_text())
+                ans = [r["answered_at"] * 1000 for r in rows if r.get("answered_at")]
+                if rows and ans and max(ans) < t0:
+                    snaps.append((max(ans), {r["user"].lower(): r["total_open"] for r in rows}))
+            snaps.sort(key=lambda x: x[0])
+            if len(snaps) >= 2:
+                a, b = snaps[-2][1], snaps[-1][1]
+                self.cap_pinned = {u for u, n in b.items() if u in a and abs(n - a[u]) <= 1 and n >= 1000}
+            self.cap_stats["pinned_users"] = len(self.cap_pinned)
         self._sweep: dict[tuple[int, bool], int] = {}      # (asset, taker is buy) -> extreme px traded so far this block
         self._sweep_blk = None
         self._sweep_prev = None
@@ -1445,6 +1475,15 @@ class Replay:
             self._sigfig_blk = (block.height, rej)
         return action.tx_index in self._sigfig_blk[1]
 
+    def _apply_unpinned(self, block: Block, action: Action):
+        """Apply an action through the normal path, skipping the I37 hook (used to observe a cancel's effect).
+        The observer's before_action already ran for this action, so it is not called twice."""
+        self._cap_inner = True
+        try:
+            return self._apply_body(block, action)
+        finally:
+            self._cap_inner = False
+
     def phantom_flagged(self, user: str) -> bool:
         """I27c flag: >= 1 tid-proven phantom and more phantom than real proofs, from earlier blocks only."""
         u = (user or "").lower()
@@ -1485,6 +1524,9 @@ class Replay:
 
     def _apply(self, block: Block, action: Action) -> tuple[list[Fill], list[Reject]]:
         self.observer.before_action(self, block, action)
+        return self._apply_body(block, action)
+
+    def _apply_body(self, block: Block, action: Action) -> tuple[list[Fill], list[Reject]]:
         if self.gate_insweep:
             if self._sweep_blk != block.height:
                 self._sweep_blk, self._sweep_prev, self._sweep = block.height, None, {}
@@ -1496,6 +1538,40 @@ class Replay:
                     cur = self._sweep.get(k)
                     self._sweep[k] = tr.px if cur is None else (max(cur, tr.px) if k[1] else min(cur, tr.px))
             self._sweep_prev = action.hash
+        if self.cap_on and not getattr(self, "_cap_inner", False) and (action.user or "").lower() in self.cap_pinned:
+            u = action.user.lower()
+            if isinstance(action, (Cancel, CancelByCloid)):
+                if self.cap_free_mode == "any":
+                    self.cap_free[u] += 1
+                    self.cap_stats["freed_slots"] += 1
+                else:                                   # V2: only a cancel that removes an order from our book frees a slot
+                    before = len(self.engine.by_user.get(action.user, {}))
+                    out = self._apply_unpinned(block, action)
+                    if len(self.engine.by_user.get(action.user, {})) < before:
+                        self.cap_free[u] += 1
+                        self.cap_stats["freed_slots"] += 1
+                    return out
+            else:
+                p = action.new if isinstance(action, Modify) else action
+                if isinstance(p, Place):
+                    if self.cap_free[u] > 0:
+                        self.cap_free[u] -= 1
+                        self.cap_stats["allowed_after_free"] += 1
+                    else:
+                        self.cap_stats["rejected_pinned"] += 1
+                        if isinstance(action, Modify):      # the cancel half still happens
+                            meta = dict(user=action.user, block=action.block, tx_index=action.tx_index,
+                                        item_index=action.item_index, hash=action.hash, priority=action.priority,
+                                        asset=action.asset)
+                            cancel = (CancelByCloid(**meta, cloid=action.target) if isinstance(action.target, str)
+                                      else Cancel(**meta, oid=action.target))
+                            self._block = block
+                            self.engine.block_time_ms = block.time_ms
+                            out = self.engine.apply(cancel)
+                        else:
+                            out = ([], [])
+                        self.observer.after_action(self, block, action, out[0], out[1], None)
+                        return out
         if self.px_sigfig is not None and self._sigfig_reject(block, action):
             p = action.new if isinstance(action, Modify) else action
             self.sigfig_stats[f"rejected_{p.tif.name}"] += 1
