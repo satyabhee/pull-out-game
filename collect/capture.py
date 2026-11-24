@@ -55,6 +55,11 @@ Settings (environment variables):
                        users in the scored blocks, asked as soon as the blocks are fetched, one user at a time in
                        suspect order (round robin): chain truth for phantom/queue cases. suspect_status.json (not
                        anchors.json, so the replay never reads it); meta suspect_lookups / suspect_candidates
+  OPEN_BOOK_USERS=0    chunks: frontendOpenOrders (weight 20) of up to this many "big open book" users, asked right
+                       after planning: users of the previous chunk's public post-only touch ranking (alo_touch_users)
+                       whose live open-order count was >= OPEN_BOOK_MIN=1000 when probed (up to OPEN_BOOK_PROBES=3
+                       new probes per chunk, counts cached 1 h). Stored compactly in open_book_users.json (total count
+                       over all coins + BTC/ETH orders), a NEW file the replay never reads (I37: per-user open-order cap)
   TRUTH_IOC=0          chunks: orderStatus (weight 2) by cloid of up to this many BTC/ETH IOC placements in the
                        scored blocks, asked as each block is fetched (statuses of rejected IOCs are gone within
                        minutes: 15/15 known at 2.5 min, 6/8 at 7 min, 0-1/8 after 4 h), on a low-priority thread
@@ -102,14 +107,17 @@ HIST_END_USERS = int(os.environ.get("HIST_END_USERS", 6))
 TRACKERS_FILE = os.environ.get("TRACKERS_FILE", "trackers.json")
 HIST_END_RANDOM = os.environ.get("HIST_END_RANDOM") == "1"
 HIST_IOC_USERS = int(os.environ.get("HIST_IOC_USERS", 0))   # chunks: historicalOrders at chunk end for the top IOC senders
-CAPTURE_VERSION = "2026-11-24-truth-live2"     # written into every chunk's window.json (capture_version)
-CAPTURE_SUPERSET_OF = "2026-11-23-open-margin" # same files as that version plus new ones the replay does not read
+CAPTURE_VERSION = "2026-11-24-truth-live3"     # written into every chunk's window.json (capture_version)
+CAPTURE_SUPERSET_OF = "2026-11-24-truth-live2" # same files as that version plus new ones the replay does not read
 ALO_MARGIN_USERS = int(os.environ.get("ALO_MARGIN_USERS", 0))
 TOUCH_BP = float(os.environ.get("TOUCH_BP", 1))
 SUSPECTS_FILE = os.environ.get("SUSPECTS_FILE", "suspects.json")
 OPEN_MARGIN_USERS = int(os.environ.get("OPEN_MARGIN_USERS", 0))
 OPEN_MARGIN_DELAY_S = float(os.environ.get("OPEN_MARGIN_DELAY_S", 62))
 SUSPECT_LOOKUPS = int(os.environ.get("SUSPECT_LOOKUPS", 0))
+OPEN_BOOK_USERS = int(os.environ.get("OPEN_BOOK_USERS", 0))      # chunks: open orders of users with big open books
+OPEN_BOOK_PROBES = int(os.environ.get("OPEN_BOOK_PROBES", 3))
+OPEN_BOOK_MIN = int(os.environ.get("OPEN_BOOK_MIN", 1000))
 TRUTH_IOC = int(os.environ.get("TRUTH_IOC", 0))                 # chunks: orderStatus of this many scored-block IOCs
 TRUTH_WEIGHT_PER_MIN = int(os.environ.get("TRUTH_WEIGHT_PER_MIN", 300))
 TRUTH_STALE_S = float(os.environ.get("TRUTH_STALE_S", 360))
@@ -719,6 +727,64 @@ def ask_open_margin_later(writer, users, snap_ms, at_s, now=time.time, sleep=tim
     return th
 
 
+OPEN_BOOK_CACHE = {}      # user -> (open-order count, time probed s)
+
+
+def compact_open_orders(answer):
+    """(total open orders over all coins, [[coin, side, px, sz, oid, timestamp, tif, reduceOnly]] for BTC / ETH)."""
+    if not isinstance(answer, list):
+        return None, []
+    rows = [[o.get("coin"), o.get("side"), o.get("limitPx"), o.get("sz"), o.get("oid"), o.get("timestamp"),
+             o.get("tif"), o.get("reduceOnly")] for o in answer if o.get("coin") in ("BTC", "ETH")]
+    return len(answer), rows
+
+
+def ask_open_book(writer, touch_users, snap_ms, n_pick, n_probe=None, min_count=None, now=time.time, cache=None):
+    """Background: probe up to n_probe uncached touch users' open-order counts, then ask the top n_pick users whose
+    count >= min_count (fresh within 1 h) for their open orders; info["open_book_users"] (compact records)."""
+    n_probe = OPEN_BOOK_PROBES if n_probe is None else n_probe
+    min_count = OPEN_BOOK_MIN if min_count is None else min_count
+    cache = OPEN_BOOK_CACHE if cache is None else cache
+
+    def ask(u, role):
+        writer.budget.take(info.weight_of("frontendOpenOrders"))
+        t = now()
+        try:
+            r = writer.calls["frontendOpenOrders"](u)
+        except Exception as e:
+            r = {"error": repr(e)}
+        total, rows = compact_open_orders(r)
+        if total is not None:
+            cache[u] = (total, t)
+        with writer.lock:
+            writer.info["open_book_users"].append({"user": u, "role": role, "snapshot_time": snap_ms, "asked_at": t,
+                                                   "answered_at": now(), "total_open": total, "btc_eth": rows,
+                                                   "answer": r if isinstance(r, dict) else {"total_open": total}})
+        return total
+
+    def run():
+        t0 = now()
+        cands = [u.lower() for u in touch_users]
+        probed = []
+        for u in cands:
+            if len(probed) >= n_probe:
+                break
+            if u not in cache or t0 - cache[u][1] > 3600:
+                ask(u, "probe")
+                probed.append(u)
+        big = sorted((u for u in cands if u in cache and cache[u][0] >= min_count and now() - cache[u][1] <= 3600),
+                     key=lambda u: (-cache[u][0], u))[:n_pick]
+        for u in big:
+            if u not in probed:
+                ask(u, "pick")
+
+    th = threading.Thread(target=run, daemon=True)
+    with writer.lock:
+        writer.pending.append(th)
+    th.start()
+    return th
+
+
 def suspect_candidates(block, height, suspects):
     """[(height, tx, item, user, cloid)] of the post-only placements with a cloid by `suspects` users in one block."""
     out = []
@@ -1242,6 +1308,12 @@ def run_chunks(fetcher, state, writer, cancellers=None):
                     ask_open_margin_later(writer, om, snap, t_plan + OPEN_MARGIN_DELAY_S)
             except Exception as e:
                 meta["open_margin_error"] = repr(e)
+        if OPEN_BOOK_USERS and prev_touch:
+            try:                                     # never lose a chunk over the extra lookups
+                ask_open_book(writer, list(prev_touch)[:30], snap, OPEN_BOOK_USERS)
+                meta["open_book_asked"] = True
+            except Exception as e:
+                meta["open_book_error"] = repr(e)
         status = capture(fetcher, start, end, meta, writer=writer, state=state, warmup=warmup, max_anchors=CHUNK_ANCHORS,
                          extras=chunk_extras())
         cancellers.add(meta.get("int_cancel_users"))

@@ -724,3 +724,39 @@ def test_truth_asker_skips_a_user_after_five_unknowns_and_reprobes(tmp_path, mon
 
 def test_open_orders_file_name_is_configurable():
     assert cap.INFO_FILES["frontendOpenOrders"] == cap.OPEN_ORDERS_FILE
+
+
+class FakeWriter:
+    def __init__(self, answers):
+        import collections as _c, threading as _t
+        self.info, self.lock, self.pending = _c.defaultdict(list), _t.Lock(), []
+        self.budget = FreeBudget()
+        self.asked = []
+        self.calls = {"frontendOpenOrders": lambda u: self.asked.append(u) or answers[u]}
+
+
+def oo(n, coin="BTC"):
+    return [{"coin": coin if i % 2 == 0 else "SOL", "side": "B", "limitPx": "1", "sz": "1", "oid": i, "timestamp": i,
+             "tif": "Alo", "reduceOnly": False} for i in range(n)]
+
+
+def test_ask_open_book_probes_then_picks_big_books_compactly():
+    w = FakeWriter({"0xa": oo(1200), "0xb": oo(10), "0xc": oo(3000), "0xd": oo(5)})
+    cache = {"0xc": (2900, 0.0)}
+    th = cap.ask_open_book(w, ["0xA", "0xb", "0xc", "0xd"], 123, n_pick=2, n_probe=2, min_count=1000,
+                           now=lambda: 100.0, cache=cache)
+    th.join(5)
+    assert w.asked == ["0xa", "0xb", "0xc"]                    # 2 probes (a, b), then pick c (a was just probed)
+    recs = w.info["open_book_users"]
+    assert [(r["user"], r["role"], r["total_open"]) for r in recs] == [("0xa", "probe", 1200), ("0xb", "probe", 10),
+                                                                     ("0xc", "pick", 3000)]
+    assert len(recs[0]["btc_eth"]) == 600 and recs[0]["btc_eth"][0][0] == "BTC"   # SOL rows dropped
+    assert cache["0xa"][0] == 1200 and cache["0xc"][0] == 3000
+
+
+def test_open_book_records_save_through_save_info(tmp_path):
+    w = FakeWriter({"0xa": oo(4)})
+    cap.ask_open_book(w, ["0xa"], 1, n_pick=1, n_probe=1, min_count=1, now=lambda: 0.0, cache={}).join(5)
+    meta = {}
+    cap.save_info(str(tmp_path), dict(w.info), meta)
+    assert (tmp_path / "open_book_users.json").exists() and meta["info_open_book_users"] == 1
