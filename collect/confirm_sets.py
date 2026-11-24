@@ -32,6 +32,7 @@ def used_chunks(mac3, handoff):
         if p.is_dir():
             out |= {d.name for d in p.iterdir() if d.is_dir()}
     for f in list(handoff.glob("*chunks*.txt")) + list((handoff / "confirm_sets").glob("C*.txt")) + \
+            list((handoff / "dev_sets").glob("*.txt")) + \
             [handoff / "benchmark_postchange.txt"]:
         if f.exists():
             out |= {x.strip() for x in f.read_text().split() if "-" in x}
