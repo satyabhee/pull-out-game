@@ -709,3 +709,14 @@ def test_truth_asker_skips_users_covered_by_history(tmp_path):
     t.feed([(1, 0, 0, "0xaa", "0xc1", 0), (1, 1, 0, "0xbb", "0xc2", 0)])
     t.close(); t.join(5)
     assert asked == ["0xbb"] and json.loads((tmp_path / "t.json").read_text())["counts"]["skipped_hist_user"] == 1
+
+
+def test_truth_asker_skips_a_user_after_five_unknowns_and_reprobes(tmp_path, monkeypatch):
+    monkeypatch.setattr(cap, "UNKNOWN_STREAK", cap.collections.Counter())
+    asked = []
+    t = cap.TruthAsker(str(tmp_path / "t.json"), 100, FreeBudget(), lookup=lambda u, c: asked.append(c) or {"status": "unknownOid"},
+                       truth_bud=FreeBudget(), clock=lambda: 0.0, stale_s=1e9)
+    t.feed([(1, k, 0, "0xbusy", f"0x{k}", 0) for k in range(40)])
+    t.close(); t.join(5)
+    assert asked == ["0x0", "0x1", "0x2", "0x3", "0x4", "0x29"]   # 5 asked, then 1 probe after 25 skips
+    assert json.loads((tmp_path / "t.json").read_text())["counts"]["skipped_unanswerable_user"] == 34

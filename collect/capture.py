@@ -59,7 +59,9 @@ Settings (environment variables):
                        scored blocks, asked as each block is fetched (statuses of rejected IOCs are gone within
                        minutes: 15/15 known at 2.5 min, 6/8 at 7 min, 0-1/8 after 4 h), on a low-priority thread
                        capped at TRUTH_WEIGHT_PER_MIN=300 (inside INFO_WEIGHT_PER_MIN); this chunk's HIST_IOC users
-                       are skipped (their historicalOrders at chunk end hold the statuses); items older than
+                       are skipped (their historicalOrders at chunk end hold the statuses), and so is a user after
+                       5 unknownOid answers in a row (re-probed 1 in 25; busy users' statuses are pruned within
+                       ~3 min); items older than
                        TRUTH_STALE_S=360 s are skipped. truth_status.json (oracle truth, BLITZ Addendum 3: the replay
                        never reads it; written by the thread itself when the chunk's items are done)
   TOUCH_BP=1           post-only placement counts as "at the touch" within this many bp of the coin's last trade
@@ -190,6 +192,8 @@ def ioc_items(block, height):
 
 
 _TRUTH_BUDGET = None
+UNKNOWN_STREAK = collections.Counter()   # user -> consecutive unknownOid answers (session-wide, across chunks)
+TRUTH_SKIP_AFTER, TRUTH_PROBE_EVERY = 5, 25
 
 
 def truth_budget():
@@ -244,6 +248,11 @@ class TruthAsker:
             if bt is not None and self.clock() * 1000 - bt > self.stale_s * 1000:
                 self.counts["skipped_stale"] += 1
                 continue
+            streak = UNKNOWN_STREAK[u]
+            if streak >= TRUTH_SKIP_AFTER and (streak - TRUTH_SKIP_AFTER + 1) % TRUTH_PROBE_EVERY:
+                UNKNOWN_STREAK[u] += 1                   # a busy user whose statuses are pruned before we ask
+                self.counts["skipped_unanswerable_user"] += 1
+                continue
             self.truth_bud.take(2)
             self.budget.take(info.weight_of("orderStatus"))
             asked = self.clock()
@@ -254,6 +263,10 @@ class TruthAsker:
             st = r.get("order", {}).get("status") if isinstance(r, dict) and r.get("status") == "order" else \
                 (r.get("status") if isinstance(r, dict) else None) or "error"
             self.counts[f"status:{st}"] += 1
+            if st == "unknownOid":
+                UNKNOWN_STREAK[u] += 1
+            elif st != "error":
+                UNKNOWN_STREAK[u] = 0
             self.rows.append({"placed_height": h, "tx": t, "item": i, "user": u, "cloid": c, "block_time": bt,
                               "asked_at": asked, "answered_at": self.clock(), "answer": r})
         try:
