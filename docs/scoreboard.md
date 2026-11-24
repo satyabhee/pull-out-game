@@ -652,3 +652,28 @@ touch-refill, touch-n-cap). Only `--p-priority always` falls short (218 / 395), 
 (n 314, 78 chunks), uncontested +0.0; **0 changed scored txs, 0 changed chunks on all three sets** (self-trades never
 reach a scored tx on dev). Not promoted. It matches the documented chain rule and costs nothing; it stays default-off
 and is re-checked only inside a later bug-fix bundle (if any), not on its own. handoff/i21/i26_screen.txt.
+
+**I25 screen result (00:48Z Nov 24): FAIL the tournament bar.** B1 vs B1 + `--touch-trades-first`: pooled contested **+0.8
+[-0.5, +2.2]** (n 314, 78 chunks; bar +1.0); dev20 +0.0 [-2.8, +2.1] (1 up, 1 down), dev-fast +2.0 (1 up), dev_margin60
++0.9 (4 up, 3 down); uncontested +0.2 [-0.5, +1.2] (dm60 4 up, 2 down). Contested flips 6 up / 4 down over 8 changed
+chunks. Near-miss (>= +0.5): re-screen on the next baseline (STACKING). handoff/i21/i25_screen.txt.
+
+### Bug-fix bundle BF1 = B1 + `--touch-trades-first` + `--stp expire_maker` (I25 + I26), bug-fix track (Addendum 1.4)
+Written 00:48Z Nov 24, after the I25 / I26 dev screens above were seen, BEFORE any BF1 run and before any I25 / I26 run on
+confirm_alo2_60 / confirm_fast5_60 (both retired to dev). Why a bundle: both make a rule match a documented chain or
+data fact; I26 alone is inert on real data; the sim is exact only with both.
+- **Runs:** BF1 on dev20, dev-fast, dev_margin60, confirm_alo2_60, confirm_fast5_60 (Python engine, `--jobs 1`);
+  references: B1 runs already on disk (margin_dev20, margin_devfast, a3c_base_dev_margin60, confirm1_base, confirm2_base).
+- **Checks (all must hold):**
+  1. Citation: real bbo / trade times equal block times (bbo = post-block state, trades = intra-block), RealTouch
+     ranked trades after the bbo; docs/deviations.md D5 for stp.
+  2. Sim: BF1 = 394 / 394 on the 10 full-visibility seeds, and each of the 18 single switches of the sweep stays 394 / 394
+     on BF1's base (already seen: sim_check_tf.json, sim_sweep.json; re-run on the committed code before the decision).
+  3. Contested point > 0 on >= 3 of the 5 sets and no set < 0.
+  4. Pooled uncontested point >= 0 (`analysis.pooled_paired`, chunks once) and no set's uncontested point < -0.5.
+  5. Contested flips over the 5 sets: up > down.
+  Reported: changed chunks / txs per set, pooled contested + all-scored, gate counters, engine-only.
+- **If all hold:** NEEDS_SATYA "bug-fix adoption of BF1 as B2" (reversible, 3-hour default), Rust parity first, then
+  docs/baseline.md, ACCURACY.md ("bug-fix adoption"), ANATOMY redo, final240 headline per the pre-approval (reporting
+  only; NS-8 decides whether dev20 is excluded from it). **If any fails:** BF1 not adopted; I25 waits for the next
+  baseline's re-screen.
