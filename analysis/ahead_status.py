@@ -47,9 +47,9 @@ def main(argv=None):
                 cache[key] = None
         al = cache[key]
         res = al.get(int(r["ahead_tx_index"])) if al is not None else None
-        sst, stxt = (res[2], res[4]) if res else ("no sqd block" if al is None else "unaligned", "")
+        sst, stxt, soid = (res[2], res[4], res[3]) if res else ("no sqd block" if al is None else "unaligned", "", None)
         tst = truth.get((r["set"], r["chunk"], r["ahead_hash"], r["ahead_item"]), "")
-        out.append({**r, "sqd_status": sst, "sqd_text": stxt[:100], "truth_status": tst})
+        out.append({**r, "sqd_status": sst, "sqd_text": stxt[:100], "sqd_oid": soid or "", "truth_status": tst})
         tally[(r["listed"], sst)] += 1
     with open(a.out, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(out[0]))
