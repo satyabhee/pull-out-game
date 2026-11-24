@@ -749,3 +749,15 @@ later ones are): not pre-registered, not run.
 **ORACLE (Addendum 3) complete (05:00Z; handoff/ORACLE.md):** O1+O3+O4 0.0; O2 contested -0.15 [-0.93, +0.65], uncontested
 +1.08; O-all contested +0.43 [+0.00, +1.03], uncontested +1.20 [+0.46, +2.01]; residual 343 / 344 B1 contested misses.
 Full-visibility sim: all 66 switch pairs on the B2 base 394 / 394 (handoff/i21/sim_pairs_b2.json).
+
+**I21 on B2, bug-fix-track evaluation (07:20Z Nov 24; checks pre-registered 23:39Z Nov 23, re-run on B2 as registered
+after NS-6): ALL 5 MET.** B2 (`bf1_*`) vs B2 + `--gate-spare-after` (`i21b2_*`), 5 sets, chunks once:
+| check | result | met |
+|---|---|---|
+| 1 chain behaviour cited | causality (touch older than the order cannot disprove it) + I15 chain truth (6 of 17 dm60 lost-order cases) | yes |
+| 2 full-visibility sim | met as written (NS-6 re-run; spare branch not exercised by the sim, stated) | yes |
+| 3 point > 0 on >= 3 sets, none negative | dev20 +1.8, dev-fast +4.1, dm60 +2.7, alo2 +0.9, fast5 +1.7 (5 of 5 > 0) | yes |
+| 4 uncontested not worse | pooled +0.6 [+0.1, +1.3]; per set +1.0 / -0.0 / +0.4 / +1.1 / +0.3 (none < -0.5) | yes |
+| 5 flips majority positive | contested 13 up / 2 down (10 changed chunks); uncontested 8 up / 1 down | yes |
+Pooled contested **+1.9 [+0.8, +3.3]** (n 552, 159 chunks; 0.514 -> 0.533). Next as registered: Rust parity (queued),
+then NEEDS_SATYA "bug-fix adoption of I21 as B3" (reversible, 3-hour default).
