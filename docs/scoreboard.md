@@ -854,3 +854,18 @@ sets) can no longer be met, so the 2 confirm-set runs were stopped. The rule sta
 switch, default off). V2 (action rule) screen running as pre-registered.
 **I33 V2 (`--px-sigfig action`) screen (13:35Z Nov 24): FAIL (inert).** Pooled contested +0.0 [+0.0, +0.0]
 (n 311), uncontested +0.0; 0 txs changed on dev20 / dev-fast / dm60. I33 closed (both variants inert on scored txs).
+
+### dev_cap20 dev designation + I37 plan, pre-registered 14:25Z Nov 24 (no replay of these chunks has happened)
+- **dev_cap20** (handoff/dev_sets/dev_cap20.txt, read-only, sha256 e1d86d1508937be8...): the first 20 chunks qualifying
+  under scripts.benchmark_postchange that start at or after 1233034937 and carry open_book_users.json (truth-live3),
+  1233034937-1233035146 .. 1233109679-1233109888. DEV ONLY (screens / info checks for I37); never a confirm set (Yuta
+  excludes them; confirm sets C3+ start after it). Chosen by height only, before any replay.
+- **I37 info check (first, no rule chosen from it alone):** on dev_cap20, for users whose plan-time open count is flat
+  across the previous snapshots (open_book_users.json, past only), count their window placements that our B3 engine
+  rests; with Yuta's help (SQD only if quota remains: not required), how many of those placements sit ahead of a
+  scored contested fill. Then the screen rule below is built.
+- **I37 V1 rule (`--cap-pinned`, default off; written now, built after the info check):** a user is PINNED at chunk
+  start if its open_book_users total_open is identical (+-1) in the last 2 snapshots before the chunk; a pinned user's
+  window placements are not applied, except after that user's own cancels / fills in the window free a slot (one
+  placement per freed slot). Screen: B3 vs B3 + V1 on dev_cap20 (pooled_paired; promotion bar), confirm on the next
+  fresh set that carries open_book_users.json (Addendum 1 sign test).
