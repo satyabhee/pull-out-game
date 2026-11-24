@@ -689,3 +689,28 @@ data fact; I26 alone is inert on real data; the sim is exact only with both.
 Pooled over the 5 sets (chunks once): contested **+2.8 [+1.0, +5.0]** (0.488 -> 0.516, n 554, 159 chunks). Changed
 chunks: dev20 2, dev-fast 1, dm60 5 (+3 uncontested), alo2 5, fast5 3 (+3 uncontested). Next: Rust parity (dev20 +
 dev-fast), then NS-9 default -> B2. handoff/i21/bf1_eval.txt.
+**BF1 Rust parity (02:18Z):** `replay.parity` (Rust backend, options_for(stp=maker) + `--touch-trades-first`) vs the
+Python BF1 outputs: **PARITY OK, every CSV identical** on dev20 and dev-fast. Peak 2.0 GB (dev20). Adoption now waits only
+on NS-9 (default 04:48Z).
+
+**NS-6 (answered (c)) - I21 check 2 re-run exactly as written, with the I25 fix in the code (02:19Z):** (a) not re-run
+(394 / 394 before); (b) = (a) + B1 gate flags + `--touch-trades-first`: 394 / 394; (c) = (b) + `--gate-spare-after`:
+394 / 394, not below (b). The sim has a touch feed and the gate acts (2,188 rejects), so the "no touch feed" clause does
+not apply: **check 2 is MET as written.** Stated next to it: `spared_after_touch` = 0 in the sim, so the sim neither
+supports nor contradicts I21's own branch. I21's checks 3-5 were measured on B1; the baseline is about to move (NS-10),
+so I21 is NOT adopted on the B1 evaluation. Instead, pre-registered now: **I21 on B2** = the same 5 checks (1 and 2 as
+above; 3-5 on B2 vs B2 + `--gate-spare-after` over the same 5 sets, chunks once), run after B2 is adopted; if all hold,
+NEEDS_SATYA bug-fix adoption as for BF1.
+
+**NS-7 done (02:19Z):** ~/book-replay-g2's 11 files committed as-is to g2-determinism (9a3b82e), tagged archive/g2-determinism,
+worktree removed (no --force), local branch deleted (tag keeps it).
+
+### I27 information check (02:21Z Nov 24): **the trade id encodes both order ids.**
+`tid = SipHash-1-3(keys 0, LE u64 buyer_oid || LE u64 seller_oid) >> 14` (Rust DefaultHasher on the (u64, u64) tuple,
+top 50 bits). Verified on **1,996 of 1,996** recorded trades whose buyer and seller oids are both known (userFills
+captures in 186 chunks' fills.json; no exception). Code: data/tid_hash.py, tests/test_tid_hash.py. Meaning: every
+recorded trade (public trades stream: tid, users, taker tx hash) pins the exact (buyer order, seller order) pair once the
+candidates are narrowed (taker oid near its placement's estimated oid; maker oid among the maker's orders at p). It is
+post-tx evidence printed with the trade, like the evidence `--learn-evidence tx` already uses (rule 1 holds if it is
+used at block end, as corrections are). Next (measurement only, no replay change): how many real fills of the dev sets
+can be solved (taker oid and maker oid identified uniquely) with the oid estimator's brackets.
