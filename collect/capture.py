@@ -58,7 +58,8 @@ Settings (environment variables):
   TRUTH_IOC=0          chunks: orderStatus (weight 2) by cloid of up to this many BTC/ETH IOC placements in the
                        scored blocks, asked as each block is fetched (statuses of rejected IOCs are gone within
                        minutes: 15/15 known at 2.5 min, 6/8 at 7 min, 0-1/8 after 4 h), on a low-priority thread
-                       capped at TRUTH_WEIGHT_PER_MIN=300 (inside INFO_WEIGHT_PER_MIN); items older than
+                       capped at TRUTH_WEIGHT_PER_MIN=300 (inside INFO_WEIGHT_PER_MIN); this chunk's HIST_IOC users
+                       are skipped (their historicalOrders at chunk end hold the statuses); items older than
                        TRUTH_STALE_S=360 s are skipped. truth_status.json (oracle truth, BLITZ Addendum 3: the replay
                        never reads it; written by the thread itself when the chunk's items are done)
   TOUCH_BP=1           post-only placement counts as "at the touch" within this many bp of the coin's last trade
@@ -204,8 +205,9 @@ class TruthAsker:
     cap) and in the capture's global budget (so the IP total stays inside INFO_WEIGHT_PER_MIN). close() makes the
     thread write `path` once its queue is done; join() waits (tests)."""
 
-    def __init__(self, path, cap, budget, lookup=None, truth_bud=None, clock=time.time, stale_s=None):
+    def __init__(self, path, cap, budget, lookup=None, truth_bud=None, clock=time.time, stale_s=None, skip=()):
         self.path, self.cap, self.budget = path, cap, budget
+        self.skip = {u.lower() for u in skip}         # users whose statuses come from historicalOrders anyway
         self.lookup = lookup or order_status
         self.truth_bud = truth_bud or truth_budget()
         self.clock = clock
@@ -218,6 +220,9 @@ class TruthAsker:
 
     def feed(self, items):
         for it in items:
+            if it[3] in self.skip:
+                self.counts["skipped_hist_user"] += 1
+                continue
             if self.queued >= self.cap:
                 self.counts["over_cap"] += 1
                 continue
@@ -808,7 +813,8 @@ def capture(fetcher, start, end, meta, writer=None, state=None, warmup=None, max
     suspect_set, scands = set(suspects), []
     alos = []
     iocs = collections.Counter()
-    truth = TruthAsker(os.path.join(d, "truth_status.json"), TRUTH_IOC, writer.budget) if TRUTH_IOC else None
+    truth = TruthAsker(os.path.join(d, "truth_status.json"), TRUTH_IOC, writer.budget,
+                       skip=meta.get("hist_ioc_users") or ()) if TRUTH_IOC else None
     for i, h in enumerate(range(start, end + 1)):
         p = os.path.join(d, f"{h}.json.gz")
         b = None

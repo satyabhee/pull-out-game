@@ -700,3 +700,12 @@ def test_chunk_capture_truth_ioc_asks_scored_iocs_and_keeps_anchors_unchanged(tm
     assert meta["truth_ioc_queued"] == 10 == out["queued"] and len(calls) == 10
     assert all(r["placed_height"] >= 1150 for r in out["rows"])  # scored blocks only
     assert out["counts"]["over_cap"] == 20 and out["counts"]["status:unknownOid"] == 10
+
+
+def test_truth_asker_skips_users_covered_by_history(tmp_path):
+    asked = []
+    t = cap.TruthAsker(str(tmp_path / "t.json"), 5, FreeBudget(), lookup=lambda u, c: asked.append(u) or {"status": "unknownOid"},
+                       truth_bud=FreeBudget(), clock=lambda: 0.0, stale_s=1e9, skip=["0xAA"])
+    t.feed([(1, 0, 0, "0xaa", "0xc1", 0), (1, 1, 0, "0xbb", "0xc2", 0)])
+    t.close(); t.join(5)
+    assert asked == ["0xbb"] and json.loads((tmp_path / "t.json").read_text())["counts"]["skipped_hist_user"] == 1

@@ -92,26 +92,29 @@ class Truth:
             self.by_oid[key] = rec
 
     def index(self):
-        self.by_cloid = {}
+        self.by_cloid = defaultdict(list)          # cloids can be reused: keep every record
         self.by_shape = defaultdict(list)
         for (u, oid), r in self.by_oid.items():
             if r["cloid"]:
-                self.by_cloid[(u, r["cloid"])] = r
+                self.by_cloid[(u, r["cloid"])].append(r)
                 if not u:
-                    self.by_cloid[("*", r["cloid"])] = r
+                    self.by_cloid[("*", r["cloid"])].append(r)
             self.by_shape[(u, r["coin"], r["side"], r["px"], r["placed_ms"])].append(r)
 
     def find(self, u, cloid, coin, side, px, bt, sz, used):
         """The record of a placement by user u: own key first, then an unattributed shared-stream record whose
         shared list holds u."""
         if cloid:
-            r = self.by_cloid.get((u, cloid))
-            if r is None:
-                r = self.by_cloid.get(("*", cloid))
-                if r is not None and u not in r["shared"]:
-                    r = None
-            if r is not None:
-                return r
+            # the record must be THIS placement: same coin / side / px and placed at this block's time (a reused
+            # cloid otherwise names a later order; Nov 24 truth audit)
+            same = lambda x: x["coin"] == coin and x["side"] == side and x["px"] == px and x["placed_ms"] == bt \
+                and (u, x["oid"]) not in used
+            rs = [x for x in self.by_cloid.get((u, cloid), []) if same(x)] or \
+                [x for x in self.by_cloid.get(("*", cloid), []) if same(x) and u in x["shared"]]
+            if len(rs) == 1:
+                return rs[0]
+            if rs:
+                return None
         cands = [x for x in self.by_shape.get((u, coin, side, px, bt), []) + [
                  x for x in self.by_shape.get(("", coin, side, px, bt), []) if u in x["shared"]]
                  if x["orig_sz"] == sz and (u, x["oid"]) not in used]
@@ -211,7 +214,7 @@ def build(set_dir, hl_data, out_dir):
             used.add((u, r["oid"]))
             row = {"chunk": d.name, "height": h, "tx": t, "tx_hash": txh, "item": i, "user": u, "coin": coin, "side": side,
                    "px": norm(px), "tif": tif, "cloid": cloid, "oid": r["oid"], "status": r["status"],
-                   "status_ms": r["status_ms"], "block_ms": bt, "src": r["src"]}
+                   "status_ms": r["status_ms"], "block_ms": bt, "placed_ms": r["placed_ms"], "src": r["src"]}
             files["o1_order_status"].write(json.dumps(row) + "\n")
             files["o3_oids"].write(json.dumps({k: row[k] for k in ("chunk", "height", "tx", "item", "user", "cloid",
                                                                    "oid", "src")}) + "\n")
