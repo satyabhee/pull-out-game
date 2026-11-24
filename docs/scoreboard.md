@@ -882,3 +882,10 @@ switch, default off). V2 (action rule) screen running as pre-registered.
   freed only by a cancel that removes an order from OUR book. V1 (`--cap-free any`, as registered) and V2 both screened;
   Holm-paired at the confirm. Flag name: `--cap-windows DIR` (the windows root, needed for earlier snapshots) instead
   of `--cap-pinned`.
+
+**B3 headline (14:41Z Nov 24; pre-approved reporting run; NOT used to choose anything): final220 = final240 minus dev20
+(220 chunks, NS-8 (a)).** FROZEN v2 (= v3 on final240; Yuta #47: pdocs_f240/<pdocs-evarr subdir>, filtered to the 220
+chunks) vs B3 (report/validate/headline_b3_f220_b1..b4, merged), per-tx paired, chunk bootstrap:
+contested maker-strict 56.2% -> **59.4%**, +3.2 [+1.5, +5.0] (n 1,932, 201 chunks); uncontested 67.4% -> 66.3%,
+-1.1 [-2.5, +0.0] (n 2,353); all scored 62.3% -> 63.2%, +0.8 [-0.3, +2.0] (n 4,285). (The older FROZEN text "56.3% on
+final240" is NOT comparable: different chunk set; Yuta could not reconcile it with its own file either.)
