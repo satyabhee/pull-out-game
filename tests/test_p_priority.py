@@ -146,3 +146,22 @@ def test_touch_trades_first_keeps_post_block_bbo():
     new = RealTouch((), trades, bbos, trades_first=True)
     new.advance(1100)
     assert new.get(0, 1100)[:2] == (95, 104)
+
+
+def test_phantom_sink_jumps_flagged_and_flagged_never_jumps():
+    # I27c: a later non-flagged order goes ahead of trailing flagged orders; a flagged order rests at the tail
+    eng = Engine(p_priority="docs")
+    eng.sink = lambda u: u == "0xbad"
+    for a in (place("0xa", Side.SELL, 100, 1, p=1), place("0xbad", Side.SELL, 100, 1, p=50),
+              place("0xb", Side.SELL, 100, 1, p=0), place("0xbad", Side.SELL, 100, 1, p=99)):
+        eng.block_time_ms = 0
+        eng.apply(a)
+    assert queue(eng, 100) == ["0xa", "0xb", "0xbad", "0xbad"]
+
+
+def test_phantom_sink_off_is_unchanged():
+    eng = Engine(p_priority="docs")
+    for a in (place("0xa", Side.SELL, 100, 1, p=1), place("0xbad", Side.SELL, 100, 1, p=50)):
+        eng.block_time_ms = 0
+        eng.apply(a)
+    assert queue(eng, 100) == ["0xbad", "0xa"]          # docs p jump within the window

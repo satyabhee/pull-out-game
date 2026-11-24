@@ -764,3 +764,24 @@ then NEEDS_SATYA "bug-fix adoption of I21 as B3" (reversible, 3-hour default).
 **I21-on-B2 Rust parity (07:25Z):** replay.parity, options_for(stp=maker) + `--touch-trades-first --gate-spare-after`
 vs i21b2_dev20 / i21b2_devfast: PARITY OK, every CSV identical. NS-11 (a) unblocked (default 10:22Z).
 **I27 tid solve, dev_margin60 (07:16Z, inside a hold):** 917 of 1,332 trades solved (69%); dev20 44%, dev-fast 78%.
+
+### I27c: phantom ledger from trade ids, pre-registered 08:10Z Nov 24 (info check seen; NO I27c variant built or run)
+- **Info check (seen):** analysis.tid_phantoms over all 96 dev chunks (B2 + `--learn-tid`): 279 phantom proofs, 128 real
+  proofs. Flag "phantom proofs >= 1 and > real proofs", counting only proofs from EARLIER blocks (earlier chunks in time
+  order + earlier blocks of the same chunk): recall 0.69, precision 0.94 on later proofs. Within-chunk only: recall 0.13.
+- **Ledger:** handoff/i27/tp_chunks events compiled to handoff/i27/phantom_ledger.json (user -> [height, kind]). When
+  replaying chunk C, a proof counts only if its height < C's first block height; proofs from C's own earlier blocks
+  are added online from the replay's tid events (block end, rule 1). Flag fixed: phantom >= 1 and phantom > real (k = 1,
+  chosen from the info check; no other k is screened).
+- **V1 sink (`--phantom-mode sink`):** a resting named order of a flagged user is jumped by every later non-flagged
+  named order at its level (walk from the tail, as p-priority insertion), and a flagged user's own order never jumps
+  anyone by p. Placeholders untouched; nothing is removed.
+- **V2 reject (`--phantom-mode reject`):** a flagged user's window ALO placement is not applied (a Modify's cancel half
+  still is).
+- **Screen:** B2 vs B2 + `--learn-tid --phantom-ledger FILE --phantom-mode {sink,reject}` on dev20 + dev-fast +
+  dev_margin60, analysis.pooled_paired; promote iff pooled contested >= +1.0, lower >= -1.0, no acting set < 0. Reported:
+  changed chunks, contested up / down, uncontested, flagged users, sunk / rejected counts. Holm across the 2 variants at
+  the confirm. Caveat: the screen sets' ledger was built from runs on these same dev sets (earlier chunks only), so the
+  confirm on fresh sets is the real test; its ledger = proofs from any chunk earlier in time than each confirm chunk.
+- **Full-visibility sim:** both variants must stay 394 / 394 (no phantoms exist there, so nothing should be flagged).
+- **If B3 (NS-11) is adopted before the screen runs, the screen uses B3 as its baseline** (stated now).

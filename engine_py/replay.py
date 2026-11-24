@@ -277,7 +277,7 @@ class Replay:
                  alo_gate: str | None = None, gate_max_age_ms: int | None = None, gate_spare_after: bool = False,
                  touch_trades_first: bool = False,
                  oracle_file: str | None = None, oracle: tuple = (), oracle_prequeue: str | None = None,
-                 learn_tid: bool = False,
+                 learn_tid: bool = False, phantom_ledger: str | None = None, phantom_mode: str | None = None,
                  reconcile_known: str | None = None, reseed: bool = False,
                  touch_reconcile: bool = False, touch_n_cap: bool = False, touch_refill: str | None = None,
                  keep_known: bool = False, skip_lead_in: bool = False, lead_in_keep: int | None = None,
@@ -565,6 +565,24 @@ class Replay:
         self._tid_maker: dict = {}                  # (taker hash, tid) -> (height, tx, item) of the maker placement
         self._pos_eoid: dict = {}                   # (height, tx, item) -> our engine oid created by that placement
         self.tid_events: list = []                  # I27c info check: (height, coin, user, "real" | "phantom")
+        # I27c (default off): users with tid-proven phantoms (ledger of EARLIER chunks + this chunk's earlier blocks)
+        self.phantom_mode = phantom_mode
+        self._ph: Counter = Counter()
+        self._re: Counter = Counter()
+        if phantom_mode is not None:
+            if phantom_mode not in ("sink", "reject"):
+                raise ValueError(f"phantom_mode {phantom_mode!r}: sink | reject")
+            if not learn_tid or not phantom_ledger:
+                raise ValueError("phantom_mode needs learn_tid and phantom_ledger")
+            import json as _json
+            start = self.blocks[0].height
+            for u, evs in _json.loads(Path(phantom_ledger).read_text()).items():
+                for h, kind in evs:
+                    if h < start:
+                        (self._ph if kind == "phantom" else self._re)[u.lower()] += 1
+            self.phantom_stats = Counter(flagged_at_start=sum(1 for u in self._ph if self.phantom_flagged(u)))
+            if phantom_mode == "sink":
+                self.engine.sink = self.phantom_flagged
         if learn_tid:
             from data.tid_solve import solve_chunk
             est = self.resolver.est if self.resolver is not None else None
@@ -1020,8 +1038,10 @@ class Replay:
                         continue
                     if nd.order.oid in exact:
                         self.tid_events.append((h_now, coin, u, "real"))
+                        self._re[u.lower()] += 1
                     elif u not in px_makers:
                         self.tid_events.append((h_now, coin, u, "phantom"))
+                        self._ph[u.lower()] += 1
                 for nd in nodes[:cut]:
                     if nd.order.oid in exact:
                         continue                   # another order the chain filled in this tx
@@ -1370,6 +1390,11 @@ class Replay:
         st[(name, "ledger_evicted")] += k
         return [(px, sz)]
 
+    def phantom_flagged(self, user: str) -> bool:
+        """I27c flag: >= 1 tid-proven phantom and more phantom than real proofs, from earlier blocks only."""
+        u = (user or "").lower()
+        return self._ph[u] >= 1 and self._ph[u] > self._re[u]
+
     def _oracle_before(self, block: Block, action: Action) -> tuple[list[Fill], list[Reject]] | None:
         """ORACLE (look-ahead by design): the result of an action the oracle decides, or None to apply it normally."""
         orc, eng = self.oracle, self.engine
@@ -1405,6 +1430,23 @@ class Replay:
 
     def _apply(self, block: Block, action: Action) -> tuple[list[Fill], list[Reject]]:
         self.observer.before_action(self, block, action)
+        if self.phantom_mode == "reject":
+            p = action.new if isinstance(action, Modify) else action
+            if isinstance(p, Place) and p.tif is Tif.ALO and self.phantom_flagged(action.user):
+                self.phantom_stats["rejected_alo"] += 1
+                if isinstance(action, Modify):          # the cancel half still happens
+                    meta = dict(user=action.user, block=action.block, tx_index=action.tx_index,
+                                item_index=action.item_index, hash=action.hash, priority=action.priority,
+                                asset=action.asset)
+                    cancel = (CancelByCloid(**meta, cloid=action.target) if isinstance(action.target, str)
+                              else Cancel(**meta, oid=action.target))
+                    self._block = block
+                    self.engine.block_time_ms = block.time_ms
+                    out = self.engine.apply(cancel)
+                else:
+                    out = ([], [])
+                self.observer.after_action(self, block, action, out[0], out[1], None)
+                return out
         oracle_ioc_ok = False
         if self.oracle is not None:
             out = self._oracle_before(block, action)

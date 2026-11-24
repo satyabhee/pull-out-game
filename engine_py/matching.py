@@ -74,6 +74,8 @@ class Engine:
         (Order.seq) instead of queue position. Under p_priority the queue head is the highest-p order, not
         the oldest one, so queue order would trim the freshest high-p orders first."""
         self.docs_t_ms = DOCS_T_MS
+        # I27c (default off): sink(user) -> True for a flagged user (tid-proven phantoms); set by the replay.
+        self.sink = None
         if isinstance(p_priority, str) and p_priority.startswith(("docs:", "docsall:")):
             # I01 (tournament, Nov 23): "docs:<ms>" / "docsall:<ms>" = the docs rule with window T = <ms>
             p_priority, t = p_priority.split(":")
@@ -294,6 +296,15 @@ class Engine:
                     return (m is not None and p > m[0] and t - m[1] < docs_t
                             and (window == "docsall" or (order.tif is Tif.ALO and node.order.tif is Tif.ALO)))
                 return m is not None and m[0] > 0 and p > m[0] and t - m[1] <= window
+        if self.sink is not None and order.user != PLACEHOLDER:
+            if self.sink(order.user):
+                jumps = None                       # a flagged user's order never jumps anyone (I27c sink)
+            else:
+                base, sink = jumps, self.sink
+
+                def jumps(node, base=base, sink=sink):
+                    u = node.order.user
+                    return (u != PLACEHOLDER and sink(u)) or (base is not None and base(node))
         if self.p_priority is not None and order.user != PLACEHOLDER and p is not None and (p or self.p_priority in ("known", "knownpos", "docs", "docsall")):
             self.p_meta[order.oid] = (p, self.block_time_ms)     # p None = rested from outside evidence
         self.books[order.asset].add(order, remaining, jumps=jumps)

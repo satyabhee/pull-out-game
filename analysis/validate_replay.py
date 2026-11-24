@@ -475,7 +475,7 @@ def scoring_inputs(rp, hl_data, oid_facts) -> tuple[dict, dict]:
 
 
 def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_resolver=True, quiet=False,
-        alo_gate=None, gate_max_age_ms=None, gate_spare_after=False, touch_trades_first=False, oracle_file=None, oracle=(), oracle_prequeue=None, learn_tid=False, evict_known=None, nearest_ratio=0, reseed=False,
+        alo_gate=None, gate_max_age_ms=None, gate_spare_after=False, touch_trades_first=False, oracle_file=None, oracle=(), oracle_prequeue=None, learn_tid=False, phantom_ledger=None, phantom_mode=None, evict_known=None, nearest_ratio=0, reseed=False,
         touch_reconcile=False, touch_n_cap=False, touch_refill=None, keep_known=False, skip_lead_in=False,
         lead_in_keep=None, touch_evict="oldest", ledger_k=3,
         snapshot_shift=0, outside_position="end", stp="cancel_taker", observer_cls=None, engine=None,
@@ -493,7 +493,7 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
     gc.set_threshold(50_000, 20, 1_000)
     policy = POLICIES[policy_name]
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
-                gate_max_age_ms=gate_max_age_ms, gate_spare_after=gate_spare_after, touch_trades_first=touch_trades_first, oracle_file=oracle_file, oracle=tuple(oracle), oracle_prequeue=oracle_prequeue, learn_tid=learn_tid, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
+                gate_max_age_ms=gate_max_age_ms, gate_spare_after=gate_spare_after, touch_trades_first=touch_trades_first, oracle_file=oracle_file, oracle=tuple(oracle), oracle_prequeue=oracle_prequeue, learn_tid=learn_tid, phantom_ledger=phantom_ledger, phantom_mode=phantom_mode, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
                 reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap, touch_refill=touch_refill,
                 lead_in_keep=lead_in_keep, touch_evict=touch_evict, ledger_k=ledger_k,
                 keep_known=keep_known, skip_lead_in=skip_lead_in,
@@ -680,6 +680,8 @@ def summarize(rp, obs, rows, unlinked, policy_name) -> dict:
     if rp.trade_learn is not None:                  # trade-learning flag: only when set
         res["trade_learn"] = rp.trade_learn
         res.update({f"learn:{k}": v for k, v in sorted(rp.learn_stats.items())})
+        if getattr(rp, "phantom_mode", None):
+            res.update({f"phantom:{k}": v for k, v in sorted(rp.phantom_stats.items())})
     res.update(scope_metrics(scored))
     post = [r for r in rows if not r["warmup"]]
     res["excluded_real_maker_prewindow"] = sum(r["status"].startswith("excluded") for r in post)
@@ -826,6 +828,9 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
                     help="I25: at equal time, apply a block's trades to the touch BEFORE its post-block bbo / snapshot")
     ap.add_argument("--learn-tid", action="store_true",
                     help="I27: the queue correction cuts at the maker order the trade id pins (data/tid_hash.py)")
+    ap.add_argument("--phantom-ledger", help="I27c: tid phantom ledger JSON (user -> [[height, kind]]); proofs before the chunk only")
+    ap.add_argument("--phantom-mode", choices=("sink", "reject"),
+                    help="I27c (default off): flagged users' orders are jumped by later named orders (sink) or their ALOs not rested (reject)")
     ap.add_argument("--oracle-file", help="ORACLE (look-ahead by design, diagnostic only): chain-truth status CSV")
     ap.add_argument("--oracle-status", action="store_true", help="ORACLE O1 (look-ahead by design): chain order status")
     ap.add_argument("--oracle-cancel", action="store_true", help="ORACLE O3 (look-ahead by design): true cancel target")
@@ -940,6 +945,7 @@ def replay_kwargs(a) -> dict:
     """Keyword arguments for run() from add_replay_args options (all but hl_data, policy, anchors)."""
     return dict(use_resolver=not a.no_resolver, alo_gate=a.alo_gate, gate_max_age_ms=a.gate_max_age_ms,
                 gate_spare_after=a.gate_spare_after, touch_trades_first=a.touch_trades_first, oracle_file=a.oracle_file, oracle_prequeue=a.oracle_prequeue, learn_tid=a.learn_tid,
+                phantom_ledger=a.phantom_ledger, phantom_mode=a.phantom_mode,
                 oracle=tuple(k for k in ("status", "cancel", "ioc") if getattr(a, f"oracle_{k}")),
                 evict_known=a.evict_known, nearest_ratio=a.nearest_ratio, reseed=a.reseed,
                 touch_reconcile=a.touch_reconcile, touch_n_cap=a.touch_n_cap, touch_refill=a.touch_refill,
