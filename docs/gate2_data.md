@@ -109,17 +109,33 @@ error of the offset estimate only. A single send's latency jitter is on top of i
 Free-quota note: R0 + R1 used 40.1 MB uncompressed (the conservative reading of the ~50 MB/month public quota). No pull
 was needed tonight.
 
-## Files in mahito's format (docs/gate2.md section 2): `handoff/gate2/`
-Built by `uv run python -m analysis.gate2_sendtimes` (add `--raw` for the raw-nonce file).
+## Files in mahito's format (docs/gate2.md section 2, mail #43): `handoff/gate2/`
+Built by `uv run python -m analysis.gate2_sendtimes --mode l44|yuta95|raw`.
 - `blocks.csv` (`chunk_dir,height`): 71 blocks in 35 chunks. Each block gets one chunk dir, chosen by
-  dev_margin60 > devfast > dev20. sha256 09ade47007cced64...
-- `send_times.csv` (`height,tx_hash,item_index,user,nonce,send_ms,calibrated` + info columns action_index, batch,
-  class, tier): one row per explorer tx with a fresh nonce, 98,144 rows.
-  - send_ms = calibrated send time.
-  - calibrated = 1 (signer offset) or 2 (pooled offset).
-  - 65,521 txs with stale or future nonces have NO row, so they keep their slot. 9 txs are unaligned.
-  - sha256 976a995cd56564d6...
-- `send_times_raw.csv`: the same rows with send_ms = raw nonce and calibrated = 0, as a sensitivity arm (raw agrees
-  better for takers inside a fee tier). sha256 a7d318d888da08c5...
+  dev_margin60 > devfast > dev20. sha256 09ade47007cced643e0fc3f416be0b8b5a5450550562d937e976462e2f4528ee
+- All three send-time files have 98,144 rows: one per explorer tx with a clock-like (fresh) nonce. 65,521 txs with
+  counter / stale / future nonces have no row, so they keep their slot. 9 txs are unaligned; all are system or deploy
+  actions that SQD doesn't carry (perpDeploy 5, SystemSpotSendAction 3, approveAgent 1). Columns:
+  `height,tx_hash,item_index,user,nonce,send_ms,calibrated` + action_index, batch, class, tier. Keyed by ACCOUNT:
+  SQD has no agent signer.
+  - `send_times.csv` = **L44 as specified**: send_ms = nonce + lat(account, UTC hour), lat = 10th pct of
+    (block_time - nonce) over clock-like actions, at least 20 per account-hour.
+    - 569 account-hours are calibrated (66,098 rows, calibrated 1; lat q10 / median / q90 = 146 / 167 / 195 ms).
+    - The rest use the raw nonce (32,046 rows, calibrated 0). sha256 744de38c37982422...
+  - `send_times_yuta95.csv` = my calibration (section above). sha256 976a995cd56564d6...
+  - `send_times_raw.csv` = raw nonce. sha256 a7d318d888da08c5...
+- **Which agrees with chain order?** Weighted Kendall tau vs listing order, inside (batch, class[, tier]), one row per
+  action:
+
+  | file | C | A | G | O |
+  |---|---|---|---|---|
+  | L44 as specified | 0.408 | 0.298 | 0.217 | 0.209 |
+  | L44 with pooled fallback (+167 ms instead of raw) | 0.546 | 0.410 | 0.290 | 0.224 |
+  | yuta95 | **0.623** | **0.481** | 0.251 | 0.229 |
+  | raw nonce | 0.540 | 0.453 | **0.351** | 0.253 |
+
+  L44 as specified is worse than the raw nonce in every class. It mixes calibrated rows (shifted about +167 ms) with
+  raw-nonce fallback rows inside one batch, and that mix alone accounts for most of the loss. This is the only
+  validation possible: cross-class order (what M1n changes) is never observed, because the chain always class-sorts.
 - My batch ids are cut on ALL actions. docs/gate2.md section 8 cuts on BTC/ETH txs only. The `batch` column lets you
   compare the two.
