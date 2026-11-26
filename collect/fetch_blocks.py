@@ -28,6 +28,7 @@ skipped on rerun. Backs off on HTTP 429. Stops on the daily archived-block cap.
 capture.py imports Fetcher from this file.
 """
 import argparse, fcntl, glob, gzip, http.client, json, os, random, sys, time, urllib.request
+import backoff
 
 HOST, PATH = "rpc.hyperliquid.xyz", "/explorer"
 DEFAULT_INTERVAL = 0.8                  # pacing for --keepalive only
@@ -187,8 +188,8 @@ class Fetcher:
     def get(self, h, tries=8):
         """Return (parsed block, raw json bytes). Raises TooOld (nothing sent), ArchivedCap, NotYet,
         or RuntimeError after `tries`."""
-        delay, last = 1.0, None
-        for _ in range(tries):
+        last = None
+        for attempt in range(tries):
             self.last_age_min = self.check_age(h)   # before EVERY request, retries included
             t_sent, t0 = int(time.time() * 1000), time.perf_counter()
             status, data, outcome = None, b"", "exception"
@@ -197,8 +198,9 @@ class Fetcher:
                 outcome = "ok" if status == 200 else "http_429" if status == 429 else f"http_{status}"
                 if status == 429:
                     self.http429 += 1
+                    backoff.count_429("explorer")
                     last = "HTTP 429"
-                    time.sleep(delay + random.random()); delay = min(delay * 2, 60); continue
+                    time.sleep(backoff.delay(attempt)); continue
                 if status != 200:
                     raise ValueError(f"HTTP {status}: {data[:200]!r}")
                 blk = json.loads(data)
@@ -225,7 +227,7 @@ class Fetcher:
                 last = e
             finally:
                 self._log_request(t_sent, h, status, outcome, time.perf_counter() - t0, len(data or b""))
-            time.sleep(delay); delay = min(delay * 2, 60)
+            time.sleep(backoff.delay(attempt))
         raise RuntimeError(f"block {h}: {last}")
 
 

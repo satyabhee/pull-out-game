@@ -84,6 +84,7 @@ Needs the hl-recorder service: block headers and book snapshots come from its fi
 """
 import collections, datetime, glob, gzip, json, os, queue, random, shutil, sys, threading, time, urllib.request
 from fetch_blocks import DEFAULT_INTERVAL, ArchivedCap, Fetcher, NotYet, TooOld, last_line, recorder_head, save
+import backoff
 import info
 
 HOME = os.path.dirname(os.path.abspath(__file__))
@@ -107,7 +108,7 @@ HIST_END_USERS = int(os.environ.get("HIST_END_USERS", 6))
 TRACKERS_FILE = os.environ.get("TRACKERS_FILE", "trackers.json")
 HIST_END_RANDOM = os.environ.get("HIST_END_RANDOM") == "1"
 HIST_IOC_USERS = int(os.environ.get("HIST_IOC_USERS", 0))   # chunks: historicalOrders at chunk end for the top IOC senders
-CAPTURE_VERSION = "2026-11-24-truth-live3"     # written into every chunk's window.json (capture_version)
+CAPTURE_VERSION = "2026-11-26-backoff429"     # written into every chunk's window.json (capture_version)
 CAPTURE_SUPERSET_OF = "2026-11-24-truth-live2" # same files as that version plus new ones the replay does not read
 ALO_MARGIN_USERS = int(os.environ.get("ALO_MARGIN_USERS", 0))
 TOUCH_BP = float(os.environ.get("TOUCH_BP", 1))
@@ -179,11 +180,14 @@ def disk_pct():
 
 
 def order_status(user, oid):
-    req = urllib.request.Request("https://api.hyperliquid.xyz/info",
-                                 data=json.dumps({"type": "orderStatus", "user": user, "oid": oid}).encode(),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+    """orderStatus lookup; HTTP 429 retried with jittered back-off (collect/backoff.py)."""
+    def once():
+        req = urllib.request.Request("https://api.hyperliquid.xyz/info",
+                                     data=json.dumps({"type": "orderStatus", "user": user, "oid": oid}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    return backoff.retry_429(once, "info:orderStatus")
 
 
 def ioc_items(block, height):
