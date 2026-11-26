@@ -108,3 +108,18 @@ error of the offset estimate only. A single send's latency jitter is on top of i
 
 Free-quota note: R0 + R1 used 40.1 MB uncompressed (the conservative reading of the ~50 MB/month public quota). No pull
 was needed tonight.
+
+## Files in mahito's format (docs/gate2.md section 2): `handoff/gate2/`
+Built by `uv run python -m analysis.gate2_sendtimes` (add `--raw` for the raw-nonce file).
+- `blocks.csv` (`chunk_dir,height`): 71 blocks in 35 chunks. Each block gets one chunk dir, chosen by
+  dev_margin60 > devfast > dev20. sha256 09ade47007cced64...
+- `send_times.csv` (`height,tx_hash,item_index,user,nonce,send_ms,calibrated` + info columns action_index, batch,
+  class, tier): one row per explorer tx with a fresh nonce, 98,144 rows.
+  - send_ms = calibrated send time.
+  - calibrated = 1 (signer offset) or 2 (pooled offset).
+  - 65,521 txs with stale or future nonces have NO row, so they keep their slot. 9 txs are unaligned.
+  - sha256 976a995cd56564d6...
+- `send_times_raw.csv`: the same rows with send_ms = raw nonce and calibrated = 0, as a sensitivity arm (raw agrees
+  better for takers inside a fee tier). sha256 a7d318d888da08c5...
+- My batch ids are cut on ALL actions. docs/gate2.md section 8 cuts on BTC/ETH txs only. The `batch` column lets you
+  compare the two.
