@@ -25,6 +25,13 @@ includes the uncertainty in P_hat.
 - **P_hat** = the share of conflict pairs where the taker was sent first (ties count 0.5) = **0.85 [0.76, 0.99]**.
   It comes from 1,788 timed (cancel, taker) pairs in 2,096 conflicts at SQD-timed heights. 650 pairs were untimed and
   excluded.
+- **Caveat on P_hat (Yuta #79, section 4b; read it with W_est):**
+  - P_hat is carried by large send gaps. The median of taker send minus cancel send is −461 ms, and 1,338 of 1,788
+    pairs have the taker signed more than 100 ms earlier.
+  - Gate 2 found nonce order informative only at 5–100 ms gaps.
+  - On those gaps P is near a coin flip: 0.42 [0.11, 0.96] on my 395 pairs, and 0.517 on Yuta's 3,568 pairs.
+  - At P = 0.517, W_est would be about 11,806 USD, or 0.10 USD per block. This is a described row, not the
+    pre-registered estimate.
 - **The estimate is about 5% of the upper bound.** Queue reach is what cuts it: only 2,587 of 474,805 conflicts have
   takers whose size gets past the queue ahead of the cancelled order.
 - **Volatility:** the top trailing-10 s volatility decile holds 0.34 [0.20, 0.47] of W_up and 0.26 [0.11, 0.51] of
@@ -54,6 +61,12 @@ includes the uncertainty in P_hat.
   - Section 3 of the pre-reg counts only cancels that the B3 book resolves to a crossing resting order.
 
 ## 2. Batches (P5) against SQD batch ids
+
+**This is an alignment check, not a validation (Yuta #79 item 4).** There is no true SQD batch id. The "batch" column
+in the yuta95 files is Yuta's class-reset cut on SQD actionIndex order, and that order is not the explorer listing
+order. So (a) below compares two cuts on two different sequences. It does not measure how accurately batches are
+inferred. Yuta's own check over all 271 blocks found the same: Rand 0.689, the explorer cut finer (1,069 batches vs
+394), and 12,967 / 12,967 timed conflict pairs in one SQD batch.
 
 - **SQD-timed heights that are scored here: 67 of 271.** The other 204 lie in the warm-up of their window. Gate 2b
   replays whole windows and scores from warmup_end_height (pre-reg section 1). Gate 2 replayed set chunks with their
@@ -106,6 +119,43 @@ These come from analysis/gate2b_diag.py. They read the CIs above; they don't cha
 - **Reading:** W_est rests on a few hundred large conflicts in a few dozen windows. With about 10 windows carrying most
   of it, a percentile bootstrap may understate the upper tail of W_est. Treat its CI as indicative.
 
+## 4b. P_hat: Yuta's independent P and the send-gap rows (described, not pre-registered)
+
+Yuta recorded his P before this run reported (#79, 08:40Z; data-streams b5aa1f4 analysis/gate2b_p.py;
+handoff/gate2b/p_yuta.json). It uses chain, capture and send-time data only, with no engine. His targets come from the
+status files, so his set approximates this one.
+
+| P (taker send < cancel send, ties 0.5) | value [95% window CI] | pairs | windows |
+|---|---|---|---|
+| this run, 67 scored SQD heights (the headline P_hat) | 0.85 [0.76, 0.99] | 1,788 | — |
+| Yuta, all 271 SQD heights | 0.840 [0.781, 0.909] | 12,967 | 88 |
+| Yuta, gate 2 primary 71 blocks | 0.875 [0.797, 0.983] | 7,799 | 25 |
+| Yuta, A5 200 blocks | 0.788 [0.693, 0.874] | 5,168 | 64 |
+| Yuta, high vol (≥ per-coin median) | 0.921 [0.879, 0.967] | 6,518 | 27 |
+| Yuta, low vol | 0.758 [0.685, 0.862] | 6,440 | 74 |
+| this run, 5 ≤ \|gap\| ≤ 100 ms | 0.420 [0.108, 0.962] | 395 | 7 |
+| Yuta, 5 ≤ \|gap\| ≤ 100 ms | 0.517 | 3,568 | — |
+
+- **The headline P_hat agrees with Yuta's.**
+- **The gap is the issue:**
+  - Send gaps (taker minus cancel) on this run's pairs: p25 −591 ms, median −461 ms, p75 −87 ms. Yuta's: p25 −564,
+    median −403, p75 −34.
+  - Gate 2 (docs/gate2_data.md, Limits point 2) found nonce order anti-informative above 100 ms, where sends are
+    delayed or pre-signed.
+  - So "the taker was signed first" mostly means the taker's message took longer to land, not that it would have won
+    an arrival race.
+- **W_est at other values of P** (W_est is linear in P; ESTIMATE value before P = 22,835 USD):
+
+| P used | W_est USD | per day | per block |
+|---|---|---|---|
+| 0.85 (headline P_hat) | 19,515 [9,634, 33,687] | 182,130 | 0.17 |
+| 0.420, this run's 5–100 ms (joint bootstrap) | 9,597 [1,866, 27,528] | 89,565 | 0.084 |
+| 0.517, Yuta's 5–100 ms (point, no CI) | 11,806 | 110,184 | 0.10 |
+
+- Pairs here are per conflict: one cancel tx that removes two crossing orders counts its taker pairs twice. Yuta's are
+  unique (cancel tx, taker tx) pairs.
+- From analysis/gate2b_diag.py. These rows are described alongside the result; they don't replace it.
+
 ## 5. Assumptions (pre-reg section 7, stated with the result)
 
 - **Queue reach (ESTIMATE):**
@@ -120,7 +170,7 @@ These come from analysis/gate2b_diag.py. They read the CIs above; they don't cha
   - W_up is a bound by construction, not a plausible value.
 - **P:**
   - One P_hat (0.85) is applied to every conflict.
-  - It is measured on 67 SQD-timed heights (section 2), using the yuta95 clock, and is assumed to carry over to all
+  - It is measured on 67 SQD-timed heights (section 2), using the yuta95 clock. It is carried by >100 ms send gaps, where nonce order is anti-informative (section 4b). It is assumed to carry over to all
     windows.
 - **Order flow is fixed.** No maker or taker reacts to the rule, so this is the mechanical value of the ordering.
 - **Markout:** L21, mid-to-mid at 10 s, adverse side only (max(0, −mo)). It is the maker's adverse move, not a

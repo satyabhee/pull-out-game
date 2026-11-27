@@ -62,6 +62,47 @@ def main(argv):
         we_h = json.loads(wj.read_text()).get("warmup_end_height") if wj.exists() else None
         why["in warm-up" if we_h is not None and hh < we_h else f"other ({status[w[0]]})"] += 1
     print(f"SQD heights {len(hs)}; scored {len(hs & got)}; not scored: {dict(why)}")
+    send_gap_rows(out)
+
+
+def band_p(pairs, lo=5, hi=100):
+    """P(taker send < cancel send), ties 0.5, over pairs with lo <= |taker - cancel| <= hi ms."""
+    sel = [(t, c) for t, c in pairs if lo <= abs(t - c) <= hi]
+    return (sum(1.0 if t < c else 0.0 for t, c in sel) / len(sel) if sel else None), len(sel)
+
+
+def send_gap_rows(out, seed=20261127, n_boot=10_000):
+    """Described rows (Yuta #79): the send-gap distribution, and P / W_est on 5-100 ms gaps only. Not a re-definition."""
+    import numpy as np
+    ve, pairs_w = defaultdict(float), defaultdict(list)
+    with open(out / "conflicts.jsonl") as f:
+        for line in f:
+            x = json.loads(line)
+            ve[x["window"]] += x["v_est"]
+            pairs_w[x["window"]] += [tuple(p) for p in x["pairs"]]
+    allp = [p for w in sorted(pairs_w) for p in pairs_w[w]]
+    gaps = np.array([t - c for t, c in allp], dtype=float)
+    q = np.percentile(gaps, [25, 50, 75])
+    print(f"send gap taker - cancel (ms), {len(gaps):,} timed pairs: p25 {q[0]:.0f}, median {q[1]:.0f}, p75 {q[2]:.0f}; "
+          f"taker > 100 ms earlier {int((gaps < -100).sum()):,}")
+    P, n = band_p(allp)
+    wins = sorted(ve)
+    sv = np.array([ve[w] for w in wins])
+    n_lt = np.array([sum(1 for t, c in pairs_w[w] if 5 <= abs(t - c) <= 100 and t < c) for w in wins], dtype=float)
+    n_in = np.array([sum(1 for t, c in pairs_w[w] if 5 <= abs(t - c) <= 100) for w in wins], dtype=float)
+    rng = np.random.default_rng(seed)
+    bp, bw = [], []
+    for _ in range(n_boot):
+        i = rng.integers(0, len(wins), len(wins))
+        d = n_in[i].sum()
+        if d == 0:
+            continue
+        p = n_lt[i].sum() / d
+        bp.append(p); bw.append(p * sv[i].sum())
+    lo_p, hi_p = np.percentile(bp, [2.5, 97.5]); lo_w, hi_w = np.percentile(bw, [2.5, 97.5])
+    print(f"P on 5 <= |gap| <= 100 ms: {P:.3f} [{lo_p:.3f}, {hi_p:.3f}] on {n:,} pairs "
+          f"({int((n_in > 0).sum())} windows); W_est at that P {P * sv.sum():,.2f} USD [{lo_w:,.2f}, {hi_w:,.2f}] "
+          f"(described row, not the pre-registered estimate)")
 
 
 if __name__ == "__main__":
