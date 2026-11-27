@@ -120,3 +120,66 @@ def m1n_policy(send: dict):
 
     policy.stats = stats
     return policy
+
+
+CANCELS_LAST_RANK = {2: 0, 1: 1, 0: 2, 3: 3}   # chain rank C0 A1 G2 O3 -> G, A, C, O (cancels and GTC/IOC swapped)
+
+
+def a6_policy(send: dict, mode: str, seed: int | None = None):
+    """Gate 2 A6 orderings (docs/gate2.md A6), descriptive rows next to M1n. Same batches and the same movable set as
+    M1n (the send table's batch column; its timed txs are re-sorted among the slots they occupy; untimed txs keep
+    their slot); only the key inside a batch differs:
+      cancels_last: tx_class rank swapped for cancels and GTC/IOC (G < A < C < O), ties in listing order;
+      random: a shuffle per batch, random.Random(f"gate2-A6:{seed}:{height}") (deterministic, no hash seed).
+    Pure: returns a new list. Carries `stats` like m1n_policy."""
+    import random as _random
+    if mode not in ("cancels_last", "random"):
+        raise ValueError(f"a6_policy: unknown mode {mode!r}")
+    if mode == "random" and seed is None:
+        raise ValueError("a6_policy: random needs a seed")
+    stats: Counter = Counter()
+    send = {k: (v if isinstance(v, tuple) else (v, None)) for k, v in send.items()}
+
+    def policy(actions: list[Action]) -> list[Action]:
+        if not actions:
+            return list(actions)
+        height = actions[0].block
+        by_tx: dict[int, list] = {}
+        for a in actions:
+            by_tx.setdefault(a.tx_index, []).append(a)
+        txs = sorted(by_tx)
+        hash_of = {t: by_tx[t][0].hash.lower() for t in txs}
+        timed = {t: send[(height, hash_of[t])] for t in txs if (height, hash_of[t]) in send}
+        if not timed:
+            stats["blocks_untouched"] += 1
+            return list(actions)
+        stats["blocks_reordered"] += 1
+        if all(b is not None for _, b in timed.values()):
+            batch = {t: timed[t][1] for t in timed}
+            seq = [batch[t] for t in txs if t in timed]
+            if seq != sorted(seq):
+                raise ValueError(f"block {height}: batch ids not contiguous in listing order")
+        else:
+            cut = batches_of(actions)
+            batch = {t: cut[t] for t in timed}
+        rng = _random.Random(f"gate2-A6:{seed}:{height}") if mode == "random" else None
+        new = list(txs)
+        for bno in sorted(set(batch.values())):
+            slots = [i for i, t in enumerate(txs) if t in timed and batch[t] == bno]
+            group = [txs[i] for i in slots]
+            if mode == "cancels_last":
+                moved = sorted(group, key=lambda t: (CANCELS_LAST_RANK[tx_class(by_tx[t])], t))
+            else:
+                moved = list(group)
+                rng.shuffle(moved)
+            for i, t in zip(slots, moved):
+                new[i] = t
+        stats["batches"] += len(set(batch.values()))
+        stats["txs_moved"] += sum(1 for x, y in zip(txs, new) if x != y)
+        stats["txs_timed"] += len(timed)
+        stats["txs_untimed"] += len(txs) - len(timed)
+        rank = {t: i for i, t in enumerate(new)}
+        return sorted(actions, key=lambda a: (rank[a.tx_index], a.item_index))
+
+    policy.stats = stats
+    return policy
