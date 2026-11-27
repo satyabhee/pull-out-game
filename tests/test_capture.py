@@ -480,3 +480,283 @@ def test_margin_users_prev_iocs_first_then_recent_takers():
               {"users": ["0xM2", "0xT2"], "side": "A", "px": "100", "sz": "5"},
               {"users": ["0xi1", "0xM3"], "side": "B", "px": "100", "sz": "9"}]
     assert cap.margin_users({"0xi1": 3, "0xi2": 7}, trades, 4) == ["0xi2", "0xi1", "0xt2", "0xt1"]
+
+
+def test_alo_placements_btc_eth_alo_only():
+    blk = {"blockTime": 5, "txs": [
+        {"user": "0xA", "action": {"type": "order", "orders": [
+            {"a": 0, "b": True, "p": "100", "s": "1", "t": {"limit": {"tif": "Alo"}}},
+            {"a": 0, "b": True, "p": "100", "s": "1", "t": {"limit": {"tif": "Ioc"}}},
+            {"a": 7, "b": True, "p": "100", "s": "1", "t": {"limit": {"tif": "Alo"}}}]}},
+        {"user": "0xB", "action": {"type": "modify", "oid": 1, "order":
+            {"a": 1, "b": False, "p": "20.5", "s": "1", "t": {"limit": {"tif": "Alo"}}}}}]}
+    assert cap.alo_placements(blk) == [("0xa", 0, True, 100.0, 5), ("0xb", 1, False, 20.5, 5)]
+
+
+def test_alo_touch_users_within_bp_of_last_trade():
+    trades = [{"coin": "BTC", "time": 10, "px": "10000"}, {"coin": "BTC", "time": 20, "px": "10100"},
+              {"coin": "ETH", "time": 10, "px": "2000"}]
+    pl = [("0xa", 0, True, 10000.5, 15),      # 0.5 bp from 10000: touch
+          ("0xa", 0, True, 10000.5, 25),      # last trade now 10100: far
+          ("0xb", 0, False, 10100.0, 20),     # exactly the last trade
+          ("0xc", 1, True, 2000.0, 5),        # before ETH's first trade: not counted
+          ("0xd", 1, True, 1999.0, 11)]       # 5 bp away
+    assert cap.alo_touch_users(pl, trades, bp=1) == {"0xa": 1, "0xb": 1}
+
+
+def test_alo_margin_users_half_and_half_ioc_users_first():
+    touch = {"0xt1": 9, "0xt2": 5, "0xt3": 1, "0xi1": 20}
+    sus = ["0xs1", "0xt1", "0xs2"]
+    got = cap.alo_margin_users(touch, sus, 4, exclude=["0xI1"])
+    assert got == {"touch": ["0xt1", "0xt2"], "suspect": ["0xs1", "0xs2"]}
+    assert cap.alo_margin_users(touch, [], 4, exclude=["0xi1"]) == {"touch": ["0xt1", "0xt2", "0xt3"], "suspect": []}
+    assert cap.alo_margin_users({}, sus, 2) == {"touch": [], "suspect": ["0xs1", "0xt1"]}
+
+
+def test_ask_margin_spot_only_for_ioc_users():
+    asked = []
+
+    class W:
+        def ask_info_now(self, kind, users, extra=None):
+            asked.append((kind, list(users)))
+            return 1.0
+    assert cap.ask_margin(W(), 0, ["0xi"], ["0xa"]) == 1.0
+    assert asked == [("clearinghouseState", ["0xi", "0xa"]), ("spotClearinghouseState", ["0xi"])]
+    asked.clear()
+    assert cap.ask_margin(W(), 0, [], ["0xa"]) and asked == [("clearinghouseState", ["0xa"])]
+    assert cap.ask_margin(W(), 0, [], []) is None
+
+
+def test_load_suspects(tmp_path):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"time": 1, "users": ["0xAB", "0xcd"]}))
+    assert cap.load_suspects(str(p)) == ["0xab", "0xcd"]
+    assert cap.load_suspects(str(tmp_path / "none.json")) == []
+
+
+# ---- 2026-11-23 open-margin capture: resting-order margin + suspect orderStatus lookups
+
+def cs_answer(av, mu, ntl, wd):
+    return {"marginSummary": {"accountValue": av, "totalMarginUsed": mu, "totalNtlPos": ntl}, "withdrawable": wd}
+
+
+def test_order_margin_matches_the_live_probe():
+    from decimal import Decimal as D
+    # 0x3ff5 on 2026-11-23: 8 resting BTC sells 900008.63 at 13x -> 69231.43; base is 10% of notional
+    free, om = cap.order_margin(cs_answer("14966555.8377960008", "5272632.3617690001", "68544220.7029999942",
+                                          "8042902.3345210003"))
+    assert round(om, 2) == D("69231.43")
+    assert free == D("14966555.8377960008") - D("5272632.3617690001") - om
+    _, om0 = cap.order_margin(cs_answer("150133.574824", "960.606014", "38424.24058", "146291.150766"))
+    assert round(om0, 2) == 0                                        # no orders: gap is the 10% notional rule
+    assert cap.order_margin({"error": "x"}) is None and cap.order_margin(None) is None
+
+
+def test_open_margin_users_keeps_users_with_order_margin_least_free_first():
+    recs = [{"user": "0xa", "answer": cs_answer("1000", "100", "1000", "800")},     # om 100, free 800
+            {"user": "0xb", "answer": cs_answer("1000", "100", "1000", "500")},     # om 400, free 500
+            {"user": "0xc", "answer": cs_answer("1000", "100", "1000", "900")},     # om 0: skipped
+            {"user": "0xd", "answer": {"error": "429"}}]
+    out = cap.open_margin_users(recs, 5)
+    assert [u for u, _, _ in out] == ["0xb", "0xa"] and out[0][2] == "400"
+    assert cap.open_margin_users(recs, 1) == [out[0]]
+
+
+def test_ask_open_margin_later_stores_both_answers_and_drain_waits():
+    calls = {"clearinghouseState": lambda u: {"cs": u}, "frontendOpenOrders": lambda u: [{"oid": 1, "u": u}]}
+    budget = FakeBudget()
+    w = cap.Writer(lookup=lambda u, o: {}, info_gap_s=0, budget=budget, calls=calls)
+    slept = []
+    cap.ask_open_margin_later(w, [("0xa", "5", "1"), ("0xb", "6", "2")], 777, at_s=100.0,
+                              now=lambda: 90.0, sleep=slept.append)
+    w.drain()
+    recs = sorted(w.take_info()["margin_open"], key=lambda r: r["user"])
+    assert slept == [10.0] and budget.took == [22, 22]
+    assert recs[0]["answer"] == {"clearinghouseState": {"cs": "0xa"}, "frontendOpenOrders": [{"oid": 1, "u": "0xa"}]}
+    assert recs[1]["snapshot_time"] == 777 and recs[1]["plan_free"] == "6" and recs[1]["plan_order_margin"] == "2"
+    assert w.snapshot() == []                                        # never an anchor
+
+
+def test_status_lookups_are_info_records_not_anchors(tmp_path):
+    w = cap.Writer(lookup=lambda u, o: {"status": "order", "o": o}, info_gap_s=0, budget=FakeBudget())
+    w.ask_status("0xu", "0xc1", {"placed_height": 5})
+    w.drain()
+    got = w.take_info()["suspect_status"]
+    assert got[0]["oid"] == "0xc1" and got[0]["placed_height"] == 5 and got[0]["answer"]["o"] == "0xc1"
+    assert w.snapshot() == []
+    meta = {}
+    cap.save_info(str(tmp_path), {"suspect_status": got}, meta)
+    assert os.path.exists(tmp_path / "suspect_status.json") and meta["info_suspect_status"] == 1
+
+
+def test_suspect_candidates_and_round_robin_pick():
+    b = block_of(9, [px_tx("0xS1", 9, [item("0x1"), item("0x2", tif="Gtc"), item("0x3")]),
+                     px_tx("0xother", 9, [item("0x4")]),
+                     px_tx("0xS2", 9, [item("0x5")])])
+    cands = cap.suspect_candidates(b, 9, {"0xs1", "0xs2"})
+    assert [c[4] for c in cands] == ["0x1", "0x3", "0x5"] and cands[0][:3] == (9, 0, 0)
+    rank = {"0xs2": 0, "0xs1": 1}
+    assert [c[4] for c in cap.pick_suspect_lookups(cands, rank, 2)] == ["0x5", "0x3"]
+    assert [c[4] for c in cap.pick_suspect_lookups(cands, rank, 9)] == ["0x5", "0x3", "0x1"]
+    assert [c[4] for c in cap.pick_suspect_lookups(cands, rank, 9, skip={("0xS1", "0x3")})] == ["0x5", "0x1"]
+    import collections
+    seen = collections.Counter({("0xs2", "0x5"): 2})
+    assert [c[4] for c in cap.pick_suspect_lookups(cands, rank, 9, seen=seen)] == ["0x3", "0x1"]
+
+
+def test_chunk_capture_asks_suspect_lookups_in_scored_blocks_only_and_keeps_anchors_unchanged(tmp_home, monkeypatch):
+    sus = tmp_home / "suspects.json"
+    sus.write_text(json.dumps({"users": ["0xu1", "0xu3"]}))
+    monkeypatch.setattr(cap, "SUSPECTS_FILE", str(sus))
+    asked = []
+    w = cap.Writer(lookup=lambda u, k: asked.append((u, k)) or {"status": "order"}, info_gap_s=0)
+    base_meta = {"kind": "chunk"}
+    cap.capture(PlacementFetcher(), 1000, 1179, base_meta, writer=w, state={}, warmup=150, max_anchors=20)
+    d = tmp_home / "windows" / "1000-1179"
+    base_anchors = (d / "anchors.json").read_text()
+    for f in d.iterdir():
+        f.unlink()
+    monkeypatch.setattr(cap, "SUSPECT_LOOKUPS", 4)
+    asked.clear()
+    meta = {"kind": "chunk"}
+    assert cap.capture(PlacementFetcher(), 1000, 1179, meta, writer=w, state={}, warmup=150, max_anchors=20) == "complete"
+    strip = lambda t: [{k: v for k, v in a.items() if k != "asked_at"} for a in json.loads(t)]
+    assert strip((d / "anchors.json").read_text()) == strip(base_anchors)   # the replay's input is unchanged
+    st = json.loads((d / "suspect_status.json").read_text())
+    assert meta["suspect_lookups"] == 4 == len(st) and meta["suspect_candidates"] == 12   # 30 scored blocks, h%5 in {1,3}
+    assert [r["user"] for r in st] == ["0xu1", "0xu3", "0xu1", "0xu3"]
+    assert all(r["placed_height"] >= 1150 for r in st)
+    assert not {(r["user"], r["oid"]) for r in st} & {(a["user"], a["oid"]) for a in json.loads(base_anchors)}
+
+
+class IocFetcher(StubFetcher):
+    """Every block: one BTC IOC with a cloid, one ETH IOC without a cloid, one ALO, one errored IOC."""
+
+    def get(self, h):
+        txs = [px_tx("0xi%d" % (h % 3), h, [item(f"0x{h:04x}i", tif="Ioc")]),
+               px_tx("0xn", h, [item(None, a=1, tif="Ioc")]),
+               px_tx("0xa", h, [item(f"0x{h:04x}a")]),
+               px_tx("0xe", h, [item(f"0x{h:04x}e", tif="Ioc")], error="rejected")]
+        b = {"height": h, "blockTime": 5000 + h, "numTxs": len(txs), "txs": txs}
+        return b, json.dumps({"blockDetails": b}).encode()
+
+
+def test_ioc_items_takes_btc_eth_iocs_with_cloid_from_ok_txs():
+    b, _ = IocFetcher().get(1200)
+    assert cap.ioc_items(b, 1200) == [(1200, 0, 0, "0xi0", "0x04b0i", 6200)]
+
+
+class FreeBudget:
+    def __init__(self):
+        self.taken = 0
+
+    def take(self, w):
+        self.taken += w
+
+
+def test_truth_asker_caps_skips_stale_and_writes_its_file(tmp_path):
+    asked = []
+    now = [10.0]
+    bud, tb = FreeBudget(), FreeBudget()
+    t = cap.TruthAsker(str(tmp_path / "truth_status.json"), 3, bud,
+                       lookup=lambda u, c: asked.append((u, c)) or {"status": "order", "order": {"status": "iocCancelRejected"}},
+                       truth_bud=tb, clock=lambda: now[0], stale_s=5)
+    t.feed([(1, 0, 0, "0xa", "0xc1", 9_000), (2, 0, 0, "0xb", "0xc2", 1_000), (3, 0, 0, "0xc", "0xc3", 9_500),
+            (4, 0, 0, "0xd", "0xc4", 9_900)])                     # the 4th is over the cap
+    t.close(); t.join(5)
+    out = json.loads((tmp_path / "truth_status.json").read_text())
+    assert asked == [("0xa", "0xc1"), ("0xc", "0xc3")]          # 0xc2 was 9 s old at asking time: skipped
+    assert out["queued"] == 3 and out["counts"] == {"over_cap": 1, "skipped_stale": 1, "status:iocCancelRejected": 2}
+    assert [r["placed_height"] for r in out["rows"]] == [1, 3]
+    assert bud.taken == 4 and tb.taken == 4                      # weight 2 per call, booked in both budgets
+
+
+def test_chunk_capture_truth_ioc_asks_scored_iocs_and_keeps_anchors_unchanged(tmp_home, monkeypatch):
+    calls = []
+    w = cap.Writer(lookup=lambda u, k: {"status": "order"}, info_gap_s=0)
+    cap.capture(IocFetcher(), 1000, 1179, {"kind": "chunk"}, writer=w, state={}, warmup=150, max_anchors=20)
+    d = tmp_home / "windows" / "1000-1179"
+    base = (d / "anchors.json").read_text()
+    for f in d.iterdir():
+        f.unlink()
+    monkeypatch.setattr(cap, "TRUTH_IOC", 10)
+    monkeypatch.setattr(cap, "order_status", lambda u, c: calls.append((u, c)) or {"status": "unknownOid"})
+    monkeypatch.setattr(cap, "_TRUTH_BUDGET", cap.info.Budget(per_min=10_000))
+    made = []
+    orig = cap.TruthAsker
+
+    class Spy(orig):
+        def __init__(self, *a, **k):
+            k["stale_s"] = 1e12
+            super().__init__(*a, **k)
+            made.append(self)
+    monkeypatch.setattr(cap, "TruthAsker", Spy)
+    meta = {"kind": "chunk"}
+    assert cap.capture(IocFetcher(), 1000, 1179, meta, writer=w, state={}, warmup=150, max_anchors=20) == "complete"
+    made[0].join(10)
+    strip = lambda t: [{k: v for k, v in a.items() if k != "asked_at"} for a in json.loads(t)]
+    assert strip((d / "anchors.json").read_text()) == strip(base)
+    out = json.loads((d / "truth_status.json").read_text())
+    assert meta["truth_ioc_queued"] == 10 == out["queued"] and len(calls) == 10
+    assert all(r["placed_height"] >= 1150 for r in out["rows"])  # scored blocks only
+    assert out["counts"]["over_cap"] == 20 and out["counts"]["status:unknownOid"] == 10
+
+
+def test_truth_asker_skips_users_covered_by_history(tmp_path):
+    asked = []
+    t = cap.TruthAsker(str(tmp_path / "t.json"), 5, FreeBudget(), lookup=lambda u, c: asked.append(u) or {"status": "unknownOid"},
+                       truth_bud=FreeBudget(), clock=lambda: 0.0, stale_s=1e9, skip=["0xAA"])
+    t.feed([(1, 0, 0, "0xaa", "0xc1", 0), (1, 1, 0, "0xbb", "0xc2", 0)])
+    t.close(); t.join(5)
+    assert asked == ["0xbb"] and json.loads((tmp_path / "t.json").read_text())["counts"]["skipped_hist_user"] == 1
+
+
+def test_truth_asker_skips_a_user_after_five_unknowns_and_reprobes(tmp_path, monkeypatch):
+    monkeypatch.setattr(cap, "UNKNOWN_STREAK", cap.collections.Counter())
+    asked = []
+    t = cap.TruthAsker(str(tmp_path / "t.json"), 100, FreeBudget(), lookup=lambda u, c: asked.append(c) or {"status": "unknownOid"},
+                       truth_bud=FreeBudget(), clock=lambda: 0.0, stale_s=1e9)
+    t.feed([(1, k, 0, "0xbusy", f"0x{k}", 0) for k in range(40)])
+    t.close(); t.join(5)
+    assert asked == ["0x0", "0x1", "0x2", "0x3", "0x4", "0x29"]   # 5 asked, then 1 probe after 25 skips
+    assert json.loads((tmp_path / "t.json").read_text())["counts"]["skipped_unanswerable_user"] == 34
+
+
+def test_open_orders_file_name_is_configurable():
+    assert cap.INFO_FILES["frontendOpenOrders"] == cap.OPEN_ORDERS_FILE
+
+
+class FakeWriter:
+    def __init__(self, answers):
+        import collections as _c, threading as _t
+        self.info, self.lock, self.pending = _c.defaultdict(list), _t.Lock(), []
+        self.budget = FreeBudget()
+        self.asked = []
+        self.calls = {"frontendOpenOrders": lambda u: self.asked.append(u) or answers[u]}
+
+
+def oo(n, coin="BTC"):
+    return [{"coin": coin if i % 2 == 0 else "SOL", "side": "B", "limitPx": "1", "sz": "1", "oid": i, "timestamp": i,
+             "tif": "Alo", "reduceOnly": False} for i in range(n)]
+
+
+def test_ask_open_book_probes_then_picks_big_books_compactly():
+    w = FakeWriter({"0xa": oo(1200), "0xb": oo(10), "0xc": oo(3000), "0xd": oo(5)})
+    cache = {"0xc": (2900, 0.0)}
+    th = cap.ask_open_book(w, ["0xA", "0xb", "0xc", "0xd"], 123, n_pick=2, n_probe=2, min_count=1000,
+                           now=lambda: 100.0, cache=cache)
+    th.join(5)
+    assert w.asked == ["0xa", "0xb", "0xc"]                    # 2 probes (a, b), then pick c (a was just probed)
+    recs = w.info["open_book_users"]
+    assert [(r["user"], r["role"], r["total_open"]) for r in recs] == [("0xa", "probe", 1200), ("0xb", "probe", 10),
+                                                                     ("0xc", "pick", 3000)]
+    assert len(recs[0]["btc_eth"]) == 600 and recs[0]["btc_eth"][0][0] == "BTC"   # SOL rows dropped
+    assert cache["0xa"][0] == 1200 and cache["0xc"][0] == 3000
+
+
+def test_open_book_records_save_through_save_info(tmp_path):
+    w = FakeWriter({"0xa": oo(4)})
+    cap.ask_open_book(w, ["0xa"], 1, n_pick=1, n_probe=1, min_count=1, now=lambda: 0.0, cache={}).join(5)
+    meta = {}
+    cap.save_info(str(tmp_path), dict(w.info), meta)
+    assert (tmp_path / "open_book_users.json").exists() and meta["info_open_book_users"] == 1

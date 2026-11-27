@@ -295,7 +295,7 @@ class OidEstimator:
             anchors = json.loads(anchor_file.read_text()) if anchor_file is not None else []
             anchors = [a for a in anchors if a.get("kind") not in drop_kinds]
             refs = None
-            if all_coins and hl_data is not None:
+            if all_coins and hl_data is not None and "ws_all" not in exclude:
                 from data import oid_facts
                 refs = oid_facts.stream_orders_all(window_dir, hl_data)
             hit = (sig, cls.from_window(window_dir, anchors, facts=fx, all_refs=refs))

@@ -398,13 +398,37 @@ def _recorder_file(path: Path, lo: int | None = None, hi: int | None = None) -> 
     return rf
 
 
+def _stream_records(path: Path, lo: int | None, hi: int | None) -> Iterator[dict]:
+    """_records without the file cache: lines whose receive time is in [lo, hi] (or that have none), in file order."""
+    with _open_text(path) as f:
+        for x in f:
+            ln = x.strip()
+            if not ln:
+                continue
+            if lo is not None:
+                r = _RecorderFile._recv(ln)
+                if r is not None and not lo <= r <= hi:
+                    continue
+            try:
+                rec = _loads(ln)
+            except json.JSONDecodeError:
+                continue                                  # the open hour's last line can be cut mid-write
+            if rec is not None:
+                yield rec
+
+
 def _records(path: Path, t0_ms: int | None = None, t1_ms: int | None = None, keep_parsed: bool = True) -> Iterator[dict]:
     """Parsed lines of one recorder file in file order; with t0/t1, only lines whose receive time is in
     [t0 - RECV_SKEW_MS, t1 + RECV_LAG_MS] (lines without a receive time are always kept).
     The dicts are shared through the cache: callers must not modify them. keep_parsed=False: parse without caching
-    the dicts (user_orders: ~1 GB of parsed messages per chunk that callers reduce to compact facts at once)."""
+    the dicts (user_orders: ~1 GB of parsed messages per chunk that callers reduce to compact facts at once), and
+    stream the file instead of caching its raw lines (those lines were ~0.7 GB per chunk; memory profile Nov 22).
+    Same lines, same order either way."""
     lo = None if t0_ms is None else t0_ms - RECV_SKEW_MS
     hi = None if t1_ms is None else t1_ms + RECV_LAG_MS
+    if not keep_parsed:
+        yield from _stream_records(path, lo, hi)
+        return
     rf = _recorder_file(path, lo, None if lo is None else hi)
     for i in rf.indices(lo, hi):
         rec = rf.get(i, keep_parsed)

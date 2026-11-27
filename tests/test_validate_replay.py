@@ -407,3 +407,17 @@ def test_cli_lead_in_flags_name_the_output(tmp_path, monkeypatch):
     vr.main([str(window), "--hl-data", str(hl), "--reseed", "--skip-lead-in"])
     names = {p.name for p in (tmp_path / "report" / "validate").iterdir()}
     assert names == {"w-listing-reseed-keep", "w-listing-reseed-nolead"}
+
+
+def test_suspect_status_truth_keys_by_block_hash_item(tmp_path):
+    import gzip as gz
+    import json as js
+    from analysis.validate_replay import suspect_status_truth
+    with gz.open(tmp_path / "100.json.gz", "wt") as f:
+        js.dump({"blockDetails": {"txs": [{"hash": "0xa"}, {"hash": "0xb"}]}}, f)
+    js.dump([{"placed_height": 100, "tx": 1, "item": 2, "answer": {"status": "order", "order": {"status": "badAloPxRejected"}}},
+             {"placed_height": 100, "tx": 0, "item": 0, "answer": {"status": "unknownOid"}},
+             {"placed_height": 101, "tx": 0, "item": 0, "answer": {}}], open(tmp_path / "suspect_status.json", "w"))
+    t = suspect_status_truth(tmp_path)
+    assert t[(100, "0xb", 2)]["truth"] == "rejected_alo" and t[(100, "0xa", 0)]["truth"] == "unknown"
+    assert len(t) == 2 and suspect_status_truth(tmp_path / "none") == {}

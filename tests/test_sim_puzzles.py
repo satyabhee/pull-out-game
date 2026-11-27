@@ -112,7 +112,7 @@ def test_p2_will_the_chain_accept_this_ioc(tmp_path):
     sc.done()
     assert accepted == [False, True, True, False]                                    # the puzzle's answer
     seen = load_margin(sc.window)                                                    # what the replay sees
-    assert seen == {"a": (-7.0, {"BTC": 0.05}), "b": (8000.0, {})}
+    assert seen == {"a": (Decimal("-7"), {"BTC": Decimal("0.05")}), "b": (Decimal("8000"), {})}   # Decimals (merge: data-streams load_margin)
     snap = {"A": (25, 32, {"BTC": 0.05}), "B": (10_000, 2_000, {})}                  # the puzzle's numbers
     hist = [("C", True, False)] * 3
     oracle = [puzzles.will_accept((u.upper(), "BTC", s, z, p, False), snap, hist) for u, s, z, p in orders]
