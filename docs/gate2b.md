@@ -1,6 +1,6 @@
 # Gate 2b: what cancels-first is worth, at scale (pre-registration)
 
-Written 08:50Z Nov 27, BEFORE any gate 2b quantity is computed (no conflict has been scanned or valued). Satya's
+Written 08:29Z Nov 27 (commit 7bf5d9c; first draft said 08:50Z by mistake), BEFORE any gate 2b quantity is computed (no conflict has been scanned or valued). Satya's
 overnight brief, with mahito's choices where the brief leaves one open; those are marked **[call]** and logged in
 NEEDS_SATYA. Gate 2 (docs/gate2.md, docs/gate2_results.md) stays signed and untouched. Gate 2b reuses none of its
 numbers. No engine changes, no new data pulls, no pushes.
