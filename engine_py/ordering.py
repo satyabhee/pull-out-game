@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 from collections import Counter
+from decimal import Decimal
 from pathlib import Path
 
 from engine_py.types import Action, Cancel, CancelByCloid, Modify, Place, Tif
@@ -44,6 +45,15 @@ def batches_of(actions: list[Action]) -> dict[int, int]:
     return out
 
 
+def _int_exact(s: str) -> int:
+    """An integer from a decimal string; '1795101766784.0' is accepted (pandas writes int columns holding NaN as
+    floats), anything with a nonzero fraction fails loudly. Never rounds."""
+    d = Decimal(s)
+    if not d.is_finite() or d != d.to_integral_value():
+        raise ValueError(f"send_times: {s!r} is not an integer")
+    return int(d)
+
+
 def load_send_times(path) -> dict[tuple[int, str], tuple[int, int | None]]:
     """(height, tx hash lowercased) -> (send time ms, batch or None). Empty send_ms falls back to the raw nonce; the
     batch column (Yuta's rank-drop cut on ALL actions, handoff/gate2/*.csv) is used when present. Rows of one tx must
@@ -52,7 +62,7 @@ def load_send_times(path) -> dict[tuple[int, str], tuple[int, int | None]]:
     with open(Path(path), newline="") as f:
         for r in csv.DictReader(f):
             k = (int(r["height"]), r["tx_hash"].lower())
-            t = int(r["send_ms"]) if r.get("send_ms") not in (None, "") else int(r["nonce"])
+            t = _int_exact(r["send_ms"]) if r.get("send_ms") not in (None, "") else _int_exact(r["nonce"])
             b = int(r["batch"]) if r.get("batch") not in (None, "") else None
             if out.setdefault(k, (t, b)) != (t, b):
                 raise ValueError(f"send_times: tx {k} has two values ({out[k]}, {(t, b)})")

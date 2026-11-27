@@ -78,3 +78,22 @@ def test_score_marks_a_run_with_a_failed_chunk_invalid_and_exits_1(tmp_path):
         score_main([str(tmp_path)])
     assert e.value.code == 1
     assert (tmp_path / "score.txt").read_text().startswith("INVALID: 1 chunks failed")
+
+
+def test_same_window_in_two_sets_is_one_chunk_and_differing_copies_fail(tmp_path):
+    # A5.2: one capture window copied into devfast and confirm_margin60 must give ONE ON replay covering all its
+    # listed heights (results are keyed by basename; two ON parts would overwrite each other)
+    import pytest
+
+    from analysis.gate2 import group_chunks
+    for s in ("a", "b"):
+        (tmp_path / s / "10-20").mkdir(parents=True)
+        (tmp_path / s / "10-20" / "11.json.gz").write_bytes(b"x")
+    rows = [{"chunk_dir": str(tmp_path / "b" / "10-20"), "height": "13"},
+            {"chunk_dir": str(tmp_path / "a" / "10-20"), "height": "11"}]
+    assert group_chunks(rows) == {str(tmp_path / "a" / "10-20"): {11, 13}}
+    (tmp_path / "b" / "10-20" / "11.json.gz").write_bytes(b"y")
+    with pytest.raises(ValueError):
+        group_chunks(rows)
+    with pytest.raises(ValueError):
+        _assemble_one_block([{"tag": "on", "chunk": "10-20", "arm": {}}, {"tag": "on", "chunk": "10-20", "arm": {}}])

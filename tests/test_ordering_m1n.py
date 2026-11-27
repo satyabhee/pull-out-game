@@ -75,3 +75,14 @@ def test_reused_txs(tmp_path):
     p.write_text("height,tx_hash,item_index,user,nonce,send_ms,calibrated\n"
                  "7,0xa,0,0xU,100,95,1\n7,0xb,0,0xu,100,95,1\n7,0xc,0,0xu,101,96,1\n8,0xd,0,0xu,100,95,1\n")
     assert reused_txs(p) == {(7, "0xa"), (7, "0xb")}
+
+
+def test_load_send_times_accepts_integer_valued_decimals_and_rejects_fractions(tmp_path):
+    # A5.2: the extension file writes pooled-offset rows as '1795101766784.0'
+    import pytest
+    p = tmp_path / "s.csv"
+    p.write_text("height,tx_hash,item_index,user,nonce,send_ms,calibrated\n7,0xa,0,0xu,100,95.0,2\n")
+    assert load_send_times(p) == {(7, "0xa"): (95, None)}
+    p.write_text("height,tx_hash,item_index,user,nonce,send_ms,calibrated\n7,0xa,0,0xu,100,95.5,2\n")
+    with pytest.raises(ValueError):
+        load_send_times(p)

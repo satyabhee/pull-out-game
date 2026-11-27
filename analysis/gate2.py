@@ -241,6 +241,8 @@ def _assemble_one_block(parts: list[dict]) -> list[dict]:
     for p in sorted(parts, key=lambda p: (p["chunk"], p["tag"])):
         r = by.setdefault(p["chunk"], {"chunk": p["chunk"], "arms": {}, "off_parts": []})
         if p["tag"] == "on":
+            if "on" in r["arms"]:
+                raise ValueError(f"gate2: chunk {p['chunk']} has two ON replays (group_chunks not applied?)")
             r["arms"]["on"] = p["arm"]
         else:
             r["off_parts"].append(p["arm"])
@@ -252,6 +254,30 @@ def _assemble_one_block(parts: list[dict]) -> list[dict]:
                              "raced": [f for x in offs for f in x["raced"]],
                              "txs": sorted({tuple(t) for x in offs for t in x["txs"]})})
     return [by[k] for k in sorted(by)]
+
+
+def _dir_digest(d: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for f in sorted(d.iterdir()):
+        h.update(f.name.encode() + b"\0" + hashlib.sha256(f.read_bytes()).digest())
+    return h.hexdigest()
+
+
+def group_chunks(rows: list[dict]) -> dict[str, set]:
+    """chunk dir -> listed heights. Results are keyed by the dir's basename (the capture window), so two dirs with the
+    same name (one window captured into two sets, e.g. devfast and confirm_margin60) are ONE window: their heights are
+    merged under the first dir (sorted), and they must be byte-identical or this fails loudly (A5.2)."""
+    by_name: dict[str, dict[str, set]] = {}
+    for r in rows:
+        by_name.setdefault(Path(r["chunk_dir"]).name, {}).setdefault(r["chunk_dir"], set()).add(int(r["height"]))
+    out: dict[str, set] = {}
+    for name, dirs in by_name.items():
+        first = sorted(dirs)[0]
+        if len(dirs) > 1 and len({_dir_digest(Path(d)) for d in dirs}) > 1:
+            raise ValueError(f"gate2: chunk {name} is listed from {len(dirs)} dirs whose contents differ: {sorted(dirs)}")
+        out[first] = set().union(*dirs.values())
+    return out
 
 
 def run_main(argv):
@@ -274,10 +300,8 @@ def run_main(argv):
     kw_off = vr.replay_kwargs(a)
     a.order = "listing"
     kw_on = vr.replay_kwargs(a)
-    by_chunk: dict[str, set] = {}
     with open(a.blocks, newline="") as fh:
-        for r in csv.DictReader(fh):
-            by_chunk.setdefault(r["chunk_dir"], set()).add(int(r["height"]))
+        by_chunk = group_chunks(list(csv.DictReader(fh)))
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     meta = {"blocks_csv": a.blocks, "blocks_sha256": hashlib.sha256(open(a.blocks, "rb").read()).hexdigest(),

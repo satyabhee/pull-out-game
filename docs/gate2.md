@@ -192,3 +192,22 @@ window-cluster bootstrapped, so power comes from the number of chunks. Selection
    pulled set is a prefix of the frozen list.
 Everything else in A5 is unchanged: same code, the yuta95 clock, one run per block, the same estimator, CIs and
 reading rule, its own results section, and the cutoff of Fri 9:00 AM CT.
+
+**A5.2 (07:43Z Nov 27; after the first extension run, BEFORE any extension outcome was viewed; mahito, logged under
+the overnight protocol).** The first extension run (07:29-07:39Z, inputs sha256 2d839a1a... / 97d310d1...) is
+**void**: its OFF arm failed in 65 / 65 chunks, and `score` refused it (INVALID, exit 1), so no extension number
+exists from it. Only the status / error fields of results.pkl were read. Run dir renamed
+report/validate/gate2_ext_one_yuta95_VOID_sendms_parse. Two fixes, both inert on the primary inputs (checked: 0
+non-integer send_ms rows in all three primary send-time files; 0 duplicate chunk names in the primary list):
+1. **send_ms parsing.** The 2,388 pooled-offset rows of the extension file write send_ms as e.g. `1795101766784.0`.
+   `engine_py.ordering.load_send_times` now accepts an integer-valued decimal exactly (Decimal, no rounding) and
+   still fails loudly on any nonzero fraction. The input file is unchanged (same sha256).
+2. **One window listed from two sets.** Two pool chunks (1230280994-1230281203 and 1230343846-1230344055) exist as
+   byte-identical copies in both devfast and confirm_margin60, and the frozen list takes 3 blocks from each copy.
+   Results are keyed by the window name, so the void run would have kept only one of the two ON replays (3 of the 6
+   listed heights) against all 6 OFF blocks. `analysis.gate2.group_chunks` now merges same-name dirs into one
+   window (one ON replay, all listed heights) and fails loudly if the copies differ; `_assemble_one_block` fails on
+   a second ON part. Effect on A5.1: the frozen list is kept unchanged (200 blocks); the cluster unit is the physical
+   window, so the bootstrap has **65 clusters** (62 with 3 blocks, 2 with 6, 1 with 2), not 67. Treating two copies
+   of one window as independent clusters would understate the CI.
+The rerun uses the same inputs, the same flags, and the code of the commit that adds this text.
