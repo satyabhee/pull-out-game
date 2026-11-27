@@ -7,6 +7,7 @@ INFO_WEIGHT_PER_MIN (default 600) keeps these lookups to half of it so nothing e
 Every answer is stored raw by the caller; nothing here interprets it.
 """
 import collections
+import backoff
 import json
 import os
 import threading
@@ -20,9 +21,12 @@ PER_20_ITEMS = {"userFillsByTime", "historicalOrders"}
 
 
 def post(body, timeout=30):
-    req = urllib.request.Request(URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    """POST to /info; HTTP 429 is retried with jittered exponential back-off (collect/backoff.py, cap ~60 s)."""
+    def once():
+        req = urllib.request.Request(URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    return backoff.retry_429(once, "info:" + str(body.get("type")))
 
 
 EXPECTED = {"historicalOrders": 120}         # 2000 orders returned: 20 + 2000 / 20; booked BEFORE the call
