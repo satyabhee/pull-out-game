@@ -408,10 +408,14 @@ def score_main(argv):
     lines += _lines("primary", per, tot, rows)
     per_x, tot_x, rows_x = _score_pass(results, failed, hl_data, exclude, only=only)
     lines += _lines("sensitivity: stale/reused-nonce actions excluded", per_x, tot_x, rows_x)
+    if failed:                                       # Yuta #66 / #67: a partial run can't be quoted
+        lines.insert(0, f"INVALID: {len(failed)} chunks failed; do not quote any number below")
     (d / f"score{sfx}.txt").write_text("\n".join(lines) + "\n")
     _dump(d / f"per_chunk{sfx}.jsonl", rows)
     _dump(d / f"per_chunk_excl{sfx}.jsonl", rows_x)
     print("\n".join(lines))
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

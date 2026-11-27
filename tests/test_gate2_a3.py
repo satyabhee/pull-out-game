@@ -59,3 +59,22 @@ def test_observer_ignores_schedule_cancel_in_a_listed_block():
     obs.before_action(rp, block, a)
     obs.after_action(rp, block, a, [], [], None)
     assert obs.g_fills == [] and obs.g_txs == {(7, "0xs")}
+
+
+def test_score_marks_a_run_with_a_failed_chunk_invalid_and_exits_1(tmp_path):
+    import json
+    import pickle
+
+    import pytest
+
+    from analysis.gate2 import score_main
+    st = tmp_path / "s.csv"
+    st.write_text("height,tx_hash,item_index,user,nonce,send_ms,calibrated,batch\n7,0xa,0,u,1,1,1,0\n")
+    (tmp_path / "meta.json").write_text(json.dumps({"argv": ["--hl-data", str(tmp_path)], "send_times": str(st),
+                                                    "blocks_sha256": "0" * 64, "send_times_sha256": "0" * 64}))
+    failed = {"status": "failed", "error": "E"}
+    pickle.dump([{"chunk": "c", "arms": {"on": failed, "off": failed}}], open(tmp_path / "results.pkl", "wb"))
+    with pytest.raises(SystemExit) as e:
+        score_main([str(tmp_path)])
+    assert e.value.code == 1
+    assert (tmp_path / "score.txt").read_text().startswith("INVALID: 1 chunks failed")
