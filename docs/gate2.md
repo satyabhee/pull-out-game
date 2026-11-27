@@ -179,3 +179,16 @@ docs/gate2_results.md, never pooled into, averaged with, or replacing the primar
 5. **Cutoff: Fri Nov 27 9:00 AM CT (15:00Z)** (Satya's "Change to A5", which supersedes the 2 PM CT in his earlier
    message). If the extension isn't scored by then, docs/gate2_results.md reports it as "pending", with no partial
    numbers.
+
+**A5.1 (06:06Z Nov 27; BEFORE any extension pull or outcome; Satya, answering Yuta #70).** Replaces A5 item 3's
+"first N by height", which would put the first 200 qualifying blocks in ~4 chunks (all dev20, one day). The CIs are
+window-cluster bootstrapped, so power comes from the number of chunks. Selection, in this order:
+1. Pool chunks (A5 item 2) in ascending start height. From each chunk, take its first k qualifying blocks by height
+   (A5 item 1; the 71 primary blocks excluded). k = 3.
+2. Concatenate the per-chunk picks in chunk order, and stop when the list reaches the quota cap N (Yuta #70: N = 200).
+   If the whole pool gives fewer than 200 blocks with k = 3, use k = 5 instead (same rule).
+3. The list (handoff/gate2_ext/blocks.csv) is frozen, and its sha256 mailed, before any pull. Blocks are pulled in
+   list order. Blocks that SQD refuses or can't return in full are reported as "not pulled" and never replaced, so the
+   pulled set is a prefix of the frozen list.
+Everything else in A5 is unchanged: same code, the yuta95 clock, one run per block, the same estimator, CIs and
+reading rule, its own results section, and the cutoff of Fri 9:00 AM CT.
