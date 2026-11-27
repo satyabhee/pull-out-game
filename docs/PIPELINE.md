@@ -25,33 +25,41 @@ recorder streams, other folders = chunk sets made of symlinks into `windows/`).
 ## Stage 1. Ingest: capture blocks and market data while they are fresh
 
 **Why it exists.** Hyperliquid's explorer gives full blocks only while they are new (archived blocks are capped at
-100 per day per IP), and there is no free bulk history with every user's actions. So we must record live: the blocks
-themselves, plus the public market data we score against (trades, book snapshots), plus per-user facts that help us
-guess what we can't see (order statuses, margin).
+100 per day per IP), and there is no free bulk history with every user's actions. So we must record live:
+- the blocks themselves;
+- the public market data we score against (trades, book snapshots);
+- per-user facts that help us guess what we can't see (order statuses, margin).
 
 | what | code | output files | runs as |
 |---|---|---|---|
-| block chunks + per-chunk lookups | `collect/capture.py` (+ `info.py`, `fetch_blocks.py`, `backoff.py`) | `windows/<start>-<end>/<height>.json.gz`, `window.json` (incl. `capture_version`), `anchors.json`; since Nov 22 also `clearinghouseState.json` (margin), `hist_orders.json`, `open_orders*.json`, `suspect_status.json` (suspect `orderStatus` answers), `open_orders_truth.json`, `open_book_users.json`, live IOC `orderStatus` (`TRUTH_IOC`). Logs: `requests.jsonl` (explorer requests), `http429_hourly.json` (HTTP 429s per UTC hour, since capture version 2026-11-26-backoff429) | `hl-capture` service (server); on the Mac, see below |
-| market data streams | `collect/record_hl.py` | `hl_data/<day>/<hour>/trades_{BTC,ETH}.jsonl`, `book_{COIN}.jsonl` (20-level L2, ~12 s), `book_{COIN}_fast.jsonl` (5 levels, ~0.5 s, since Nov 21 22:56 UTC), `book_{COIN}_sf4.jsonl`, `bbo_{COIN}.jsonl`, `blocks.jsonl`, `tracked_users.jsonl` and tracked users' `user_orders` / `user_fills` (a user's stream is complete only while they are in the tracked set; per-user streams start after a 600 s warm-up) | `hl-recorder` service (server); on the Mac, see below |
+| block chunks + per-chunk lookups | `collect/capture.py` (uses `collect/fetch_blocks.py`, `collect/info.py`, `collect/backoff.py`) | `windows/<start>-<end>/<height>.json.gz` + `window.json` (incl. `capture_version`) + `anchors.json`; since Nov 22 also `clearinghouseState.json`, `spotClearinghouseState.json` (margin), `margin_open.json`, `hist_orders.json`, `suspect_status.json` (suspect makers' `orderStatus`), since Nov 24 `truth_status.json` (live IOC `orderStatus`, TRUTH_IOC), `open_orders_truth.json`, `open_book_users.json` | Mac: `caffeinate -i python3 -u capture.py` in `~/hl-data/mac3` -> `capture.out` (see below); server: `hl-capture` service |
+| market data streams | `collect/record_hl.py` | `hl_data/<day>/<hour>/` (gzipped when the hour closes): `trades_{BTC,ETH}.jsonl`, `book_{COIN}.jsonl` (20-level L2, ~12 s), `book_{COIN}_sf4.jsonl` (L2 at 4 significant figures, deeper), `book_{COIN}_fast.jsonl` (5 levels with order counts n, ~0.5 s, since Nov 21 22:56 UTC), `bbo_{COIN}.jsonl`, `blocks.jsonl`, `user_orders.jsonl` / `user_fills.jsonl` (tracked users) + `tracked_users.jsonl` (who was tracked when: a user's stream is complete only while they're in the set; first pick 600 s after start) | Mac: `caffeinate -i python3 -u record_hl.py BTC ETH` in `~/hl-data/mac3` -> `recorder.log`; server: `hl-recorder` service |
+| request / throttle logs | `collect/fetch_blocks.py`, `collect/backoff.py` | `~/hl-data/mac3/requests.jsonl` (one row per explorer request: height, ms, status, outcome), `~/hl-data/mac3/http429_hourly.json` (HTTP 429 count per UTC hour and source, since capture 2026-11-26-backoff429) | written by the capture |
 | copy server -> Mac | `server/sync_down.sh` | `~/hl-data/mac3/...` | by hand |
-| free all-user truth (small) | `collect/sqd_pull.sh` | `~/hl-data/sqd/blocks/<height>.jsonl` (SQD replica_cmds: every action with user, nonce, per-item outcome) | by hand, quota ~50 MB/month |
+| free all-user truth (small) | `collect/sqd_pull.sh` | `~/hl-data/sqd/blocks/<height>.jsonl` (SQD replica_cmds: every action with user, nonce, per-item outcome); every query is logged in `handoff/sqd_queries.log` | by hand, quota ~50 MB/month |
 
-**How the Mac capture runs (Yuta #64).** Not from a git checkout and not via `uv run`: from COPIES of `capture.py`,
-`info.py`, `fetch_blocks.py`, `backoff.py` and `record_hl.py` in `~/hl-data/mac3`, under the system `python3`, with
-the environment of the latest `~/hl-data/mac3/restart_*.sh` (now `restart_backoff429.sh`):
-`caffeinate -i python3 -u capture.py` -> `capture.out`, and `caffeinate -i python3 -u record_hl.py BTC ETH` ->
-`recorder.log`. Deploy = copy from `collect/` (old copies kept as `*.pre-<tag>`) and bump `CAPTURE_VERSION` (written
-into each `window.json`). It is never paused (the `never-pause-ingest` rule); an outage is logged in
-`data/ingest_gaps.json`, and chunks touching a gap are kept out of every set (stage 2). **Do not touch it from this
-worktree.**
+**How the Mac ingest runs.** The capture and recorder run from COPIES of the `collect/` files in `~/hl-data/mac3`
+(`capture.py`, `fetch_blocks.py`, `info.py`, `backoff.py`, `record_hl.py`), under the system `python3`, not the
+repo's venv.
+- **Settings** are environment variables. The current command line is the latest `~/hl-data/mac3/restart_*.sh`
+  (now `restart_backoff429.sh`).
+- **Deploying a capture change** takes three steps:
+  1. Copy the file from `collect/`, keeping the old copy as `<file>.pre-<tag>`.
+  2. Bump `CAPTURE_VERSION` in `capture.py`; it is written into every new `window.json`.
+  3. Restart with a new `restart_<tag>.sh`.
+- **Rules:**
+  - Never pause the ingest (`never-pause-ingest` rule; a pause or outage becomes an ingest gap).
+  - HTTP 429s are retried with exponential back-off (equal jitter, cap 60 s) for both explorer and info lookups.
+- **If the ingest stops,** log the gap in `data/ingest_gaps.json`. Use the first silent and the first resumed
+  `recv_ms` of the recorder files; `end_ms: null` while it is still open. `data/catalog.py` and
+  `analysis/validate_chunks.find_chunks` then keep every chunk that touches it out of all sets.
+- **Do not touch it from this worktree.**
 
-**Derived truth (offline, diagnostic; not an input to B3's replay).**
-
-| what | code | output |
+| derived truth (offline, diagnostic; never an input to a baseline rule) | code | output |
 |---|---|---|
-| order outcomes O1-O4 from `user_orders` / `historicalOrders` / `anchors` / `suspect_status` | `analysis/oracle_truth.py` | per-chunk truth tables used by audits (ORACLE.md) |
-| all-user outcomes from SQD blocks | `analysis/sqd_truth.py` | SQD truth for the fetched blocks (RIKA.md) |
-| gate-2 inputs: block list + send times (calibrated nonce) | `analysis/gate2_input.py`, `analysis/gate2_sendtimes.py` | `handoff/gate2/blocks.csv`, `send_times*.csv` (docs/gate2_data.md) |
+| tracked users' order truth O1-O4 (status, oids, pre-window queue, IOC status) | `analysis/oracle_truth.py` (from `user_orders`, `hist_orders.json`, `anchors.json`, `suspect_status.json`) | `handoff/oracle_truth/<set>/` |
+| all-user outcomes in SQD-fetched blocks | `analysis/sqd_truth.py` (explorer tx <-> SQD (actionIndex, item) alignment) | `handoff/truth_audit/sqd/<set>/{status,ioc}.csv` |
+| gate 2 send times (nonce, batch, class, calibrated send time) | `analysis/gate2_input.py`, `analysis/gate2_sendtimes.py` (docs/gate2_data.md) | `handoff/gate2_input/`, `handoff/gate2/{blocks,send_times*}.csv` |
 
 **B0 -> B3 at this stage:** B1's margin rule needs `clearinghouseState.json`, which the capture writes only for chunks
 captured since Nov 22 04:20 UTC (dev20 and final240 are older, so B1 is inert there). B2 / B3 need nothing new.
