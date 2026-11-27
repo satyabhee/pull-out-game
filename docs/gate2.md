@@ -153,3 +153,29 @@ block, and `ScheduleCancel` has none, so any chunk with a scheduleCancel in a li
 with fills (`tests/test_gate2_a3.py`). Everything in A3 now refers to new runs on the fixed code: the all-listed
 runs (yuta95, raw, L44), from which come the A3 fallback and S1-S3, then the A3 primary `--one-block` run. The
 pre-registered design is unchanged.
+
+**A5 (04:46Z Nov 27; EXTENSION; written BEFORE Yuta pulls any new block and before any extension run; Satya).**
+Purpose: more race opportunities. **The A3 primary is unchanged.** A5 is reported in its own section of
+docs/gate2_results.md, never pooled into, averaged with, or replacing the primary.
+1. **Selection rule (outcome-blind: chain data only, no replay output, no V).** A block qualifies when, inside ONE
+   batch (Yuta's rank-drop cut on the stored order, as in the `batch` column), there is (i) a cancel /
+   cancelByCloid / modify whose target order rests at coin C, price P, side s, and (ii) a GTC / IOC order (place or
+   modify) on coin C, opposite side, whose limit reaches P (buy px >= P against an ask, sell px <= P against a bid).
+   The target's (C, P, s) comes from its placing action in the same chunk or from the capture's order-status files.
+   A target that can't be resolved this way doesn't qualify the block. BTC / ETH only.
+2. **Pool of chunks:** captured chunks of the dev sets and retired confirm sets only: dev20, devfast, dev_margin60,
+   dev_alo10, confirm_margin60, confirm2_margin60, confirm_alo2_60, confirm_fast5_60. Excluded: final240 (and
+   final220), confirm68, held / held66 / held67, the reserved post-change benchmark, new3 / new34 / newcov / post / tgt
+   (status not checked tonight; can be added only by a later amendment before their blocks are pulled), every chunk
+   that touches a gap in data/ingest_gaps.json, and the 71 primary blocks. No use of final240 for screening.
+3. **Order and cap, fixed before any pull:** qualifying blocks are listed by ascending height (across all pool
+   chunks). The first N are taken, where N is the cap from Yuta's SQD quota estimate, written with the full list
+   to handoff/gate2_ext/blocks.csv (`chunk_dir,height`; sha256 logged in his mail) BEFORE any block is pulled.
+   A listed block that SQD can't return in full (an action without nonce) is dropped and counted, never replaced.
+4. **Same method:** code 10e8113, plus only fixes that are needed and logged here; send times by the same yuta95
+   calibration (analysis/gate2_sendtimes.py), file sha256 logged before the run; `analysis.gate2 run
+   --one-block` (one OFF replay per listed block); same estimator, 10 s markout, chunk-cluster bootstrap (10,000,
+   seed 20261127), and the section 5 reading rule applied to the extension's own V_race.
+5. **Cutoff: Fri Nov 27 9:00 AM CT (15:00Z)** (Satya's "Change to A5", which supersedes the 2 PM CT in his earlier
+   message). If the extension isn't scored by then, docs/gate2_results.md reports it as "pending", with no partial
+   numbers.
