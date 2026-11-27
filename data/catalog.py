@@ -15,12 +15,13 @@ from functools import lru_cache
 from pathlib import Path
 
 GAPS_FILE = Path(__file__).with_name("ingest_gaps.json")
+OPEN_END = 2**63 - 1          # end_ms null: a gap that is still open (recorder not restarted yet)
 
 
 @lru_cache(maxsize=1)
 def _load() -> tuple[tuple[tuple[int, int], ...], int, int]:
     d = json.loads(GAPS_FILE.read_text())
-    gaps = tuple(sorted((g["start_ms"], g["end_ms"]) for g in d["gaps"]))
+    gaps = tuple(sorted((g["start_ms"], OPEN_END if g["end_ms"] is None else g["end_ms"]) for g in d["gaps"]))
     return gaps, d["margin"]["before_ms"], d["margin"]["after_ms"]
 
 

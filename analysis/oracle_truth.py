@@ -24,6 +24,7 @@ import gzip
 import json
 import time
 from collections import Counter, defaultdict
+from decimal import Decimal
 from pathlib import Path
 
 COINS = {0: "BTC", 1: "ETH"}
@@ -117,7 +118,7 @@ class Truth:
                 return None
         cands = [x for x in self.by_shape.get((u, coin, side, px, bt), []) + [
                  x for x in self.by_shape.get(("", coin, side, px, bt), []) if u in x["shared"]]
-                 if x["orig_sz"] == sz and (u, x["oid"]) not in used]
+                 if Decimal(str(x["orig_sz"])) == Decimal(str(sz)) and (u, x["oid"]) not in used]   # L55: "1" == "1.0"
         return cands[0] if len(cands) == 1 else None
 
 

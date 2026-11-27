@@ -43,7 +43,7 @@ def main(argv=None) -> int:
         for c in sorted(chunks):
             if owner.setdefault(c, name) != name:
                 dup.append(f"{c} ({owner[c]} + {name})")
-        mine = lambda c: owner[c] == name
+        mine = lambda c: owner.get(c) == name           # ref chunks outside this set (e.g. dev20 in final240) are skipped
         ref_all.update({k: x for k, x in ref.items() if mine(k[0])})
         var_all.update({k: x for k, x in var.items() if mine(k[0])})
         cont += [k for k, s in scope.items() if s and mine(k[0])]

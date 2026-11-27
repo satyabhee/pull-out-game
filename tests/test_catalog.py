@@ -35,3 +35,11 @@ def test_find_chunks_skips_gap_chunks(tmp_path):
     chunks, skipped = find_chunks([tmp_path])
     assert chunks == [ok] and skipped == [(bad, "ingest gap")]
     assert chunk_gap(bad) == (GAP0, GAP1) and chunk_gap(ok) is None
+
+
+def test_open_gap_touches_every_later_chunk(tmp_path):
+    from data.catalog import OPEN_END
+    gaps, _, _ = _load()
+    start = max(g0 for g0, g1 in gaps if g1 == OPEN_END)     # Nov 26 17:36:05Z, recorder still down
+    assert gap_touched(start + 86_400_000, start + 86_410_000) == (start, OPEN_END)
+    assert gap_touched(start - 3_600_000, start - 3_590_000) is None
