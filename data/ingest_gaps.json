@@ -1,5 +1,5 @@
 {
-  "about": "end_ms null = the gap is still open (treated as never ending). Times when the Mac's recorder (record_hl.py) and capture (capture.py) recorded nothing. Measured from the recorder files' receive times (bbo, trades, blocks, book_fast all silent). A chunk whose span [first_block_time - before_ms, last_block_time + after_ms] overlaps a gap must not be in any chunk set (data/catalog.py; analysis/validate_chunks.find_chunks skips it).",
+  "about": "end_ms null = a gap still open (treated as never ending). Times when the Mac's recorder (record_hl.py) and capture (capture.py) recorded nothing. Measured from the recorder files' receive times (bbo, trades, blocks, book_fast all silent). A chunk whose span [first_block_time - before_ms, last_block_time + after_ms] overlaps a gap must not be in any chunk set (data/catalog.py; analysis/validate_chunks.find_chunks skips it).",
   "margin": {"before_ms": 900000, "after_ms": 300000,
              "why": "a replay reads recorder data up to 15 min before a chunk (top-maker ranking 10 min, nearest snapshots, deep-book lookback) and up to 5 min after (RECV_LAG_MS 300 s)"},
   "gaps": [
@@ -9,7 +9,7 @@
      "cause": "ingest paused (SIGSTOP) for M5 timing window 1"},
     {"start_ms": 1795340815000, "end_ms": 1795342328000, "utc": "2026-11-22 09:46:55 - 10:12:08", "seconds": 1513,
      "cause": "ingest paused (SIGSTOP) for M5 timing window 2"},
-    {"start_ms": 1795714565000, "end_ms": null, "utc": "2026-11-26 17:36:05 - (open)",
-     "cause": "recorder + capture not running; cause unknown (found dead 22:41Z; Yuta, handoff/ingest_gap_2026-11-26.md, NS-14). end_ms null = still open: fill in on restart"}
+    {"start_ms": 1795714565000, "end_ms": 1795734886000, "utc": "2026-11-26 17:36:05 - 23:14:46", "seconds": 20321,
+     "cause": "recorder + capture not running; cause unknown (found dead 22:41Z; Yuta, handoff/ingest_gap_2026-11-26.md, NS-14). Restarted 23:14:46Z on Satya's NS-14 answer (first recv_ms 1795734885999; Yuta #61/#64)"}
   ]
 }

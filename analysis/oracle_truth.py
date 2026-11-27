@@ -118,7 +118,7 @@ class Truth:
                 return None
         cands = [x for x in self.by_shape.get((u, coin, side, px, bt), []) + [
                  x for x in self.by_shape.get(("", coin, side, px, bt), []) if u in x["shared"]]
-                 if Decimal(str(x["orig_sz"])) == Decimal(str(sz)) and (u, x["oid"]) not in used]   # L55: "1" == "1.0"
+                 if x["orig_sz"] is not None and Decimal(str(x["orig_sz"])) == Decimal(str(sz)) and (u, x["oid"]) not in used]   # L55: "1" == "1.0"
         return cands[0] if len(cands) == 1 else None
 
 

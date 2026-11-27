@@ -37,9 +37,21 @@ def test_find_chunks_skips_gap_chunks(tmp_path):
     assert chunk_gap(bad) == (GAP0, GAP1) and chunk_gap(ok) is None
 
 
-def test_open_gap_touches_every_later_chunk(tmp_path):
-    from data.catalog import OPEN_END
+def test_open_gap_touches_every_later_chunk(tmp_path, monkeypatch):
+    import data.catalog as cat
+    start = 1_900_000_000_000                                 # fixture gap, still open (end_ms null)
+    f = tmp_path / "gaps.json"
+    f.write_text(json.dumps({"margin": {"before_ms": 900_000, "after_ms": 300_000},
+                             "gaps": [{"start_ms": start, "end_ms": None}]}))
+    monkeypatch.setattr(cat, "GAPS_FILE", f)
+    cat._load.cache_clear()
+    try:
+        assert cat.gap_touched(start + 86_400_000, start + 86_410_000) == (start, cat.OPEN_END)
+        assert cat.gap_touched(start - 3_600_000, start - 3_590_000) is None
+    finally:
+        cat._load.cache_clear()
+
+
+def test_nov26_gap_is_closed():
     gaps, _, _ = _load()
-    start = max(g0 for g0, g1 in gaps if g1 == OPEN_END)     # Nov 26 17:36:05Z, recorder still down
-    assert gap_touched(start + 86_400_000, start + 86_410_000) == (start, OPEN_END)
-    assert gap_touched(start - 3_600_000, start - 3_590_000) is None
+    assert (1795714565000, 1795734886000) in gaps             # 17:36:05 - 23:14:46Z, 20,321 s (Yuta #61/#64)
