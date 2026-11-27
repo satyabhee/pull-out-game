@@ -11,7 +11,30 @@ from snapshot."
 - Data: dev20 (20 chunks, 4,200 blocks), B3 = `handoff/i27/baseline.txt` line 2.
 - Scripts and logs: data-streams `checks/determinism/`. Outputs: `~/book-replay-detcheck/report/determinism/`.
 
-## Verdict
+## Update after Satya's decision (~22:10Z Nov 27)
+
+**Decision:** the SHA-256 book digest below is the **official per-block state hash**.
+- **Scope = the books:** price, size, queue position and identity of every resting order.
+- **Stated exclusion:** ledgers, learners, oid maps and counters are not in the hash.
+- **Snapshot save / restore is not built today.**
+
+| condition | status now |
+|---|---|
+| per-block state hash | **built:** `engine_py/state.py` (`encode_books`, `block_hash`). It is the same code as `checks/determinism/book_digest.py`, so the 4,200-block results below are results for this hash. Pass `hasher=state.block_hash` to Replay. The default stays None. |
+| two runs, different PYTHONHASHSEED | **PASS:** `tests/test_determinism.py::test_two_runs_different_hash_seeds_identical` (a seeded 60-block simulated chunk, two subprocesses with PYTHONHASHSEED 1 and 2), plus dev20 4,200 / 4,200 below |
+| Rust vs Python | **PASS:** `test_rust_equals_python_per_block_hashes` (simulated chunk, baseline and class-sort orders), plus dev20 4,200 / 4,200 below |
+| the hash can fail | **PASS:** `test_hash_sees_an_ordering_change`, plus the dev20 sensitivity run below |
+| **restart from snapshot** | **NOT BUILT.** `tests/test_snapshot.py` is an explicit skip, so the gap shows in every run. |
+
+- **Tests run:** on unified 2b16768 + these files (~/book-replay-detcheck), `nice -n 19`: 4 passed, 1 skipped (the
+  snapshot test), 28 s under load.
+- On data-streams, which has no `replay.sim` or `replay_core`, the 3 simulated-chunk tests skip and the encoding test
+  passes.
+- **G2 status:** met for "two runs, different hash seeds" and for Rust vs Python, with the book-scope hash. "Restart
+  from snapshot" is not built.
+- The verdict below is the 22:05Z check, from before the decision.
+
+## Verdict (22:05Z, before the decision)
 
 **G2 is NOT met as written.**
 - The per-block state hash and snapshot restart the gate names don't exist: `engine_py/state.py`,
