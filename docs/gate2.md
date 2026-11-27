@@ -211,3 +211,11 @@ non-integer send_ms rows in all three primary send-time files; 0 duplicate chunk
    window, so the bootstrap has **65 clusters** (62 with 3 blocks, 2 with 6, 1 with 2), not 67. Treating two copies
    of one window as independent clusters would understate the CI.
 The rerun uses the same inputs, the same flags, and the code of the commit that adds this text.
+
+**A5.2 decision (07:51Z Nov 27; Satya, answering NS-18; BEFORE the extension rerun is scored).** Rule: each block
+height is counted once, and each physical window is one bootstrap cluster. Check of the two duplicated windows:
+- 1230280994-1230281203: confirm_margin60 copy 1230280997 / 0998 / 1001; devfast copy 1230281003 / 1009 / 1010.
+- 1230343846-1230344055: confirm_margin60 copy 1230343849 / 3851 / 3855; devfast copy 1230343857 / 3862 / 3864.
+The second copies' heights are **different** from the first copies', and no height appears twice in the list.
+**Case applied: keep all 200 blocks**, in **65 clusters** (62 with 3 blocks, 2 with 6, 1 with 2). This is what
+group_chunks (de19e47) already does, so the rerun started at 07:46Z on de19e47 needs no change.
