@@ -3,7 +3,8 @@
 
 usage: python -m analysis.gate2 run <blocks.csv> --out DIR --jobs N --hl-data ~/hl-data/mac3/hl_data <B3 flags> \
            --order m1n --send-times <send_times.csv>     (ON = the same flags without --order)
-       python -m analysis.gate2 score DIR
+       python -m analysis.gate2 run ... --one-block   (A3 primary: OFF reorders one listed block per replay)
+       python -m analysis.gate2 score DIR [--first-listed]
 """
 from __future__ import annotations
 
@@ -45,7 +46,8 @@ def markout(fl: GFill, mid10: Decimal) -> Decimal:
 def block_values(on: list[GFill], off: list[GFill], raced: set[str], mid10) -> dict:
     """V_race / V_absorb / V_net for one block (sums ON minus OFF). mid10(coin, time_ms) -> Decimal | None."""
     out = dict(V_race=Decimal(0), V_absorb=Decimal(0), n_race_on=0, n_race_off=0, n_absorb_on=0, n_absorb_off=0,
-               ntl_on=Decimal(0), ntl_off=Decimal(0), dropped_no_mid=0)
+               ntl_on=Decimal(0), ntl_off=Decimal(0), dropped_no_mid=0,
+               **{f"{x}_{g}_{arm}": Decimal(0) for x in ("m", "ntl") for g in ("race", "absorb") for arm in ("on", "off")})
     key = lambda x: (x.taker_hash, x.maker, x.maker_side, x.px, x.sz)
     out["changed"] = sorted(map(key, on)) != sorted(map(key, off))
     for arm, fills, sign in (("on", on, 1), ("off", off, -1)):
@@ -58,6 +60,8 @@ def block_values(on: list[GFill], off: list[GFill], raced: set[str], mid10) -> d
             out[f"V_{grp}"] += sign * markout(fl, m)
             out[f"n_{grp}_{arm}"] += 1
             out[f"ntl_{arm}"] += fl.px * fl.sz
+            out[f"m_{grp}_{arm}"] += markout(fl, m)                  # bps reporting (A3 item 6)
+            out[f"ntl_{grp}_{arm}"] += fl.px * fl.sz
     out["V_net"] = out["V_race"] + out["V_absorb"]
     return out
 
@@ -72,6 +76,28 @@ def cluster_boot(per_chunk: dict[str, float], reps: int = BOOT_REPS, seed: int =
     rng = random.Random(seed)
     sims = sorted(sum(vals[rng.randrange(len(vals))] for _ in vals) for _ in range(reps))
     return point, sims[int(0.025 * reps)], sims[min(reps - 1, int(0.975 * reps))]
+
+
+def bps_diff(m_on, n_on, m_off, n_off):
+    """ON - OFF notional-weighted mean markout in bps (1e4 x sum markout / sum notional); None if an arm has none."""
+    if not n_on or not n_off:
+        return None
+    return 1e4 * (m_on / n_on - m_off / n_off)
+
+
+def cluster_boot_ratio(per_chunk: dict[str, tuple], reps: int = BOOT_REPS, seed: int = BOOT_SEED) -> tuple:
+    """bps_diff of the summed (m_on, n_on, m_off, n_off), chunks resampled with numerator and denominator together.
+    (point, lo, hi); None values where undefined."""
+    keys = sorted(per_chunk)
+    vals = [per_chunk[k] for k in keys]
+    tot = lambda vs: [sum(v[i] for v in vs) for i in range(4)]
+    point = bps_diff(*tot(vals)) if vals else None
+    if point is None:
+        return None, None, None
+    rng = random.Random(seed)
+    sims = [bps_diff(*tot([vals[rng.randrange(len(vals))] for _ in vals])) for _ in range(reps)]
+    sims = sorted(x for x in sims if x is not None)
+    return point, sims[int(0.025 * len(sims))], sims[min(len(sims) - 1, int(0.975 * len(sims)))]
 
 
 class Mids:
@@ -132,7 +158,7 @@ def observer_for(heights: frozenset):
             super().after_action(rp, block, a, fills, rejects, created)
             if block.height not in heights:
                 return
-            spec = ASSETS[a.asset]
+            spec = ASSETS[a.asset] if fills else None    # ScheduleCancel has no asset (and never fills)
             for fl in fills:
                 self.g_fills.append(dict(
                     height=block.height, taker_hash=fl.taker_hash.lower(), maker=_ident(rp, fl.maker_order),
@@ -176,6 +202,58 @@ def _run_chunk(job) -> dict:
     return out
 
 
+def _run_arm(job) -> dict:
+    """A3 one-block mode: one arm of one chunk, recording only `heights`. Top level so it pickles."""
+    from analysis import validate_replay as vr
+    from analysis.validate_chunks import _free_chunk_caches
+    tag, chunk, hl_data, heights, kw = job
+    holder = {}
+
+    class Cls(observer_for(frozenset(heights))):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            holder["obs"] = self
+    try:
+        res, rows = vr.run(chunk, hl_data, "listing", out_dir=None, quiet=True, observer_cls=Cls, **kw)
+        o = holder["obs"]
+        arm = {"status": "ok", "res": res, "rows": rows, "fills": o.g_fills, "raced": o.g_raced, "txs": sorted(o.g_txs)}
+    except Exception as e:                           # recorded and reported, never dropped
+        arm = {"status": "failed", "error": f"{type(e).__name__}: {e}"}
+    _free_chunk_caches()
+    return {"tag": tag, "chunk": Path(chunk).name, "arm": arm}
+
+
+def _one_block_send_times(src, out_dir: Path, height: int) -> Path:
+    """The send-time file restricted to one height: M1n then reorders only that block (others: no timed tx)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    p = out_dir / f"{height}.csv"
+    with open(src, newline="") as fh, open(p, "w", newline="") as fo:
+        rd = csv.DictReader(fh)
+        wr = csv.DictWriter(fo, fieldnames=rd.fieldnames)
+        wr.writeheader()
+        wr.writerows(r for r in rd if int(r["height"]) == height)
+    return p
+
+
+def _assemble_one_block(parts: list[dict]) -> list[dict]:
+    """Per chunk: ON from its single ON replay; OFF = the per-block OFF replays, each contributing only its block."""
+    by: dict[str, dict] = {}
+    for p in sorted(parts, key=lambda p: (p["chunk"], p["tag"])):
+        r = by.setdefault(p["chunk"], {"chunk": p["chunk"], "arms": {}, "off_parts": []})
+        if p["tag"] == "on":
+            r["arms"]["on"] = p["arm"]
+        else:
+            r["off_parts"].append(p["arm"])
+    for r in by.values():
+        offs = r.pop("off_parts")
+        bad = [x for x in offs if x["status"] != "ok"]
+        r["arms"]["off"] = ({"status": "failed", "error": "; ".join(x["error"] for x in bad)} if bad else
+                            {"status": "ok", "fills": [f for x in offs for f in x["fills"]],
+                             "raced": [f for x in offs for f in x["raced"]],
+                             "txs": sorted({tuple(t) for x in offs for t in x["txs"]})})
+    return [by[k] for k in sorted(by)]
+
+
 def run_main(argv):
     import argparse
     import hashlib
@@ -187,6 +265,8 @@ def run_main(argv):
     ap.add_argument("blocks")
     ap.add_argument("--out", required=True)
     ap.add_argument("--jobs", type=int, default=1)
+    ap.add_argument("--one-block", action="store_true",
+                    help="A3 primary: OFF replayed once per listed block, only that block reordered and recorded")
     vr.add_replay_args(ap)
     a = ap.parse_args(argv)
     if a.order != "m1n" or not a.send_times:
@@ -202,8 +282,27 @@ def run_main(argv):
     out.mkdir(parents=True, exist_ok=True)
     meta = {"blocks_csv": a.blocks, "blocks_sha256": hashlib.sha256(open(a.blocks, "rb").read()).hexdigest(),
             "send_times": a.send_times, "send_times_sha256": hashlib.sha256(open(a.send_times, "rb").read()).hexdigest(),
-            "chunks": len(by_chunk), "listed_blocks": sum(map(len, by_chunk.values())), "argv": argv}
+            "chunks": len(by_chunk), "listed_blocks": sum(map(len, by_chunk.values())), "argv": argv,
+            "mode": "one_block" if a.one_block else "all_listed"}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
+    if a.one_block:
+        jobs = []
+        for c, hs in sorted(by_chunk.items()):
+            jobs.append(("on", c, a.hl_data, sorted(hs), kw_on))
+            for h in sorted(hs):
+                st = _one_block_send_times(a.send_times, out / "send_times_by_height", h)
+                jobs.append((f"off:{h}", c, a.hl_data, [h], dict(kw_off, send_times=str(st))))
+        with ProcessPoolExecutor(a.jobs) as ex:
+            parts = list(ex.map(_run_arm, jobs)) if a.jobs > 1 else list(map(_run_arm, jobs))
+        results = _assemble_one_block(parts)
+        pickle.dump(results, open(out / "results.pkl", "wb"))
+        outs = [{"chunk": r["chunk"], "status": r["arms"]["on"]["status"], "res": r["arms"]["on"].get("res"),
+                 "rows": r["arms"]["on"].get("rows", []), "error": r["arms"]["on"].get("error", "")} for r in results]
+        res, rows = pool(outs, [], kw_on, "listing")
+        chunks = {Path(c).name: Path(c) for c in by_chunk}
+        write_csvs(out / "on", res, rows, [chunk_row(o, _meta(chunks[o["chunk"]])) for o in outs])
+        print(f"gate2 run --one-block: {len(results)} chunks, {len(jobs)} replays -> {out}")
+        return
     jobs = [(c, a.hl_data, sorted(h), kw_on, kw_off) for c, h in sorted(by_chunk.items())]
     with ProcessPoolExecutor(a.jobs) as ex:
         results = list(ex.map(_run_chunk, jobs)) if a.jobs > 1 else list(map(_run_chunk, jobs))
@@ -217,7 +316,7 @@ def run_main(argv):
     print(f"gate2 run: {len(results)} chunks -> {out}")
 
 
-def _score_pass(results, failed, hl_data, exclude=None) -> tuple[dict, Counter, list]:
+def _score_pass(results, failed, hl_data, exclude=None, only=None) -> tuple[dict, Counter, list]:
     """exclude: (height, hash) set. A fill is dropped from BOTH arms when its taker tx is in it, or its maker is a
     raced order whose racing cancel tx is in it (sensitivity row, docs/gate2.md 5)."""
     per = {k: {} for k in ("V_race", "V_absorb", "V_net")}
@@ -230,6 +329,8 @@ def _score_pass(results, failed, hl_data, exclude=None) -> tuple[dict, Counter, 
                              **{k: x[k] for k in ("height", "taker_hash", "maker", "maker_user", "maker_side",
                                                   "coin", "time_ms")})
         heights = sorted({x["height"] for x in on["fills"] + off["fills"] + on["raced"] + off["raced"]})
+        if only is not None:                         # A3: e.g. the first listed block of each chunk
+            heights = [h for h in heights if h in only.get(r["chunk"], ())]
         times = [x["time_ms"] for x in on["fills"] + off["fills"]]
         mids = Mids(hl_data, min(times), max(times)) if times else None
         acc = Counter()
@@ -247,21 +348,32 @@ def _score_pass(results, failed, hl_data, exclude=None) -> tuple[dict, Counter, 
                 acc[k] += int(val) if isinstance(val, bool) else val
             acc["raced_orders"] += len(raced)
             acc["blocks"] += 1
-        for k in per:
+        for k in ("V_race", "V_absorb", "V_net"):
             per[k][r["chunk"]] = float(acc[k])
+        for g in ("race", "absorb"):
+            per.setdefault(f"bps_{g}", {})[r["chunk"]] = tuple(float(acc[f"{x}_{g}_{arm}"]) for arm in ("on", "off")
+                                                                for x in ("m", "ntl"))
         tot.update(acc)
         rows_out.append({"chunk": r["chunk"], **{k: str(v) for k, v in acc.items()}})
     return per, tot, rows_out
 
 
 def _lines(title, per, tot, rows_out):
-    out = [f"[{title}] chunks scored {len(per['V_race'])}; blocks with fills/races {tot['blocks']}, blocks changed "
+    out = [f"[{title}] chunks scored {len(per['V_race'])} (chunks with any difference: see 'chunks changed'); blocks with fills/races {tot['blocks']}, blocks changed "
            f"{tot['changed']}, chunks changed {sum(1 for x in rows_out if int(x.get('changed', '0')) > 0)}; "
            f"raced orders {tot['raced_orders']}; dropped (no mid) {tot['dropped_no_mid']}"
            + (f"; fills excluded {tot['fills_excluded']}" if "fills_excluded" in tot else "")]
     for k in ("V_race", "V_absorb", "V_net"):
         pt, lo, hi = cluster_boot(per[k])
         out.append(f"  {k:8s} {pt:+12.2f} USD  95% CI [{lo:+.2f}, {hi:+.2f}] (chunk bootstrap {BOOT_REPS}, seed {BOOT_SEED})")
+    for g in ("race", "absorb"):
+        vals = per.get(f"bps_{g}", {})
+        m_on, n_on, m_off, n_off = (sum(v[i] for v in vals.values()) for i in range(4))
+        on_b = f"{1e4 * m_on / n_on:+.3f}" if n_on else "n/a"
+        off_b = f"{1e4 * m_off / n_off:+.3f}" if n_off else "n/a"
+        pt, lo, hi = cluster_boot_ratio(vals)
+        diff = f"{pt:+.3f} bps  95% CI [{lo:+.3f}, {hi:+.3f}]" if pt is not None else "n/a"
+        out.append(f"  {g:6s} mean markout (notional-weighted) ON {on_b} / OFF {off_b} bps; ON - OFF {diff} (reporting only)")
     out.append(f"  n race fills ON / OFF {tot['n_race_on']} / {tot['n_race_off']}; absorb fills ON / OFF "
                f"{tot['n_absorb_on']} / {tot['n_absorb_off']}; notional ON {float(tot['ntl_on']):.0f} OFF "
                f"{float(tot['ntl_off']):.0f} USD")
@@ -271,8 +383,17 @@ def _lines(title, per, tot, rows_out):
 def score_main(argv):
     import pickle
     from engine_py.ordering import load_send_times, reused_txs
-    d = Path(argv[0])
+    first = "--first-listed" in argv
+    d = Path([x for x in argv if not x.startswith("--")][0])
     meta = json.loads((d / "meta.json").read_text())
+    only = None
+    if first:                                        # A3: first listed block of each chunk (35 blocks)
+        only = {}
+        with open(meta["blocks_csv"], newline="") as fh:
+            for row in csv.DictReader(fh):
+                only.setdefault(Path(row["chunk_dir"]).name, []).append(int(row["height"]))
+        only = {c: {min(hs)} for c, hs in only.items()}
+    sfx = "_first" if first else ""
     results = pickle.load(open(d / "results.pkl", "rb"))
     hl_data = meta["argv"][meta["argv"].index("--hl-data") + 1]
     failed = [r["chunk"] for r in results if any(r["arms"][x]["status"] != "ok" for x in ("on", "off"))]
@@ -280,16 +401,16 @@ def score_main(argv):
     reused = reused_txs(meta["send_times"])
     seen = {tuple(t) for r in results if r["chunk"] not in failed for t in r["arms"]["on"]["txs"]}
     exclude = {t for t in seen if t not in timed} | reused
-    lines = [f"gate2 score: {d} (blocks sha256 {meta['blocks_sha256'][:12]}, send times {meta['send_times_sha256'][:12]})",
+    lines = [f"gate2 score{' --first-listed' if first else ''} ({meta.get('mode', 'all_listed')}): {d} (blocks sha256 {meta['blocks_sha256'][:12]}, send times {meta['send_times_sha256'][:12]})",
              f"chunks failed {len(failed)} {failed}; listed-block txs {len(seen)}: untimed (stale/counter/future) "
              f"{len(seen - timed)}, reused-nonce {len(reused & seen)}"]
-    per, tot, rows = _score_pass(results, failed, hl_data)
+    per, tot, rows = _score_pass(results, failed, hl_data, only=only)
     lines += _lines("primary", per, tot, rows)
-    per_x, tot_x, rows_x = _score_pass(results, failed, hl_data, exclude)
+    per_x, tot_x, rows_x = _score_pass(results, failed, hl_data, exclude, only=only)
     lines += _lines("sensitivity: stale/reused-nonce actions excluded", per_x, tot_x, rows_x)
-    (d / "score.txt").write_text("\n".join(lines) + "\n")
-    _dump(d / "per_chunk.jsonl", rows)
-    _dump(d / "per_chunk_excl.jsonl", rows_x)
+    (d / f"score{sfx}.txt").write_text("\n".join(lines) + "\n")
+    _dump(d / f"per_chunk{sfx}.jsonl", rows)
+    _dump(d / f"per_chunk_excl{sfx}.jsonl", rows_x)
     print("\n".join(lines))
 
 

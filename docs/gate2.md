@@ -144,3 +144,12 @@ result line has been opened or printed.
    notional-weighted mean markout in bps (1e4 x sum markout / sum fill notional) and the ON - OFF difference in bps,
    with the same chunk bootstrap (numerator and denominator resampled together); and n chunks with any difference
    (already printed as "chunks changed"). Reporting only: the reading rule (section 5) still applies to V_race in USD.
+
+**A4 (01:42Z Nov 27; still BEFORE any result was viewed). Observer bug; the 01:19Z runs are void.** A smoke test of
+`--one-block` on one chunk failed in both arms: the gate-2 observer looked up the asset of every action in a listed
+block, and `ScheduleCancel` has none, so any chunk with a scheduleCancel in a listed block failed in BOTH arms. The
+01:19Z runs used that code (primary finished 01:38Z, S2 was stopped mid-run): their folders are renamed
+`report/validate/gate2_{primary,s2_raw}_VOID_observer_bug` and never read. Fix: the lookup happens only for actions
+with fills (`tests/test_gate2_a3.py`). Everything in A3 now refers to new runs on the fixed code: the all-listed
+runs (yuta95, raw, L44), from which come the A3 fallback and S1-S3, then the A3 primary `--one-block` run. The
+pre-registered design is unchanged.
