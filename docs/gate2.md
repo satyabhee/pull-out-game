@@ -219,3 +219,49 @@ height is counted once, and each physical window is one bootstrap cluster. Check
 The second copies' heights are **different** from the first copies', and no height appears twice in the list.
 **Case applied: keep all 200 blocks**, in **65 clusters** (62 with 3 blocks, 2 with 6, 1 with 2). This is what
 group_chunks (de19e47) already does, so the rerun started at 07:46Z on de19e47 needs no change.
+
+**A6 (21:26Z Nov 27; Satya, "across policies", README G3; written BEFORE any A6 run, no A6 number computed).** Two
+descriptive orderings are added next to M1n. M1n stays the primary counterfactual and the A2 result is unchanged. No
+new headline and no significance reading: these are described rows.
+- **Same as the A3 primary:**
+  - blocks: handoff/gate2/blocks.csv, 71 blocks in 35 chunks;
+  - B3 flags;
+  - clock: handoff/gate2/send_times_yuta95.csv;
+  - one-block mode: one OFF replay per listed block, with only that block reordered and recorded;
+  - estimators (section 4);
+  - chunk bootstrap (10,000 resamples, seed 20261127);
+  - sensitivity row (section 5).
+- **(a) CANCELS-LAST** (`--order cancels_last`):
+  - Inside each batch, the class order is reversed for cancels and GTC/IOC, so the in-batch rank is G (sends a
+    GTC/IOC order) < A (ALO only) < C (cancel) < O (other), with ties in listing order.
+  - **[call]** The batches and the set of txs that move are M1n's: the yuta95 batch column, and the yuta95-timed
+    txs, which are re-sorted among the slots they occupy. Untimed txs keep their listing slot, as in M1n. So the
+    three orderings differ only in the sort key inside a batch.
+- **(b) RANDOM** (`--order random --order-seed s`):
+  - Inside each batch, the timed txs are shuffled among their slots (same batches and movable set as (a)).
+  - The RNG is random.Random("gate2-A6:<s>:<height>"), seeds s = 0..19.
+  - Reported:
+    - per seed;
+    - the mean over the 20 seeds of each point estimate;
+    - the spread across seeds (min, max and SD);
+    - a CI for the seed mean: per chunk, average the value over the seeds, then apply the same chunk bootstrap.
+- **Outputs per policy:**
+  - V_race / V_absorb / V_net with 95% CIs (`analysis.gate2 score`, unchanged);
+  - n raced fills ON / OFF.
+  - **L61-style row:** maker-strict contested accuracy vs ON (`analysis.contested_paired`; contested set fixed by
+    ON; chunk bootstrap, its default 4,000 resamples with seed 11).
+  - **[call]** The L61 row uses the listed blocks only: each OFF part's tx rows are restricted to its own block. So
+    it is not section 6's all-listed, whole-chunk row. M1n is rerun in the same runner so that its row is computed
+    the same way.
+- **Check before reading A6:**
+  - The rerun M1n must reproduce the signed primary V_race / V_absorb / V_net (score.txt of
+    report/validate/gate2_one_yuta95) exactly.
+  - If it doesn't, nothing from A6 is quoted, and the result is reported as "pending".
+- **Scope:** the only code change is new `--order` values (engine_py/ordering.py policies plus the validate_replay
+  choices) and a runner (analysis/gate2_policies.py). If anything needs a further engine change, A6 stops and is
+  reported as "pending".
+- **Partial runs:** jobs run in this order: ON, M1n, cancels-last, then seeds 0..19. If the status deadline
+  (23:30Z) arrives first, the finished seeds are reported as "k of 20 seeds" and the rest as pending. Seeds are
+  never chosen by outcome.
+- **Results:** docs/gate2_results.md section 11 "Across policies", with one comparison table (ON, M1n, cancels-last,
+  random).
