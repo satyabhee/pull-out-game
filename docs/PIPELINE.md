@@ -31,13 +31,27 @@ guess what we can't see (order statuses, margin).
 
 | what | code | output files | runs as |
 |---|---|---|---|
-| block chunks + per-chunk lookups | `collect/capture.py` | `windows/<start>-<end>/<height>.json.gz`, `window.json`, `anchors.json`; since Nov 22 also `clearinghouseState.json` (margin), `hist_orders.json`, `open_orders*.json`, suspect `orderStatus` answers | `hl-capture` service (server) / the live capture in `~/book-replay-data` (Mac) |
-| market data streams | `collect/record_hl.py` | `hl_data/<day>/<hour>/trades_{BTC,ETH}.jsonl`, `book_{COIN}.jsonl` (20-level L2, ~12 s), `book_{COIN}_fast.jsonl` (5 levels, ~0.5 s, since Nov 21 22:56 UTC), `bbo_{COIN}.jsonl`, `blocks.jsonl`, tracked users' `user_orders` / `user_fills` | `hl-recorder` service |
+| block chunks + per-chunk lookups | `collect/capture.py` (+ `info.py`, `fetch_blocks.py`, `backoff.py`) | `windows/<start>-<end>/<height>.json.gz`, `window.json` (incl. `capture_version`), `anchors.json`; since Nov 22 also `clearinghouseState.json` (margin), `hist_orders.json`, `open_orders*.json`, `suspect_status.json` (suspect `orderStatus` answers), `open_orders_truth.json`, `open_book_users.json`, live IOC `orderStatus` (`TRUTH_IOC`). Logs: `requests.jsonl` (explorer requests), `http429_hourly.json` (HTTP 429s per UTC hour, since capture version 2026-11-26-backoff429) | `hl-capture` service (server); on the Mac, see below |
+| market data streams | `collect/record_hl.py` | `hl_data/<day>/<hour>/trades_{BTC,ETH}.jsonl`, `book_{COIN}.jsonl` (20-level L2, ~12 s), `book_{COIN}_fast.jsonl` (5 levels, ~0.5 s, since Nov 21 22:56 UTC), `book_{COIN}_sf4.jsonl`, `bbo_{COIN}.jsonl`, `blocks.jsonl`, `tracked_users.jsonl` and tracked users' `user_orders` / `user_fills` (a user's stream is complete only while they are in the tracked set; per-user streams start after a 600 s warm-up) | `hl-recorder` service (server); on the Mac, see below |
 | copy server -> Mac | `server/sync_down.sh` | `~/hl-data/mac3/...` | by hand |
 | free all-user truth (small) | `collect/sqd_pull.sh` | `~/hl-data/sqd/blocks/<height>.jsonl` (SQD replica_cmds: every action with user, nonce, per-item outcome) | by hand, quota ~50 MB/month |
 
-One command (Mac, live): `uv run python -m collect.capture` (normally the service; never paused, see the
-`never-pause-ingest` rule). **Do not touch it from this worktree.**
+**How the Mac capture runs (Yuta #64).** Not from a git checkout and not via `uv run`: from COPIES of `capture.py`,
+`info.py`, `fetch_blocks.py`, `backoff.py` and `record_hl.py` in `~/hl-data/mac3`, under the system `python3`, with
+the environment of the latest `~/hl-data/mac3/restart_*.sh` (now `restart_backoff429.sh`):
+`caffeinate -i python3 -u capture.py` -> `capture.out`, and `caffeinate -i python3 -u record_hl.py BTC ETH` ->
+`recorder.log`. Deploy = copy from `collect/` (old copies kept as `*.pre-<tag>`) and bump `CAPTURE_VERSION` (written
+into each `window.json`). It is never paused (the `never-pause-ingest` rule); an outage is logged in
+`data/ingest_gaps.json`, and chunks touching a gap are kept out of every set (stage 2). **Do not touch it from this
+worktree.**
+
+**Derived truth (offline, diagnostic; not an input to B3's replay).**
+
+| what | code | output |
+|---|---|---|
+| order outcomes O1-O4 from `user_orders` / `historicalOrders` / `anchors` / `suspect_status` | `analysis/oracle_truth.py` | per-chunk truth tables used by audits (ORACLE.md) |
+| all-user outcomes from SQD blocks | `analysis/sqd_truth.py` | SQD truth for the fetched blocks (RIKA.md) |
+| gate-2 inputs: block list + send times (calibrated nonce) | `analysis/gate2_input.py`, `analysis/gate2_sendtimes.py` | `handoff/gate2/blocks.csv`, `send_times*.csv` (docs/gate2_data.md) |
 
 **B0 -> B3 at this stage:** B1's margin rule needs `clearinghouseState.json`, which the capture writes only for chunks
 captured since Nov 22 04:20 UTC (dev20 and final240 are older, so B1 is inert there). B2 / B3 need nothing new.
