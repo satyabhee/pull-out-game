@@ -115,3 +115,32 @@ Input sha256: blocks.csv 09ade47007cced643e0fc3f416be0b8b5a5450550562d937e976462
 send_times_yuta95.csv 976a995cd56564d658d17ba8734b2011a07fb343b319462641d3726b5317c89a;
 send_times_raw.csv a7d318d888da08c5247964595851f20d9dcd9091e6140a4a052bfa1cb8607414;
 send_times.csv 744de38c37982422044c2853b2f0255a8255bdb4fc7fb9fa56bc5b17c4ed1c25.
+
+**A3 (Nov 27 01:35Z; Satya's "Amendment A2" of Nov 27, numbered A3 because A2 above already holds section 0;
+Yuta #59 / #63 / #64). Written BEFORE any gate-2 result was viewed:** the runs started 01:19Z; since then I have
+read only their progress trace (elapsed seconds, memory) and a stage list. No results.pkl, score, out/ CSV or
+result line has been opened or printed.
+1. **State carry-over (#59 item 1), PRIMARY = option (a).** 18 of the 35 chunks hold more than one listed block, and
+   after the first listed block OFF's book differs from ON's, so a later block's ON - OFF mixes its own reorder with
+   carry-over. New PRIMARY run (`analysis.gate2 run --one-block`): ON is replayed once per chunk (it does not depend
+   on which block OFF reorders); OFF is replayed once per listed block, with ONLY that block reordered (the send-time
+   file filtered to that height, so every other block keeps the ON order), and only that block is scored. Both arms
+   therefore enter every scored block with identical state. 71 blocks, 35 chunks, OFF = `send_times_yuta95.csv`,
+   window-cluster bootstrap and everything else as in sections 0-5. Launched as soon as the current runs finish.
+2. **FALLBACK (pre-registered): if the (a) run is not finished by Fri Nov 27 10:00 CT (16:00Z),** the PRIMARY is the
+   FIRST listed block of each chunk (35 blocks) from the current yuta95 run (`analysis.gate2 score DIR
+   --first-listed`). Before its first listed block OFF applies the identical order, so the state into that block is
+   identical in both arms. If (a) finishes in time, this row is reported as a check of (a), not as a headline.
+3. **Sensitivity rows S1-S3 = first-listed-block results (35 blocks) from the current runs:** S1 = the yuta95 run
+   with stale / reused-nonce actions excluded; S2 = the raw-nonce run; S3 = the L44 run. All-listed-block results
+   (71 blocks, carry-over included) from the current runs are reported only as a labelled appendix row, never as a
+   headline or sensitivity row.
+4. **L61 mutation row (section 6)** stays as committed: whole-chunk contested accuracy ON vs OFF from the current
+   yuta95 run (all listed blocks reordered; carry-over is part of what the accuracy metric sees there).
+5. **#59 item 2, raced set = union over arms, kept on purpose.** Under OFF a raced order that was already filled
+   before its owner's cancel is no longer in the owner's book when the cancel runs, so only ON records it as raced.
+   The union is what makes its OFF fill count as a race fill. Do not "fix" it to OFF-only or ON-only.
+6. **#59 item 3, reporting added to `analysis.gate2 score`:** per category (race / absorb) and arm, the
+   notional-weighted mean markout in bps (1e4 x sum markout / sum fill notional) and the ON - OFF difference in bps,
+   with the same chunk bootstrap (numerator and denominator resampled together); and n chunks with any difference
+   (already printed as "chunks changed"). Reporting only: the reading rule (section 5) still applies to V_race in USD.
