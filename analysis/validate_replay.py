@@ -55,6 +55,7 @@ from pathlib import Path
 
 from data.parse import iter_trades, recorder_hours
 from engine_py.matching import PLACEHOLDER, Engine
+from engine_py.ordering import load_send_times, m1n_policy
 from engine_py.replay import COINS, OUTSIDE_FILL_POSITION, Observer, Replay, listing
 from engine_py.types import (ASSETS, Cancel, CancelByCloid, Modify, OutsideFill, Place, RejectReason, Side,
                              Tif, ZERO_HASH)
@@ -511,13 +512,20 @@ def run(window, hl_data, policy_name="listing", out_dir=None, anchors=None, use_
         trade_learn=None, trade_learn_at="tx", oid_guard=None, refill_position="front", oid_facts=False,
         name_prewindow=False, named_anon="front", deep_book=False,
         learn_keep_known=False, learn_evidence="loose", facts_exclude=(), use_bbo=True, anchor_drop_kinds=(), oid_bracket=False, p_priority=None,
-        evict_arrival=False, taker_reject=None, taker_seed=None, alo_reject=None, deep_ledger=None, alo_distrust=None):
+        evict_arrival=False, taker_reject=None, taker_seed=None, alo_reject=None, deep_ledger=None, alo_distrust=None,
+        order="listing", send_times=None):
     """observer_cls / engine: measurement hooks (analysis/g1_triage.py); default = ValidateObserver, Engine."""
     # A replay holds millions of long-lived objects (oid facts, books, placed actions); CPython's full collections
     # re-scan all of them and were ~65% of a chunk's runtime. Young generations still collect cycles; outputs are
     # identical (checked on a chunk, Nov 20). Process-wide, so it also covers validate_chunks workers.
     gc.set_threshold(50_000, 20, 1_000)
     policy = POLICIES[policy_name]
+    if order == "m1n":                                   # gate 2 OFF arm (docs/gate2.md): send-time order per batch
+        if policy_name != "listing" or not send_times:
+            raise ValueError("--order m1n needs --policy listing and --send-times FILE")
+        policy = m1n_policy(load_send_times(send_times))
+    elif order != "listing":
+        raise ValueError(f"unknown order {order!r}")
     rp = Replay(window, hl_data, policy, anchors=anchors, use_resolver=use_resolver, alo_gate=alo_gate,
                 gate_max_age_ms=gate_max_age_ms, gate_spare_after=gate_spare_after, touch_trades_first=touch_trades_first, oracle_file=oracle_file, oracle=tuple(oracle), oracle_prequeue=oracle_prequeue, learn_tid=learn_tid, phantom_ledger=phantom_ledger, phantom_mode=phantom_mode, px_sigfig=px_sigfig, gate_insweep=gate_insweep, cap_windows=cap_windows, cap_free=cap_free, reseed_evict=reseed_evict, reconcile_known=evict_known, nearest_ratio=nearest_ratio,
                 reseed=reseed, touch_reconcile=touch_reconcile, touch_n_cap=touch_n_cap, touch_refill=touch_refill,
@@ -850,6 +858,9 @@ def add_replay_args(ap: argparse.ArgumentParser, hl_data_required: bool = True) 
     """The replay options shared by validate_replay and validate_chunks."""
     ap.add_argument("--hl-data", required=hl_data_required)
     ap.add_argument("--policy", default="listing", choices=sorted(POLICIES))
+    ap.add_argument("--order", default="listing", choices=["listing", "m1n"],
+                    help="m1n: gate 2 OFF arm, send-time order inside each batch, no class sort (docs/gate2.md)")
+    ap.add_argument("--send-times", default=None, help="with --order m1n: handoff/gate2/send_times.csv")
     ap.add_argument("--no-resolver", action="store_true")
     ap.add_argument("--alo-gate", choices=["touch"], help="G1 fix #1: admit ALOs against the real touch")
     ap.add_argument("--gate-max-age-ms", type=int, help="gate abstains when the touch is older than this")
@@ -1018,7 +1029,8 @@ def replay_kwargs(a) -> dict:
                 anchor_drop_kinds=("target",) if a.no_target_lookups else (), oid_bracket=a.oid_bracket,
                 p_priority=a.p_priority, evict_arrival=a.evict_arrival, taker_reject=a.taker_reject,
                 taker_seed=a.taker_seed, alo_reject=a.alo_reject, deep_ledger=a.deep_ledger,
-                alo_distrust=a.alo_distrust)
+                alo_distrust=a.alo_distrust,
+                **({"order": a.order, "send_times": a.send_times} if a.order != "listing" else {}))
 
 
 def _seed_for(path, window):
@@ -1068,7 +1080,8 @@ def options_tag(a) -> str:
                     "-tseed" if a.taker_seed else "",
                     f"-arej{a.alo_reject.replace(',', '+')}" if a.alo_reject else "",
                     f"-dl{a.deep_ledger}" if a.deep_ledger else "",
-                    f"-distrust{a.alo_distrust.split(':')[0]}" if a.alo_distrust else ""])
+                    f"-distrust{a.alo_distrust.split(':')[0]}" if a.alo_distrust else "",
+                    f"-{a.order}" if a.order != "listing" else ""])
 
 
 def main(argv=None):
