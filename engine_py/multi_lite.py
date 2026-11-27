@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 
 from engine_py.matching import PLACEHOLDER
-from engine_py.types import ASSETS, Cancel, CancelByCloid, Modify, Place, RejectReason, Side, Tif
+from engine_py.types import Cancel, CancelByCloid, Modify, Place, RejectReason, Side, Tif
 
 MAX_ALTS = 4
 MAX_CANDIDATES = 3

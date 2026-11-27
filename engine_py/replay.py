@@ -33,7 +33,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from data.oids import OidEstimator, OidResolver
-from data.parse import COIN_TO_ASSET, Stats, _hour_files, _records, iter_books, iter_trades, load_window, nearest_book
+from data.parse import COIN_TO_ASSET, _hour_files, _records, iter_books, iter_trades, load_window, nearest_book
 from engine_py.matching import split_equal, PLACEHOLDER, Engine
 from engine_py.types import (ASSETS, Action, Block, Cancel, CancelByCloid, Fill, Modify, OutsideFill, Place,
                              Reject, RejectReason, Side, Tif, ZERO_HASH)

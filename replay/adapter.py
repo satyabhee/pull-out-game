@@ -17,7 +17,6 @@ from __future__ import annotations
 import copy
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from analysis import validate_replay as vr
 from engine_py.replay import Observer, Replay

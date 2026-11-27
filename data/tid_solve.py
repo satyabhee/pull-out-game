@@ -2,10 +2,8 @@
 (data/tid_hash.py). See analysis/tid_solve.py for the measurement CLI and the method."""
 from __future__ import annotations
 
-import argparse
 import gzip
 import json
-import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 

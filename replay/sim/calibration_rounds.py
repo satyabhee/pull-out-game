@@ -17,7 +17,7 @@ from pathlib import Path
 
 from replay.sim.calibrate import feed_and_trades, real_rejections, sim_rejections
 from replay.sim.config import SimConfig
-from replay.sim.generate import chunk_name, generate_chunk, link_set, parse_seeds
+from replay.sim.generate import generate_chunk, link_set, parse_seeds
 
 TARGETS = ("trades per block (mean of chunks)", "orders at the touch (median n)",
            "orders per level, 20-level book (median of means)", "touch |dn| median", "touch |dn| p90",
