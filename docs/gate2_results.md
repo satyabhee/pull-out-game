@@ -182,10 +182,66 @@ all three all-listed runs (docs/gate2_crosscheck.md). The engine's fills themsel
 
 ## 10. Extension (A5)
 
-Pending. The block list (handoff/gate2_ext/blocks.csv) is not frozen yet. A5 was committed (9379175) before any
-block was pulled. Cutoff Fri Nov 27 9:00 AM CT (15:00Z); reported in its own section, never pooled with section 1.
+Its own result, **never pooled with section 1 and never replacing it** (A5). Design: A5 (9379175), A5.1 (5ad2c65),
+A5.2 (de19e47 + 0239ed1), all committed before the rerun was scored.
+- **Blocks:** 200 blocks frozen by Yuta before any pull (blocks.csv sha256 2d839a1a...; #74), all 200 pulled
+  (#75). They come from 65 physical windows (confirm_margin60 131 blocks, dev20 60, devfast 9).
+- **Clusters:** 65. Two windows exist as byte-identical copies in two sets and give 6 blocks each, at different
+  heights (A5.2, Satya NS-18).
+- **Clock:** send times = yuta95, fitted on the extension blocks (sha256 97d310d1...; 224,500 rows calibrated by
+  signer, 2,388 by the pooled offset).
+- **Method:** the same as section 1: one OFF replay per listed block, 10 s markout, chunk-cluster bootstrap 10,000,
+  seed 20261127.
+- **Run:** report/validate/gate2_ext_one_yuta95 on de19e47 (the 0239ed1 commit is doc-only). 65 ON + 200 OFF
+  replays, **0 failed chunks**, score exit 0.
+- **Void run:** the first run (07:29Z) is void, with the OFF arm failed in 65 / 65 chunks; it was not read (A5.2).
+
+**V_race = -0.07 USD, 95% CI [-0.21, +0.00]** (exact upper bound 0.0).
+
+**Reading (frozen rule, section 5, applied to the extension's own V_race): the CI covers 0, so the result is "not
+distinguishable from 0 at this n".** No claim of no effect.
+- **The n:** 16 of the 200 blocks differ between ON and OFF, in 13 of 65 chunks. 13 >= 8, so the "low power" label
+  does not apply.
+- **What V_race rests on:** **2 raced fills (0 under ON, 2 under OFF)**, one in each of 2 chunks (1227941615: -0.00;
+  1230350863: -0.07). The CI is 0.21 USD wide. Its upper bound is exactly 0 because every resample that misses those
+  2 chunks has V_race = 0.
+
+**Race yield, against the A5 purpose.** A5 was meant to add race opportunities. Yuta's rough forecast (#72) was ~65
+raced fills, from 0.33 raced fills per qualifying block measured on the primary blocks. The extension gave 2, from
+6,906 raced orders (the primary had 14 raced fills from 10,115 raced orders on 71 blocks). The cause is not examined
+here. The extension adds blocks, but not raced fills.
+
+| quantity (extension, A5) | value | 95% CI |
+|---|---|---|
+| V_race (primary estimand, reading rule applies) | -0.07 USD | [-0.21, +0.00] |
+| V_absorb (described, not tested) | -4.22 USD | [-12.70, +0.19] |
+| V_net (described, not tested) | -4.29 USD | [-12.76, +0.06] |
+| fills: race ON / OFF; absorb ON / OFF | 0 / 2; 310 / 304 | |
+| notional ON / OFF | 2,209,715 / 2,199,252 USD | |
+| absorb markout, notional-weighted (reporting only) | ON -1.504 / OFF -1.492 bps; ON - OFF -0.012 bps | [-0.015, +0.005] |
+| race markout (reporting only) | ON n/a (no fills) / OFF +2.458 bps | |
+
+- **V_absorb is concentrated:** one chunk (1227768025-1227768234) carries -4.13 of the -4.22 USD.
+- **Sensitivity (stale / reused-nonce actions excluded, as S1; 100 fills excluded):**
+  - V_race -0.00 [-0.00, +0.00] on 1 OFF raced fill.
+  - V_absorb +0.07 [-0.43, +0.59].
+  - V_net +0.07 [-0.43, +0.59].
+- **Scale:** listed-block txs 103,552, of which 28,709 are untimed (stale / counter / future nonce) and 60,095 carry a
+  reused nonce.
+- **Sign:** V_race is negative in both section 1 and here, as in section 1's sign note. Neither CI excludes 0, and the
+  two are not combined.
+
+Sign-off for this section (Yuta): pending; his crosscheck (analysis/gate2_crosscheck.py, grouped by window name).
 
 ## 11. Freeze and sign-off
 
-Frozen at the commit that adds this file, apart from section 10 (extension) and the sign-off line.
-Sign-off (Yuta): pending.
+Frozen at the commit that adds this file, apart from section 10 (extension) and the sign-off line. Section 10 added
+after the extension rerun was scored (08:15Z Nov 27).
+Sign-off (Yuta, 05:40Z Nov 27): sections 1-9 checked against the run files (score.txt, score_first.txt, l61_contested.txt, meta.json) and the independent recompute; numbers correct. Section 10 (A5) is signed separately when it is scored.
+(Pasted from Yuta #71. He checked the working-tree file sha256 3d9cd4c924f2...; the committed d2fb954 also has the
+scoring-guard line under the header, added at Satya's request. Text only; Yuta to confirm that diff.)
+
+**Erratum (07:46Z Nov 27, Yuta #71 / #74; text only, no result changes).** Section 9 point 1, "from the SQD free
+quota (40 MB used)", should read: "from the SQD free quota (these 71 blocks are 42.4 MB uncompressed; all of this
+month's SQD queries total 46.7 MB uncompressed, 6.8 MB compressed)". Section 9 is left as frozen; data-streams
+docs/gate2_limits.md has the fix.
