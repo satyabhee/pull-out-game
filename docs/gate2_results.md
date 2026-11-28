@@ -245,3 +245,68 @@ scoring-guard line under the header, added at Satya's request. Text only; Yuta t
 quota (40 MB used)", should read: "from the SQD free quota (these 71 blocks are 42.4 MB uncompressed; all of this
 month's SQD queries total 46.7 MB uncompressed, 6.8 MB compressed)". Section 9 is left as frozen; data-streams
 docs/gate2_limits.md has the fix.
+
+## 12. Across policies (A6)
+
+These rows are descriptive, with no new headline; M1n remains the primary counterfactual (section 1). The A6 brief
+and docs/gate2.md A6 name this "section 11", but section 11 was already the frozen "Freeze and sign-off", so A6 goes
+here instead. That is the only change from A6.
+
+**Run.**
+- Code: unified 763d46b (`--order cancels_last|random`, `--order-seed`; runner analysis/gate2_policies.py).
+- Same A3 primary blocks (71 blocks, 35 chunks), B3 flags, yuta95 clock and one-block mode. The estimator,
+  bootstrap (10,000, seed 20261127) and sensitivity row are unchanged.
+- 1,597 replays (35 ON + 22 × 71 OFF), 21:53Z-01:22Z, exit 0, 0 failed. All 20 random seeds are complete, so the
+  partial rule was not needed.
+- Output: report/validate/gate2_a6/{score_a6.txt, summary_a6.json, <policy>/score.txt}.
+- Rerun: `python -m analysis.gate2_policies score report/validate/gate2_a6 --primary report/validate/gate2_one_yuta95`.
+
+**M1n reproduction check (A6, before reading anything): IDENTICAL.** The M1n arm rerun in the A6 runner matches
+gate2_one_yuta95/score.txt line for line, apart from the path line.
+
+**Comparison** (USD, OFF − ON; 95% CI from the chunk bootstrap; primary rows, stale/reused-nonce actions included).
+The contested column is the L61-style maker-strict contested accuracy, OFF − ON, on the **listed blocks only**
+(71 txs, 29 chunks). That is a narrower scope than section 6's −3.6 pt, which covers all listed blocks of whole chunks
+(gate2_all_yuta95), so the two are not the same row.
+
+| policy | V_race | V_absorb | V_net | raced fills OFF | changed chunks | contested OFF − ON |
+|---|---|---|---|---|---|---|
+| ON (B3 listing; reference) | 0 | 0 | 0 | 1 (ON) | — | 34.0% (ON level) |
+| M1n (primary) | −8.32 [−24.27, +0.13] | +17.79 [−0.49, +53.35] | +9.47 [−0.74, +29.32] | 13 | 16 | −7.8 pt [−14.11, −2.27] |
+| cancels-last | −8.32 [−24.27, +0.13] | +17.56 [−0.70, +53.01] | +9.23 [−0.96, +28.98] | 13 | 16 | −6.4 pt [−12.98, −1.72] |
+| random, mean of 20 seeds | −10.81 [−32.19, +0.15] | +17.23 [−0.16, +51.38] | +6.41 [−0.04, +19.20] | 11.1 (8-15) | 10-16 | −7.1 pt (−9.9 to −3.4) |
+
+For the random row, each CI is the chunk bootstrap of the per-chunk seed mean. The spread across the 20 seeds
+(point estimates) is:
+- V_race: min −15.60, max −3.92, SD 3.37.
+- V_absorb: min +4.92, max +19.63, SD 2.97.
+- V_net: min +0.99, max +10.01, SD 3.42.
+
+Per-seed rows, each with its own CI, are in score_a6.txt.
+
+**Sensitivity row** (stale/reused-nonce actions excluded; same reading as section 3, not a headline), V_net:
+- M1n: +13.50 [−4.78, +44.58].
+- Cancels-last: +13.27 [−4.99, +44.24].
+- Random: mean +14.29 (min +3.44, max +16.59, SD 2.70). V_race mean −2.33 (−3.84 to −0.11).
+
+**What the rows show (described, not tested):**
+- **Cancels-last is almost the same as M1n.** V_race and the raced fills are identical, and V_absorb differs by
+  0.23 USD. On these blocks the race outcome does not depend on whether the cancel or the GTC/IOC comes first by
+  class, given the same batches and movable set.
+- **Every policy has the same sign pattern as M1n.** V_race is ≤ 0 and V_absorb is > 0.
+  - Like M1n, every V_race CI includes 0 (upper ends +0.01 to +0.52).
+  - V_net lower ends run from −0.96 to +0.02. Five random seeds have a lower end of +0.01 or +0.02. That is a single
+    chunk at one ON race fill, so it is not read as a separation from 0.
+- **The seed spread comes almost entirely from one chunk, 1230828573-1230828782.**
+  - That chunk's per-seed SD of V_net is 3.31 USD, against 3.42 for the total. The next largest chunk SD is 0.05.
+  - The seeds fall into two groups of 10: V_net +8.4 to +10.0 and +1.0 to +4.2. The group depends on which race that
+    chunk's shuffle produces (V_race in that chunk −7.5 to −8.9 vs −13.0 to −15.3).
+  - Seed 1 also differs in V_absorb (+3.98 in that chunk vs about +17 elsewhere).
+  - Seed 1's score.txt also counts 0 ON raced fills, where every other policy counts 1. ON is the same 35 replays for
+    every policy, so the difference comes from the race classification, which is per pair of arms. Not investigated.
+  - So the random mean is a mix of two outcomes for one chunk, not a smooth average.
+- **The contested accuracy falls under every policy** (−3.4 to −9.9 pt). This is consistent with section 6: reordering
+  away from ON makes the replay match real fills less well. Per-seed CIs include 0 for 7 of the 20 seeds.
+
+**Limits.** These are the same as sections 1 and 9 (n = 35 chunks, one ON race fill, wide CIs). Random is a
+within-batch shuffle with the M1n batches and movable set, not a model of any real sequencer.
