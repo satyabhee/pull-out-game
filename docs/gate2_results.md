@@ -231,7 +231,8 @@ here. The extension adds blocks, but not raced fills.
 - **Sign:** V_race is negative in both section 1 and here, as in section 1's sign note. Neither CI excludes 0, and the
   two are not combined.
 
-Sign-off for this section (Yuta): pending; his crosscheck (analysis/gate2_crosscheck.py, grouped by window name).
+Sign-off (Yuta, 08:19Z Nov 27): section 10 checked against gate2_ext_one_yuta95 (score.txt, per_chunk.jsonl, results.pkl) and the independent recompute (65 / 65 windows, max difference 0 USD; bootstrap re-run within noise); numbers correct.
+(Pasted from Yuta #77.)
 
 ## 11. Freeze and sign-off
 
@@ -239,7 +240,7 @@ Frozen at the commit that adds this file, apart from section 10 (extension) and 
 after the extension rerun was scored (08:15Z Nov 27).
 Sign-off (Yuta, 05:40Z Nov 27): sections 1-9 checked against the run files (score.txt, score_first.txt, l61_contested.txt, meta.json) and the independent recompute; numbers correct. Section 10 (A5) is signed separately when it is scored.
 (Pasted from Yuta #71. He checked the working-tree file sha256 3d9cd4c924f2...; the committed d2fb954 also has the
-scoring-guard line under the header, added at Satya's request. Text only; Yuta to confirm that diff.)
+scoring-guard line under the header, added at Satya's request. Text only; confirmed by Yuta (#76).)
 
 **Erratum (07:46Z Nov 27, Yuta #71 / #74; text only, no result changes).** Section 9 point 1, "from the SQD free
 quota (40 MB used)", should read: "from the SQD free quota (these 71 blocks are 42.4 MB uncompressed; all of this
@@ -268,6 +269,16 @@ gate2_one_yuta95/score.txt line for line, apart from the path line.
 The contested column is the L61-style maker-strict contested accuracy, OFF − ON, on the **listed blocks only**
 (71 txs, 29 chunks). That is a narrower scope than section 6's −3.6 pt, which covers all listed blocks of whole chunks
 (gate2_all_yuta95), so the two are not the same row.
+M1n's contested drop is −7.8 pt [−14.11, −2.27] here vs −3.6 pt [−6.65, −1.14] in section 6, and the policy is M1n in
+both. The difference is scope and sample:
+- **Here:** the one-block run (gate2_a6/m1n), with contested txs in the 71 listed blocks only: 71 txs, 29 chunks, ON
+  34.0%.
+- **Section 6:** the all-listed run (gate2_all_yuta95), with contested txs over whole chunks: 169 txs, 35 chunks, ON
+  54.6%.
+
+The listed blocks are where every reordered tx sits, and they were selected for contested misses, so their ON level is
+lower. The whole-chunk set adds txs in unlisted blocks, which are not reordered themselves, and these most likely
+dilute the drop. That is not tested here.
 
 | policy | V_race | V_absorb | V_net | raced fills OFF | changed chunks | contested OFF − ON |
 |---|---|---|---|---|---|---|
